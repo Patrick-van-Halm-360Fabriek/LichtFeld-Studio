@@ -1909,6 +1909,11 @@ namespace lfs::core {
         Tensor& index_put_(const std::vector<Tensor>& indices, const Tensor& values);
 
         Tensor index_select(int dim, const Tensor& indices, BoundaryMode mode) const;
+        // Gather rows along `dim` into a caller-provided output (no allocation),
+        // letting the caller control the output's storage (e.g. a Vulkan-external
+        // backing block). `out` must already be sized [..., indices.numel(), ...]
+        // and share this tensor's dtype/device; `indices` must be 1-D integer.
+        void index_select_into(Tensor& out, int dim, const Tensor& indices, BoundaryMode mode) const;
         Tensor gather(int dim, const Tensor& indices, BoundaryMode mode) const;
 
         TensorIndexer operator[](const Tensor& indices);
