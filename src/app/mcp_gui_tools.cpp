@@ -44,6 +44,7 @@
 #include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer/visualizer.hpp"
 #include "visualizer/visualizer_impl.hpp"
+#include "visualizer/window/vulkan_context.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -170,10 +171,25 @@ namespace lfs::app {
             vis::Visualizer* viewer,
             int width = 0,
             int height = 0) {
-            (void)viewer;
-            (void)width;
-            (void)height;
-            return std::unexpected("Full-window capture needs a Vulkan swapchain readback path; use render.capture for viewport capture");
+            auto* const viewer_impl = dynamic_cast<vis::VisualizerImpl*>(viewer);
+            if (!viewer_impl)
+                return std::unexpected("Full-window capture requires a GUI visualizer");
+
+            auto* const window_manager = viewer_impl->getWindowManager();
+            auto* const vulkan_context = window_manager ? window_manager->getVulkanContext() : nullptr;
+            if (!vulkan_context)
+                return std::unexpected("Full-window capture requires a Vulkan window");
+
+            auto capture = vulkan_context->captureActiveFrameRgba();
+            if (!capture)
+                return std::unexpected(capture.error());
+
+            return mcp::encode_pixels_to_base64(capture->rgba.data(),
+                                                capture->width,
+                                                capture->height,
+                                                4,
+                                                width,
+                                                height);
         }
 
         json selection_state_json(core::Scene& scene, const int max_indices = 100000) {

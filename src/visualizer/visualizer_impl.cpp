@@ -1414,9 +1414,10 @@ namespace lfs::vis {
         if (gui_manager_) {
             LOG_TIMER("VisualizerImpl::render.gui_frame_total_with_swapchain_wait");
             gui_manager_->render();
+        } else {
+            processRenderWorkQueue();
         }
 
-        processRenderWorkQueue();
         python::flush_signals();
         gui_frame_rendered_ = true;
         update_work_processed_ = false;
