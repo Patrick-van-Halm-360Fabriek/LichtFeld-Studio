@@ -340,14 +340,17 @@ namespace lfs::vis {
 
         // Depth access for tools (returns camera-space depth at pixel, or -1 if invalid).
         float getDepthAtPixel(int x, int y, std::optional<SplitViewPanelId> panel = std::nullopt) const;
+        struct ExpectedDepthSampleRequest {
+            SceneManager* scene_manager = nullptr;
+            const Viewport* viewport = nullptr;
+            glm::ivec2 render_size{0, 0};
+            glm::ivec2 pixel{0, 0};
+            float focal_length_mm = lfs::rendering::DEFAULT_FOCAL_LENGTH_MM;
+            bool orthographic = false;
+            float ortho_scale = lfs::rendering::DEFAULT_ORTHO_SCALE;
+        };
         // Renders a fresh expected-depth preview for precise picking on sparse or low-opacity splats.
-        float renderExpectedDepthAtPixel(SceneManager* scene_manager,
-                                         const Viewport& viewport,
-                                         glm::ivec2 render_size,
-                                         glm::ivec2 pixel,
-                                         float focal_length_mm,
-                                         bool orthographic,
-                                         float ortho_scale);
+        float renderExpectedDepthAtPixel(const ExpectedDepthSampleRequest& request);
         float renderDepthAtPixelForNodeMask(const SceneManager* scene_manager,
                                             const Viewport& viewport,
                                             const glm::ivec2& render_size,

@@ -54,17 +54,6 @@ namespace lfs::vis {
             return std::max(1, static_cast<int>(max_pixels / static_cast<std::size_t>(width)));
         }
 
-        [[nodiscard]] int scalePixelCoord(const int value, const int source_extent, const int target_extent) {
-            if (source_extent <= 0 || target_extent <= 0) {
-                return value;
-            }
-            const float target =
-                (static_cast<float>(value) + 0.5f) *
-                    (static_cast<float>(target_extent) / static_cast<float>(source_extent)) -
-                0.5f;
-            return std::clamp(static_cast<int>(std::lround(target)), 0, target_extent - 1);
-        }
-
         [[nodiscard]] std::optional<float> sampleDepthTensorAt(
             const lfs::core::Tensor& depth,
             const glm::ivec2& pixel) {
@@ -1060,29 +1049,21 @@ namespace lfs::vis {
                               : VksplatViewportRenderer::OutputSlot::SplitLeft;
         }
 
-        int sample_x = x;
-        int sample_y = y;
-        const auto output_size = vksplat_viewport_renderer_->latestOutputImageSize(output_slot);
-        if (output_size && output_size->x > 0 && output_size->y > 0) {
-            glm::ivec2 source_size = frame_lifecycle_service_.lastViewportSize();
-            if (panel && isIndependentSplitViewActive()) {
-                if (const auto layouts = split_view_service_.panelLayouts(settings_, source_size.x)) {
-                    const auto& layout = (*layouts)[splitViewPanelIndex(*panel)];
-                    source_size.x = std::max(layout.width, 1);
-                }
+        glm::ivec2 source_size = frame_lifecycle_service_.lastViewportSize();
+        if (source_size.x > 0 && source_size.y > 0 && panel && isIndependentSplitViewActive()) {
+            if (const auto layouts = split_view_service_.panelLayouts(settings_, source_size.x)) {
+                const auto& layout = (*layouts)[splitViewPanelIndex(*panel)];
+                source_size.x = std::max(layout.width, 1);
             }
-            if (source_size.x <= 0 || source_size.y <= 0) {
-                source_size = *output_size;
-            }
-            sample_x = scalePixelCoord(x, source_size.x, output_size->x);
-            sample_y = scalePixelCoord(y, source_size.y, output_size->y);
         }
 
         const auto depth = vksplat_viewport_renderer_->sampleDepthAtPixel(
             *last_vulkan_context_,
-            sample_x,
-            sample_y,
-            output_slot);
+            VksplatViewportRenderer::DepthSampleRequest{
+                .pixel = {x, y},
+                .source_size = source_size,
+                .output_slot = output_slot,
+            });
         if (!depth) {
             LOG_TRACE("VkSplat depth sample failed: {}", depth.error());
             return -1.0f;
@@ -1090,44 +1071,39 @@ namespace lfs::vis {
         return *depth;
     }
 
-    float RenderingManager::renderExpectedDepthAtPixel(SceneManager* const scene_manager,
-                                                       const Viewport& viewport,
-                                                       const glm::ivec2 render_size,
-                                                       const glm::ivec2 pixel,
-                                                       const float focal_length_mm,
-                                                       const bool orthographic,
-                                                       const float ortho_scale) {
-        if (!scene_manager ||
-            render_size.x <= 0 ||
-            render_size.y <= 0 ||
-            pixel.x < 0 ||
-            pixel.y < 0 ||
-            pixel.x >= render_size.x ||
-            pixel.y >= render_size.y) {
+    float RenderingManager::renderExpectedDepthAtPixel(const ExpectedDepthSampleRequest& request) {
+        if (!request.scene_manager ||
+            !request.viewport ||
+            request.render_size.x <= 0 ||
+            request.render_size.y <= 0 ||
+            request.pixel.x < 0 ||
+            request.pixel.y < 0 ||
+            request.pixel.x >= request.render_size.x ||
+            request.pixel.y >= request.render_size.y) {
             return -1.0f;
         }
 
-        auto render_lock = acquireLiveModelRenderLock(scene_manager);
-        auto scene_state = scene_manager->buildRenderState();
+        auto render_lock = acquireLiveModelRenderLock(request.scene_manager);
+        auto scene_state = request.scene_manager->buildRenderState();
         const auto* const model = scene_state.combined_model;
         if (!hasRenderableGaussians(model)) {
             return -1.0f;
         }
 
         auto rendered = renderDepthCaptureToPreviewSlotWithState(
-            scene_manager,
+            request.scene_manager,
             *model,
             std::move(scene_state),
-            viewport.camera.R,
-            viewport.camera.t,
-            focal_length_mm,
-            render_size.x,
-            render_size.y,
+            request.viewport->camera.R,
+            request.viewport->camera.t,
+            request.focal_length_mm,
+            request.render_size.x,
+            request.render_size.y,
             render_lock.has_value(),
             true,
             std::nullopt,
-            orthographic,
-            ortho_scale);
+            request.orthographic,
+            request.ortho_scale);
         if (!rendered) {
             LOG_TRACE("Expected-depth pixel render failed: {}", rendered.error());
             return -1.0f;
@@ -1141,7 +1117,7 @@ namespace lfs::vis {
             return -1.0f;
         }
 
-        return sampleDepthTensorAt(**depth, pixel).value_or(-1.0f);
+        return sampleDepthTensorAt(**depth, request.pixel).value_or(-1.0f);
     }
 
     float RenderingManager::renderDepthAtPixelForNodeMask(const SceneManager* const scene_manager,

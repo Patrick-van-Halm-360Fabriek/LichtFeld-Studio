@@ -832,7 +832,7 @@ void main(
         model_transforms,
         model_transform_base,
         model_transform_enabled,
-        uniforms.mip_filter != 0u);
+        (uniforms.mip_filter & 1u) != 0u);
   #else
     Splat_2D_Vertex splat = project_gaussian_to_camera_model(
         gauss,
@@ -842,7 +842,7 @@ void main(
         model_transforms,
         model_transform_base,
         model_transform_enabled,
-        uniforms.mip_filter != 0u,
+        (uniforms.mip_filter & 1u) != 0u,
         spark_rad_opacity_path);
   #endif
   #else

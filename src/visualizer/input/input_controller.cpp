@@ -2771,13 +2771,15 @@ namespace lfs::vis {
         float depth = -1.0f;
         if (auto* const scene_manager = services().sceneOrNull()) {
             depth = rendering->renderExpectedDepthAtPixel(
-                scene_manager,
-                projection_viewport,
-                projection_viewport.windowSize,
-                {sample_x, sample_y},
-                focal_length_mm,
-                render_settings.orthographic,
-                ortho_scale);
+                RenderingManager::ExpectedDepthSampleRequest{
+                    .scene_manager = scene_manager,
+                    .viewport = &projection_viewport,
+                    .render_size = projection_viewport.windowSize,
+                    .pixel = {sample_x, sample_y},
+                    .focal_length_mm = focal_length_mm,
+                    .orthographic = render_settings.orthographic,
+                    .ortho_scale = ortho_scale,
+                });
         }
         if (depth <= 0.0f) {
             depth = rendering->getDepthAtPixel(sample_x, sample_y, interaction->panel);

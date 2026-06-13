@@ -5227,9 +5227,7 @@ namespace lfs::vis {
 
     std::expected<float, std::string> VksplatViewportRenderer::sampleDepthAtPixel(
         VulkanContext& context,
-        const int x,
-        const int y,
-        const OutputSlot output_slot) const {
+        const DepthSampleRequest& request) const {
         std::lock_guard<std::mutex> readback_lock(readback_mutex_);
         if (!context_) {
             return std::unexpected("VkSplat depth sample requested before renderer initialization");
@@ -5243,7 +5241,7 @@ namespace lfs::vis {
             return std::unexpected(std::format("VkSplat depth sample pending-batch wait failed: {}", e.what()));
         }
 
-        const auto& output = output_slots_[outputSlotIndex(output_slot)][latestOutputRingSlot(output_slot)];
+        const auto& output = output_slots_[outputSlotIndex(request.output_slot)][latestOutputRingSlot(request.output_slot)];
         if (output.depth_image.image == VK_NULL_HANDLE ||
             output.size.x <= 0 ||
             output.size.y <= 0) {
@@ -5251,6 +5249,19 @@ namespace lfs::vis {
         }
         if (output.depth_image.format != VK_FORMAT_R32_SFLOAT) {
             return std::unexpected("VkSplat depth sample only supports R32F depth images");
+        }
+        int x = request.pixel.x;
+        int y = request.pixel.y;
+        if (request.source_size.x > 0 && request.source_size.y > 0) {
+            const auto scale_coord = [](const int value, const int source_extent, const int target_extent) {
+                const float target =
+                    (static_cast<float>(value) + 0.5f) *
+                        (static_cast<float>(target_extent) / static_cast<float>(source_extent)) -
+                    0.5f;
+                return std::clamp(static_cast<int>(std::lround(target)), 0, target_extent - 1);
+            };
+            x = scale_coord(x, request.source_size.x, output.size.x);
+            y = scale_coord(y, request.source_size.y, output.size.y);
         }
         if (x < 0 || y < 0 || x >= output.size.x || y >= output.size.y) {
             return -1.0f;
@@ -6590,6 +6601,14 @@ namespace lfs::vis {
         const bool higs_active =
             !request.gut && renderer_.supportsFloat16Storage() && !synchronize_input_upload &&
             !depth_capture_mode_;
+        // Depth view colorizes the per-pixel median depth. mip_filter bit 1
+        // switches the macro compose to an exact per-pixel replay of the single
+        // batch that crosses transmittance 0.5, so the map is smooth instead of
+        // quantized to the crossing batch's leading splat. Bit 0 stays the mip
+        // anti-aliasing flag; the raster reads them independently.
+        if (request.depth_view) {
+            uniforms.mip_filter |= 2u;
+        }
         // Capture forces the non-batched per-pixel rasterizer (full pixel_depth
         // coverage); the batched compose only writes a subset of pixels.
         renderer_.setDepthCapture(depth_capture_mode_);
