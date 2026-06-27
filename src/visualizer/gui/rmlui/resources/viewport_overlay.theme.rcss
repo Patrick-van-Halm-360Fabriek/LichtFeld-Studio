@@ -96,6 +96,17 @@
     image-color: @{background};
 }
 
+.icon-btn.disabled,
+.icon-btn.disabled:hover,
+.icon-btn.disabled:active {
+    background-color: transparent;
+    border-color: transparent;
+}
+
+.icon-btn.disabled img {
+    image-color: @{text_dim};
+}
+
 .viewport-metrics-card {
     background-color: @{viewport.metrics_bg};
     border-color: @{viewport.metrics_border};
