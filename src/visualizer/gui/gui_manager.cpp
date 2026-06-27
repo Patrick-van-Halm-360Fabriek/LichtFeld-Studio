@@ -6299,12 +6299,12 @@ namespace lfs::vis::gui {
                                        panel_input.screen_h);
             } else {
                 rml_status_bar_.renderCached(draw_ctx,
-                                              status_bar_x,
-                                              status_bar_y,
-                                              status_bar_w,
-                                              status_bar_height,
-                                              panel_input.screen_w,
-                                              panel_input.screen_h);
+                                             status_bar_x,
+                                             status_bar_y,
+                                             status_bar_w,
+                                             status_bar_height,
+                                             panel_input.screen_w,
+                                             panel_input.screen_h);
             }
             if (has_status_bar_panels)
                 reg.draw_panels(PanelSpace::StatusBar, draw_ctx, &panel_input);

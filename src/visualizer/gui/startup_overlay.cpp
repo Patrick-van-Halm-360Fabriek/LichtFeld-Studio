@@ -22,15 +22,15 @@
 #include <RmlUi/Core/Elements/ElementFormControlSelect.h>
 #include <RmlUi/Core/Input.h>
 #include <algorithm>
-#include <charconv>
 #include <cassert>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <imgui_internal.h>
-#include <imgui.h>
 #include <utility>
+#include <imgui.h>
 
 #ifdef _WIN32
 #include <shellapi.h>

@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "runner.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "package_manager.hpp"
 #include "python_buffer_analysis.hpp"
-#include "core/event_bridge/localization_manager.hpp"
 #include "visualizer/gui/string_keys.hpp"
 
 #include <algorithm>
