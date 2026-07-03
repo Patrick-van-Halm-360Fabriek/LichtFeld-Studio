@@ -34,8 +34,9 @@ namespace lfs::training {
             core::TensorShape({4, 4}),
             means.device());
 
+        const auto xyz_means = means.slice(1, 0, 3);
         auto ones = core::Tensor::ones({static_cast<size_t>(means.size(0)), 1}, means.device());
-        auto means_homo = means.cat(ones, 1);
+        auto means_homo = xyz_means.cat(ones, 1);
 
         const auto transformed_points = transform_tensor.mm(means_homo.t()).t();
         const auto local_points = transformed_points.slice(1, 0, 3);

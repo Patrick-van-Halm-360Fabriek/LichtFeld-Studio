@@ -241,6 +241,29 @@ TEST(TrainingCropBoxMask, DisabledCropBoxReturnsNulloptWithoutMutation) {
     expect_cropbox_scene_unchanged(scene, *model, before);
 }
 
+TEST(TrainingCropBoxMask, WiderMeansUseFirstThreeColumnsForCropMask) {
+    const auto means = lfs::core::Tensor::from_vector(
+        std::vector<float>{
+            0.0f, 0.0f, 0.0f, 1000.0f,
+            2.0f, 0.0f, 0.0f, -1000.0f,
+            0.0f, -1.0f, 1.0f, 500.0f},
+        {size_t{3}, size_t{4}},
+        lfs::core::Device::CPU);
+    const auto means_before = means.to(lfs::core::Device::CPU).to_vector();
+
+    const auto remove_mask = lfs::training::compute_cropbox_remove_mask(
+        means,
+        {-1.0f, -1.0f, -1.0f},
+        {1.0f, 1.0f, 1.0f},
+        glm::mat4(1.0f),
+        false);
+
+    ASSERT_TRUE(remove_mask.has_value());
+    EXPECT_EQ(remove_mask->to(lfs::core::Device::CPU).to_vector_bool(),
+              (std::vector<bool>{false, true, false}));
+    EXPECT_EQ(means.to(lfs::core::Device::CPU).to_vector(), means_before);
+}
+
 TEST(TrainingCropBoxMask, EmptyMeansReturnNulloptWithoutMutation) {
     const auto means = lfs::core::Tensor::zeros({size_t{0}, size_t{3}},
                                                 lfs::core::Device::CPU,
