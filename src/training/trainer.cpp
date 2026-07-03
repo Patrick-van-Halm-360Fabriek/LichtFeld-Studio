@@ -23,7 +23,6 @@
 #include "core/tensor/internal/memory_pool.hpp"
 #include "core/tensor/internal/size_bucketed_pool.hpp"
 #include "diagnostics/vram_profiler.hpp"
-#include "geometry/bounding_box.hpp"
 #include "io/cache_image_loader.hpp"
 #include "io/cuda/image_format_kernels.cuh"
 #include "io/exporter.hpp"
@@ -38,6 +37,7 @@
 #include "strategies/mcmc.hpp"
 #include "strategies/strategy_factory.hpp"
 #include "strategies/strategy_utils.hpp"
+#include "training_cropbox_mask.hpp"
 #include "training/kernels/camera_loss_heatmap.cuh"
 #include "training/kernels/depth_loss.hpp"
 #include "training/kernels/grad_alpha.hpp"
@@ -189,83 +189,6 @@ namespace lfs::training {
 
         [[nodiscard]] double bytes_to_gib(const size_t bytes) {
             return static_cast<double>(bytes) / BYTES_PER_GIB;
-        }
-
-        [[nodiscard]] std::optional<lfs::core::Tensor> compute_training_cropbox_remove_mask(
-            const lfs::core::Scene& scene,
-            const lfs::core::SplatData& model) {
-            const auto training_model_name = scene.getTrainingModelNodeName();
-            if (training_model_name.empty()) {
-                return std::nullopt;
-            }
-
-            const auto* training_node = scene.getNode(training_model_name);
-            if (!training_node) {
-                return std::nullopt;
-            }
-
-            const lfs::core::NodeId cropbox_id = scene.getCropBoxForSplat(training_node->id);
-            if (cropbox_id == lfs::core::NULL_NODE) {
-                return std::nullopt;
-            }
-
-            const auto* cropbox = scene.getCropBoxData(cropbox_id);
-            if (!cropbox || !cropbox->enabled) {
-                return std::nullopt;
-            }
-
-            const auto& means = model.means();
-            if (!means.is_valid() || means.ndim() != 2 || means.size(0) == 0 || means.size(1) < 3) {
-                return std::nullopt;
-            }
-
-            lfs::geometry::BoundingBox bounding_box;
-            bounding_box.setBounds(cropbox->min, cropbox->max);
-            bounding_box.setworld2BBox(scene.getWorldTransform(cropbox_id));
-
-            const glm::mat4 world_to_bbox_matrix = bounding_box.hasFullTransform()
-                                                       ? bounding_box.getworld2BBoxMat4()
-                                                       : bounding_box.getworld2BBox().toMat4();
-
-            const std::vector<float> transform_data = {
-                world_to_bbox_matrix[0][0], world_to_bbox_matrix[1][0], world_to_bbox_matrix[2][0], world_to_bbox_matrix[3][0],
-                world_to_bbox_matrix[0][1], world_to_bbox_matrix[1][1], world_to_bbox_matrix[2][1], world_to_bbox_matrix[3][1],
-                world_to_bbox_matrix[0][2], world_to_bbox_matrix[1][2], world_to_bbox_matrix[2][2], world_to_bbox_matrix[3][2],
-                world_to_bbox_matrix[0][3], world_to_bbox_matrix[1][3], world_to_bbox_matrix[2][3], world_to_bbox_matrix[3][3]};
-            auto transform_tensor = lfs::core::Tensor::from_vector(
-                transform_data,
-                lfs::core::TensorShape({4, 4}),
-                means.device());
-
-            auto ones = lfs::core::Tensor::ones({static_cast<size_t>(means.size(0)), 1}, means.device());
-            auto means_homo = means.cat(ones, 1);
-
-            const auto transformed_points = transform_tensor.mm(means_homo.t()).t();
-            const auto local_points = transformed_points.slice(1, 0, 3);
-
-            const std::vector<float> bbox_min_data = {cropbox->min.x, cropbox->min.y, cropbox->min.z};
-            const std::vector<float> bbox_max_data = {cropbox->max.x, cropbox->max.y, cropbox->max.z};
-            auto bbox_min_tensor = lfs::core::Tensor::from_vector(
-                bbox_min_data, lfs::core::TensorShape({3}), means.device());
-            auto bbox_max_tensor = lfs::core::Tensor::from_vector(
-                bbox_max_data, lfs::core::TensorShape({3}), means.device());
-
-            auto inside_min = local_points.ge(bbox_min_tensor.unsqueeze(0));
-            auto inside_max = local_points.le(bbox_max_tensor.unsqueeze(0));
-            auto inside_both = inside_min && inside_max;
-            std::vector<int> reduce_dims = {1};
-            auto inside_mask = inside_both.all(std::span<const int>(reduce_dims), false);
-            if (!inside_mask.is_valid() || inside_mask.numel() == 0) {
-                return std::nullopt;
-            }
-
-            auto remove_mask = cropbox->inverse ? inside_mask : inside_mask.logical_not();
-            if (model.has_deleted_mask() && model.deleted().is_valid() &&
-                model.deleted().numel() == remove_mask.numel()) {
-                remove_mask = remove_mask.logical_and(model.deleted().logical_not());
-            }
-
-            return remove_mask;
         }
 
         [[nodiscard]] size_t tensor_reserved_bytes(const lfs::core::Tensor& tensor) {
@@ -3362,6 +3285,10 @@ namespace lfs::training {
                         crop_mask && crop_mask->is_valid() && crop_mask->numel() > 0) {
                         const int crop_pruned = crop_mask->to(lfs::core::DataType::Int32).sum().template item<int>();
                         if (crop_pruned > 0) {
+                            if (!lock.owns_lock()) {
+                                lock.lock();
+                                waitForModelReaders();
+                            }
                             LOG_DEBUG("Training cropbox: pruning {} gaussians outside the active box at iter {}",
                                       crop_pruned, iter);
                             strategy_->remove_gaussians(*crop_mask);
@@ -4332,6 +4259,13 @@ namespace lfs::training {
                                 crop_mask && crop_mask->is_valid() && crop_mask->numel() > 0) {
                                 const int crop_pruned = crop_mask->to(lfs::core::DataType::Int32).sum().template item<int>();
                                 if (crop_pruned > 0) {
+                                    if (!lock.owns_lock()) {
+                                        if (model_write_lock.owns_lock()) {
+                                            model_write_lock.unlock();
+                                        }
+                                        lock.lock();
+                                        waitForModelReaders();
+                                    }
                                     LOG_DEBUG("Training cropbox: pruning {} gaussians outside the active box at iter {}",
                                               crop_pruned, iter);
                                     strategy_->remove_gaussians(*crop_mask);
