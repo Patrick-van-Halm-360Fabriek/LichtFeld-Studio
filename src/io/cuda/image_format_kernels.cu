@@ -10,7 +10,6 @@ namespace lfs::io::cuda {
         constexpr int BLOCK_SIZE = 256;
         constexpr float NORMALIZE_SCALE_U8 = 1.0f / 255.0f;
         constexpr float NORMALIZE_SCALE_U16 = 1.0f / 65535.f;
-        ;
     } // namespace
 
     __global__ void uint8_hwc_to_float32_chw_kernel(
@@ -55,31 +54,6 @@ namespace lfs::io::cuda {
         output[out_idx] = static_cast<float>(input[idx]) * NORMALIZE_SCALE_U16;
     }
 
-    __global__ void float32_chw_to_uint16_hwc_kernel(
-        const float* __restrict__ input, // CHW float32 input
-        uint16_t* __restrict__ output,   // HWC uint16 output
-        const size_t H,
-        const size_t W,
-        const size_t C) {
-
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        const size_t total = H * W * C;
-        if (idx >= total)
-            return;
-
-        // Decompose linear CHW index -> (c, h, w)
-        const size_t c = idx / (H * W);
-        const size_t h = (idx / W) % H;
-        const size_t w = idx % W;
-
-        // Recompose as HWC index
-        const size_t out_idx = h * (W * C) + w * C + c;
-
-        // Scale [0, 1] -> [0, 65535] and clamp before cast
-        const float scaled = fminf(fmaxf(input[idx] * 65535.0f, 0.0f), 65535.0f);
-        output[out_idx] = static_cast<uint16_t>(scaled);
-    }
-
     __global__ void float32_hwc_to_uint16_hwc_kernel(
         const float* __restrict__ input,
         uint16_t* __restrict__ output,
@@ -102,27 +76,6 @@ namespace lfs::io::cuda {
         if (idx >= total)
             return;
         output[idx] = static_cast<float>(input[idx]) * NORMALIZE_SCALE_U16;
-    }
-
-    __global__ void float32_hwc_to_float32_chw_kernel(
-        const float* __restrict__ input,
-        float* __restrict__ output,
-        const size_t H,
-        const size_t W,
-        const size_t C) {
-
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        const size_t total = H * W * C;
-        if (idx >= total)
-            return;
-
-        const size_t c = idx % C;
-        const size_t tmp = idx / C;
-        const size_t w = tmp % W;
-        const size_t h = tmp / W;
-
-        const size_t out_idx = c * (H * W) + h * W + w;
-        output[out_idx] = input[idx];
     }
 
     __global__ void uint8_hwc_to_uint8_chw_kernel(
@@ -164,7 +117,8 @@ namespace lfs::io::cuda {
         const size_t h = tmp / W;
 
         const size_t out_idx = c * (H * W) + h * W + w;
-        output[out_idx] = input[idx] >> 8;
+        output[out_idx] = static_cast<uint8_t>(
+            (static_cast<uint32_t>(input[idx]) * 255u + 32767u) / 65535u);
     }
 
     __device__ __forceinline__ uint8_t float_to_u8(const float v) {
@@ -214,21 +168,6 @@ namespace lfs::io::cuda {
             input, output, height, width, channels);
     }
 
-    void launch_float32_chw_to_uint16_hwc(
-        const float* input,
-        uint16_t* output,
-        size_t height,
-        size_t width,
-        size_t channels,
-        cudaStream_t stream) {
-
-        const size_t total = height * width * channels;
-        const int num_blocks = static_cast<int>((total + BLOCK_SIZE - 1) / BLOCK_SIZE);
-
-        float32_chw_to_uint16_hwc_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-            input, output, height, width, channels);
-    }
-
     void launch_float32_hwc_to_uint16_hwc(
         const float* input,
         uint16_t* output,
@@ -257,21 +196,6 @@ namespace lfs::io::cuda {
 
         uint16_hwc_to_float_hwc_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
             input, output, total);
-    }
-
-    void launch_float32_hwc_to_float32_chw(
-        const float* input,
-        float* output,
-        size_t height,
-        size_t width,
-        size_t channels,
-        cudaStream_t stream) {
-
-        const size_t total = height * width * channels;
-        const int num_blocks = static_cast<int>((total + BLOCK_SIZE - 1) / BLOCK_SIZE);
-
-        float32_hwc_to_float32_chw_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-            input, output, height, width, channels);
     }
 
     void launch_uint8_hwc_to_uint8_chw(

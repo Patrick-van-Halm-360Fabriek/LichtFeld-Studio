@@ -27,7 +27,9 @@ namespace {
     constexpr int DEFAULT_JPEG_QUALITY = 95;
 
     template <typename T>
-    struct PixelTypeTrait;
+    struct PixelTypeTrait {
+        static_assert(!sizeof(T), "Unsupported pixel type");
+    };
 
     template <>
     struct PixelTypeTrait<uint8_t> {
@@ -37,16 +39,6 @@ namespace {
     template <>
     struct PixelTypeTrait<uint16_t> {
         static constexpr OIIO::TypeDesc value = OIIO::TypeDesc::UINT16;
-    };
-
-    template <>
-    struct PixelTypeTrait<float> {
-        static constexpr OIIO::TypeDesc value = OIIO::TypeDesc::FLOAT;
-    };
-
-    template <typename T>
-    struct PixelTypeTrait {
-        static_assert(!sizeof(T), "Unsupported pixel type");
     };
 
     template <typename T>
@@ -557,11 +549,6 @@ namespace lfs::core {
     std::tuple<uint16_t*, int, int, int>
     load_image_u16(std::filesystem::path p, int res_div, int max_width) {
         return ::load_image_t<uint16_t>(p, res_div, max_width);
-    }
-
-    std::tuple<float*, int, int, int>
-    load_image_fp32(std::filesystem::path p, int res_div, int max_width) {
-        return ::load_image_t<float>(p, res_div, max_width);
     }
 
     void save_image(const std::filesystem::path& path, lfs::core::Tensor image) {

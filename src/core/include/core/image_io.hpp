@@ -13,7 +13,6 @@
 #include <memory>
 #include <mutex>
 #include <queue>
-#include <stdfloat>
 #include <thread>
 #include <vector>
 
@@ -26,15 +25,11 @@ namespace lfs::core {
     LFS_CORE_API std::tuple<unsigned char*, int, int, int>
     load_image_from_memory(const uint8_t* data, size_t size);
 
-    // Existing functions
     LFS_CORE_API std::tuple<unsigned char*, int, int, int>
     load_image(std::filesystem::path p, int res_div = -1, int max_width = 0);
 
     LFS_CORE_API std::tuple<uint16_t*, int, int, int>
     load_image_u16(std::filesystem::path p, int res_div = -1, int max_width = 0);
-
-    LFS_CORE_API std::tuple<float*, int, int, int>
-    load_image_fp32(std::filesystem::path p, int res_div = -1, int max_width = 0);
 
     LFS_CORE_API void save_image(const std::filesystem::path& path, Tensor image);
     LFS_CORE_API void save_image_u8(const std::filesystem::path& path, Tensor image, int jpeg_quality = 95);
