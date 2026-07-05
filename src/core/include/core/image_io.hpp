@@ -13,9 +13,9 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <stdfloat>
 #include <thread>
 #include <vector>
-#include <stdfloat>
 
 namespace lfs::core {
 
@@ -39,9 +39,9 @@ namespace lfs::core {
     LFS_CORE_API void save_image(const std::filesystem::path& path, Tensor image);
     LFS_CORE_API void save_image_u8(const std::filesystem::path& path, Tensor image, int jpeg_quality = 95);
     LFS_CORE_API void save_image(const std::filesystem::path& path,
-                                const std::vector<Tensor>& images,
-                                bool horizontal = true,
-                                int separator_width = 2);
+                                 const std::vector<Tensor>& images,
+                                 bool horizontal = true,
+                                 int separator_width = 2);
 
     LFS_CORE_API bool save_img_data(const std::filesystem::path& p, const std::tuple<unsigned char*, int, int, int>& image_data);
 

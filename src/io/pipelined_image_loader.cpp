@@ -1541,8 +1541,7 @@ namespace lfs::io {
 
                     if (!used_gpu) {
 
-                        if (config_.use_16bits_pixel_depth)
-                        {
+                        if (config_.use_16bits_pixel_depth) {
                             auto [img_data, width, height, channels] = lfs::core::load_image_u16(
                                 item.path, item.params.resize_factor, item.params.max_width);
 
@@ -1591,30 +1590,29 @@ namespace lfs::io {
                             auto gpu_u8 = cpu_tensor.to(lfs::core::Device::CUDA);
                             lfs::core::free_image(img_data);
 
-                        if (item.params.output_uint8) {
-                            decoded = lfs::core::Tensor::empty(
-                                lfs::core::TensorShape({C, H, W}),
-                                lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
-                            cuda::launch_uint8_hwc_to_uint8_chw(
-                                reinterpret_cast<const uint8_t*>(gpu_u8.data_ptr()),
-                                reinterpret_cast<uint8_t*>(decoded.data_ptr()),
-                                H, W, C, nullptr);
-                        } else {
-                            decoded = lfs::core::Tensor::zeros(
-                                lfs::core::TensorShape({C, H, W}),
-                                lfs::core::Device::CUDA, lfs::core::DataType::Float32);
-                            cuda::launch_uint8_hwc_to_float32_chw(
-                                reinterpret_cast<const uint8_t*>(gpu_u8.data_ptr()),
-                                reinterpret_cast<float*>(decoded.data_ptr()),
-                                H, W, C, nullptr);
-                        }
+                            if (item.params.output_uint8) {
+                                decoded = lfs::core::Tensor::empty(
+                                    lfs::core::TensorShape({C, H, W}),
+                                    lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
+                                cuda::launch_uint8_hwc_to_uint8_chw(
+                                    reinterpret_cast<const uint8_t*>(gpu_u8.data_ptr()),
+                                    reinterpret_cast<uint8_t*>(decoded.data_ptr()),
+                                    H, W, C, nullptr);
+                            } else {
+                                decoded = lfs::core::Tensor::zeros(
+                                    lfs::core::TensorShape({C, H, W}),
+                                    lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+                                cuda::launch_uint8_hwc_to_float32_chw(
+                                    reinterpret_cast<const uint8_t*>(gpu_u8.data_ptr()),
+                                    reinterpret_cast<float*>(decoded.data_ptr()),
+                                    H, W, C, nullptr);
+                            }
 
                             if (const cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess) {
                                 throw std::runtime_error(std::string("CUDA sync failed: ") + cudaGetErrorString(err));
                             }
                             gpu_u8 = lfs::core::Tensor();
                         }
-
                     }
 
                     if (item.undistort) {

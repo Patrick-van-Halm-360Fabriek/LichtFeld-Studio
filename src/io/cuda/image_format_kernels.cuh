@@ -44,7 +44,7 @@ namespace lfs::io::cuda {
         size_t channels,
         cudaStream_t stream = nullptr);
 
-     // Fused kernel: uint16 HWC [0, 65535] -> float32 HWC [0,1]
+    // Fused kernel: uint16 HWC [0, 65535] -> float32 HWC [0,1]
     void launch_uint16_hwc_to_float32_hwc(
         const uint16_t* input,
         float* output,

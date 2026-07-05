@@ -97,7 +97,7 @@ namespace lfs::core {
                 const float* __restrict__ pre_coef_x,
                 const float* __restrict__ pre_coef_y,
                 const T* __restrict__ input, // [H, W, C] T
-                float* __restrict__ output         // [C, H, W] float32
+                float* __restrict__ output   // [C, H, W] float32
             ) {
             const auto block = cg::this_thread_block();
             const uint32_t thread_idx_x = block.thread_index().x;

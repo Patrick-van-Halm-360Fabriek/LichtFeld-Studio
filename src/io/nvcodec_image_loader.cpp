@@ -1008,7 +1008,7 @@ namespace lfs::io {
         std::optional<Tensor> u16_converted;
 
         if (decode_u16_data_path && needs_resize) {
-             u16_converted.emplace(Tensor::empty(
+            u16_converted.emplace(Tensor::empty(
                 TensorShape({static_cast<size_t>(src_height), static_cast<size_t>(src_width), static_cast<size_t>(3)}),
                 Device::CUDA,
                 DataType::Float32));
@@ -1017,7 +1017,6 @@ namespace lfs::io {
                 reinterpret_cast<const uint16_t*>(image_tensor_aux.data_ptr()),
                 reinterpret_cast<float*>(u16_converted.value().data_ptr()),
                 src_height, src_width, 3, static_cast<cudaStream_t>(cuda_stream));
-
         }
 
         const Tensor& resize_input_image = u16_converted.has_value()
@@ -1593,11 +1592,11 @@ namespace lfs::io {
             lfs::core::TensorShape({height, width, channels}),
             lfs::core::Device::CUDA, lfs::core::DataType::Float16);
 
-        auto convert_to_uint16 = [height, width, channels](const Tensor& in, Tensor& out){
+        auto convert_to_uint16 = [height, width, channels](const Tensor& in, Tensor& out) {
             cuda::launch_float32_hwc_to_uint16_hwc(
-                    reinterpret_cast<const float*>(in.data_ptr()),
-                    reinterpret_cast<uint16_t*>(out.data_ptr()),
-                    height, width, channels, nullptr);
+                reinterpret_cast<const float*>(in.data_ptr()),
+                reinterpret_cast<uint16_t*>(out.data_ptr()),
+                height, width, channels, nullptr);
         };
 
         if (is_chw) {

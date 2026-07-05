@@ -126,8 +126,8 @@ namespace {
 
     template <typename T>
     T* downscale_resample_direct(const T* src_rgb,
-                                            int w, int h, int nw, int nh,
-                                            int nthreads /* 0=auto, 1=single */) {
+                                 int w, int h, int nw, int nh,
+                                 int nthreads /* 0=auto, 1=single */) {
         return downscale_resample_nch<T>(src_rgb, w, h, nw, nh, 3, nthreads);
     }
 
@@ -555,14 +555,12 @@ namespace lfs::core {
     }
 
     std::tuple<uint16_t*, int, int, int>
-    load_image_u16(std::filesystem::path p, int res_div, int max_width)
-    {
+    load_image_u16(std::filesystem::path p, int res_div, int max_width) {
         return ::load_image_t<uint16_t>(p, res_div, max_width);
     }
 
     std::tuple<float*, int, int, int>
-    load_image_fp32(std::filesystem::path p, int res_div, int max_width)
-    {
+    load_image_fp32(std::filesystem::path p, int res_div, int max_width) {
         return ::load_image_t<float>(p, res_div, max_width);
     }
 

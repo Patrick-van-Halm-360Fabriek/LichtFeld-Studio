@@ -104,7 +104,6 @@ namespace lfs::io::cuda {
         output[idx] = static_cast<float>(input[idx]) * NORMALIZE_SCALE_U16;
     }
 
-
     __global__ void float32_hwc_to_float32_chw_kernel(
         const float* __restrict__ input,
         float* __restrict__ output,
@@ -213,7 +212,6 @@ namespace lfs::io::cuda {
 
         uint16_hwc_to_float32_chw_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
             input, output, height, width, channels);
-
     }
 
     void launch_float32_chw_to_uint16_hwc(
@@ -259,7 +257,6 @@ namespace lfs::io::cuda {
 
         uint16_hwc_to_float_hwc_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
             input, output, total);
-
     }
 
     void launch_float32_hwc_to_float32_chw(
@@ -274,7 +271,7 @@ namespace lfs::io::cuda {
         const int num_blocks = static_cast<int>((total + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
         float32_hwc_to_float32_chw_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-                input, output, height, width, channels);
+            input, output, height, width, channels);
     }
 
     void launch_uint8_hwc_to_uint8_chw(
