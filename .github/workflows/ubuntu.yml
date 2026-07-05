@@ -88,6 +88,7 @@ jobs:
                               --slave /usr/bin/g++ g++ /usr/bin/g++-14
 
       - name: Ensure cuDNN is available
+        shell: bash
         run: |
           set -euo pipefail
           if [ -f /usr/local/cuda/include/cudnn.h ] && \
