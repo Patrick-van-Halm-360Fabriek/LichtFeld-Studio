@@ -185,6 +185,7 @@ set(TEST_FILES
     test_mcmc_critical_bugs.cpp
     test_mcmc_dead_mask.cpp
     test_relocate_gs_edge_cases.cpp
+    test_training_cropbox_mask.cpp
     test_bool_reduction.cpp
     test_tensor_index_select_bool.cpp
     test_tensor_index_select_uint8.cpp
