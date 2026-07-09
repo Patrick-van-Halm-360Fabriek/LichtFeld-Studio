@@ -323,29 +323,40 @@ namespace lfs::vis::gui {
         return image.contiguous();
     }
 
-    void applyVideoExportPointCloudFilters(rendering::PointCloudFilterState& filters,
-                                           const VideoExportSceneSnapshot& snapshot,
-                                           const RenderSettings& render_settings) {
-        if (!(render_settings.use_crop_box || render_settings.show_crop_box) || snapshot.cropboxes.empty()) {
+        void applyVideoExportPointCloudFilters(rendering::PointCloudFilterState& filters,
+                                               const VideoExportSceneSnapshot& snapshot,
+                                               const RenderSettings& render_settings) {
+        if (snapshot.cropboxes.empty()) {
             return;
         }
 
-        const size_t idx = (snapshot.selected_cropbox_index >= 0)
-                               ? static_cast<size_t>(snapshot.selected_cropbox_index)
-                               : 0;
-        if (idx >= snapshot.cropboxes.size() || !snapshot.cropboxes[idx].has_data) {
+        const VideoExportCropBoxSnapshot* selected = nullptr;
+        if (snapshot.selected_cropbox_index >= 0) {
+            const size_t idx = static_cast<size_t>(snapshot.selected_cropbox_index);
+            if (idx < snapshot.cropboxes.size() && snapshot.cropboxes[idx].has_data &&
+                snapshot.cropboxes[idx].data.enabled) {
+                selected = &snapshot.cropboxes[idx];
+            }
+        }
+        if (!selected) {
+            for (const auto& cb : snapshot.cropboxes) {
+                if (cb.has_data && cb.data.enabled) {
+                    selected = &cb;
+                    break;
+                }
+            }
+        }
+        if (!selected) {
             return;
         }
 
-        const auto& cb = snapshot.cropboxes[idx];
+        const auto& cb = *selected;
         filters.crop_box = rendering::BoundingBox{
             .min = cb.data.min,
             .max = cb.data.max,
             .transform = glm::inverse(cb.world_transform)};
         filters.crop_inverse = cb.data.inverse;
-        filters.crop_desaturate = render_settings.show_crop_box &&
-                                  !render_settings.use_crop_box &&
-                                  render_settings.desaturate_cropping;
+        filters.crop_desaturate = render_settings.desaturate_cropping;
     }
 
     rendering::MeshRenderOptions makeVideoExportMeshOptions(const RenderSettings& render_settings,
@@ -389,6 +400,7 @@ namespace lfs::vis::gui {
                 .data = cb.has_data ? &cb.data : nullptr,
                 .world_transform = cb.world_transform,
                 .local_transform = glm::mat4(1.0f),
+                .effectively_visible = true,
             });
         }
 
@@ -401,6 +413,7 @@ namespace lfs::vis::gui {
                 .data = &el.data,
                 .world_transform = el.world_transform,
                 .local_transform = glm::mat4(1.0f),
+                .effectively_visible = true,
             });
         }
         return state;

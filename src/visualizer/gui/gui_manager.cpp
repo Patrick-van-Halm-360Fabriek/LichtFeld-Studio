@@ -2375,7 +2375,32 @@ namespace lfs::vis::gui {
                                    4.5f);
             }
 
-            if (gizmo.cropbox_active) {
+            const auto selected_cropbox_is_visible = [&]() {
+                if (!scene_state || !scene_manager)
+                    return true;
+                const core::NodeId selected_id = scene_manager->getSelectedNodeCropBoxId();
+                if (selected_id == core::NULL_NODE)
+                    return !gizmo.cropbox_affects_render;
+                for (const auto& cb : scene_state->cropboxes) {
+                    if (cb.node_id == selected_id)
+                        return cb.effectively_visible;
+                }
+                return false;
+            };
+            const auto selected_ellipsoid_is_visible = [&]() {
+                if (!scene_state || !scene_manager)
+                    return true;
+                const core::NodeId selected_id = scene_manager->getSelectedNodeEllipsoidId();
+                if (selected_id == core::NULL_NODE)
+                    return !gizmo.ellipsoid_affects_render;
+                for (const auto& el : scene_state->ellipsoids) {
+                    if (el.node_id == selected_id)
+                        return el.effectively_visible;
+                }
+                return false;
+            };
+
+            if (gizmo.cropbox_active && selected_cropbox_is_visible()) {
                 appendProjectedBox(params.overlay_triangles, params, panel, settings,
                                    gizmo.cropbox_min,
                                    gizmo.cropbox_max,
@@ -2384,7 +2409,7 @@ namespace lfs::vis::gui {
                                    2.0f);
             }
 
-            if (gizmo.ellipsoid_active) {
+            if (gizmo.ellipsoid_active && selected_ellipsoid_is_visible()) {
                 appendProjectedEllipsoid(params.overlay_triangles, params, panel, settings,
                                          gizmo.ellipsoid_radii,
                                          gizmo.ellipsoid_transform,
@@ -2396,44 +2421,38 @@ namespace lfs::vis::gui {
                 return;
             }
 
-            if (settings.show_crop_box) {
-                const core::NodeId selected_id = scene_manager->getSelectedNodeCropBoxId();
-                for (const auto& cb : scene_state->cropboxes) {
-                    if (!cb.data) {
-                        continue;
-                    }
-                    const bool selected = cb.node_id == selected_id;
-                    const bool use_pending = selected && gizmo.cropbox_active;
-                    const glm::vec3 box_min = use_pending ? gizmo.cropbox_min : cb.data->min;
-                    const glm::vec3 box_max = use_pending ? gizmo.cropbox_max : cb.data->max;
-                    const glm::mat4 world_transform = use_pending ? gizmo.cropbox_transform : cb.world_transform;
-                    const float flash = selected ? std::clamp(cb.data->flash_intensity, 0.0f, 1.0f) : 0.0f;
-                    appendProjectedBox(params.overlay_triangles, params, panel, settings,
-                                       box_min,
-                                       box_max,
-                                       world_transform,
-                                       cropGuideColor(cb.data->color, cb.data->inverse, flash),
-                                       cb.data->line_width + flash * 4.0f);
+            const core::NodeId selected_cropbox_id = scene_manager->getSelectedNodeCropBoxId();
+            for (const auto& cb : scene_state->cropboxes) {
+                if (!cb.data || !cb.effectively_visible || cb.node_id != selected_cropbox_id) {
+                    continue;
                 }
+                const bool use_pending = gizmo.cropbox_active;
+                const glm::vec3 box_min = use_pending ? gizmo.cropbox_min : cb.data->min;
+                const glm::vec3 box_max = use_pending ? gizmo.cropbox_max : cb.data->max;
+                const glm::mat4 world_transform = use_pending ? gizmo.cropbox_transform : cb.world_transform;
+                const float flash = std::clamp(cb.data->flash_intensity, 0.0f, 1.0f);
+                appendProjectedBox(params.overlay_triangles, params, panel, settings,
+                                   box_min,
+                                   box_max,
+                                   world_transform,
+                                   cropGuideColor(cb.data->color, cb.data->inverse, flash),
+                                   cb.data->line_width + flash * 4.0f);
             }
 
-            if (settings.show_ellipsoid) {
-                const core::NodeId selected_id = scene_manager->getSelectedNodeEllipsoidId();
-                for (const auto& el : scene_state->ellipsoids) {
-                    if (!el.data) {
-                        continue;
-                    }
-                    const bool selected = el.node_id == selected_id;
-                    const bool use_pending = selected && gizmo.ellipsoid_active;
-                    const glm::vec3 radii = use_pending ? gizmo.ellipsoid_radii : el.data->radii;
-                    const glm::mat4 world_transform = use_pending ? gizmo.ellipsoid_transform : el.world_transform;
-                    const float flash = selected ? std::clamp(el.data->flash_intensity, 0.0f, 1.0f) : 0.0f;
-                    appendProjectedEllipsoid(params.overlay_triangles, params, panel, settings,
-                                             radii,
-                                             world_transform,
-                                             cropGuideColor(el.data->color, el.data->inverse, flash),
-                                             el.data->line_width + flash * 4.0f);
+            const core::NodeId selected_ellipsoid_id = scene_manager->getSelectedNodeEllipsoidId();
+            for (const auto& el : scene_state->ellipsoids) {
+                if (!el.data || !el.effectively_visible || el.node_id != selected_ellipsoid_id) {
+                    continue;
                 }
+                const bool use_pending = gizmo.ellipsoid_active;
+                const glm::vec3 radii = use_pending ? gizmo.ellipsoid_radii : el.data->radii;
+                const glm::mat4 world_transform = use_pending ? gizmo.ellipsoid_transform : el.world_transform;
+                const float flash = std::clamp(el.data->flash_intensity, 0.0f, 1.0f);
+                appendProjectedEllipsoid(params.overlay_triangles, params, panel, settings,
+                                         radii,
+                                         world_transform,
+                                         cropGuideColor(el.data->color, el.data->inverse, flash),
+                                         el.data->line_width + flash * 4.0f);
             }
         }
 

@@ -500,11 +500,8 @@ namespace lfs::app {
                 }
             }
 
-            if (rendering_manager) {
-                const auto settings = rendering_manager->getSettings();
-                crop_box["show"] = settings.show_crop_box;
-                crop_box["use"] = settings.use_crop_box;
-            }
+            crop_box["show"] = node->visible.get();
+            crop_box["use"] = node->cropbox->enabled;
 
             return json{{"success", true}, {"crop_box", crop_box}};
         }
@@ -1251,11 +1248,8 @@ namespace lfs::app {
                     ellipsoid["parent"] = parent->name;
             }
 
-            if (rendering_manager) {
-                const auto settings = rendering_manager->getSettings();
-                ellipsoid["show"] = settings.show_ellipsoid;
-                ellipsoid["use"] = settings.use_ellipsoid;
-            }
+            ellipsoid["show"] = node->visible.get();
+            ellipsoid["use"] = node->ellipsoid->enabled;
 
             return json{{"success", true}, {"ellipsoid", ellipsoid}};
         }
@@ -2244,7 +2238,7 @@ namespace lfs::app {
                         {"ppisp", json{{"type", "object"}}}},
                     .required = {}}},
             [viewer_impl](const json& args) -> json {
-                return post_and_wait(viewer_impl, [args]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args]() -> json {
                     auto settings = vis::get_render_settings();
                     if (!settings)
                         return json{{"error", "Render settings bridge is not available"}};
@@ -2253,6 +2247,32 @@ namespace lfs::app {
                         return json{{"error", result.error()}};
 
                     vis::update_render_settings(*settings);
+
+                    auto* const scene_manager = viewer_impl->getSceneManager();
+                    auto* const rendering_manager = viewer_impl->getRenderingManager();
+                    if (scene_manager && (args.contains("show_crop_box") || args.contains("use_crop_box"))) {
+                        auto cropbox_id = resolve_cropbox_id(*scene_manager, std::nullopt);
+                        if (cropbox_id) {
+                            vis::cap::CropBoxUpdate update;
+                            update.has_show = args.contains("show_crop_box");
+                            update.show = update.has_show ? args["show_crop_box"].get<bool>() : false;
+                            update.has_use = args.contains("use_crop_box");
+                            update.use = update.has_use ? args["use_crop_box"].get<bool>() : false;
+                            (void)vis::cap::updateCropBox(*scene_manager, rendering_manager, *cropbox_id, update);
+                        }
+                    }
+                    if (scene_manager && (args.contains("show_ellipsoid") || args.contains("use_ellipsoid"))) {
+                        auto ellipsoid_id = resolve_ellipsoid_id(*scene_manager, std::nullopt);
+                        if (ellipsoid_id) {
+                            vis::cap::EllipsoidUpdate update;
+                            update.has_show = args.contains("show_ellipsoid");
+                            update.show = update.has_show ? args["show_ellipsoid"].get<bool>() : false;
+                            update.has_use = args.contains("use_ellipsoid");
+                            update.use = update.has_use ? args["use_ellipsoid"].get<bool>() : false;
+                            (void)vis::cap::updateEllipsoid(*scene_manager, rendering_manager, *ellipsoid_id, update);
+                        }
+                    }
+
                     const auto updated = vis::get_render_settings();
                     if (!updated)
                         return json{{"success", true}};

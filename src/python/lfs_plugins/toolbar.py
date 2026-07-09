@@ -84,7 +84,10 @@ def _current_selected_node_types() -> tuple[str, ...]:
     try:
         import lichtfeld as lf
 
-        scene = lf.scene.current()
+        get_scene = getattr(lf, "get_scene", None)
+        scene = get_scene() if callable(get_scene) else None
+        if scene is None:
+            return ()
         selected_names = lf.get_selected_node_names() or []
         node_types: list[str] = []
         for name in selected_names:
@@ -586,7 +589,65 @@ class _GizmoToolbarController:
             )
         ]
 
-    def _active_crop_shape(self):
+    @staticmethod
+    def _node_type_name(node):
+        node_type = getattr(node, "type", None)
+        type_name = getattr(node_type, "name", None)
+        if type_name:
+            return str(type_name).upper()
+        text = str(node_type)
+        if "." in text:
+            text = text.rsplit(".", 1)[-1]
+        return text.upper()
+
+    @staticmethod
+    def _scene_node_by_id(scene, node_id):
+        getter = getattr(scene, "get_node_by_id", None)
+        return getter(node_id) if callable(getter) else None
+
+    def _crop_shape_for_existing_selection(self):
+        try:
+            import lichtfeld as lf
+
+            scene_getter = getattr(lf, "get_scene", None)
+            selected_getter = getattr(lf, "get_selected_node_names", None)
+            if not callable(scene_getter) or not callable(selected_getter):
+                return None
+            scene = scene_getter()
+            if scene is None:
+                return None
+            get_node = getattr(scene, "get_node", None)
+            if not callable(get_node):
+                return None
+
+            def shape_for_node(node):
+                type_name = self._node_type_name(node)
+                if type_name == "ELLIPSOID":
+                    return "ellipsoid"
+                if type_name == "CROPBOX":
+                    return "box"
+                for child_id in getattr(node, "children", []) or []:
+                    child = self._scene_node_by_id(scene, child_id)
+                    if child is None:
+                        continue
+                    child_shape = shape_for_node(child)
+                    if child_shape:
+                        return child_shape
+                return None
+
+            for name in selected_getter() or []:
+                shape = shape_for_node(get_node(name))
+                if shape:
+                    return shape
+        except Exception:
+            pass
+        return None
+
+    def _active_crop_shape(self, infer_selection_shape=False):
+        if infer_selection_shape:
+            shape = self._crop_shape_for_existing_selection()
+            if shape in self._CROP_OBJECT_SHAPES:
+                return shape
         try:
             import lichtfeld as lf
 
@@ -599,10 +660,14 @@ class _GizmoToolbarController:
             pass
         return "box"
 
-    def _activate_crop_tool(self, gizmo_type="translate"):
+    def _activate_crop_tool(self, gizmo_type="translate", infer_selection_shape=True):
         import lichtfeld as lf
 
-        shape = self._active_crop_shape()
+        shape = self._active_crop_shape(infer_selection_shape)
+        if infer_selection_shape:
+            set_shape = getattr(lf.ui, "set_crop_tool_shape", None)
+            if callable(set_shape):
+                set_shape(shape)
         selected_getter = getattr(lf, "get_selected_node_names", None)
         selected = (selected_getter() or []) if callable(selected_getter) else []
         if shape == "box" and selected:
@@ -745,7 +810,7 @@ class _GizmoToolbarController:
                 set_shape = getattr(lf.ui, "set_crop_tool_shape", None)
                 if callable(set_shape):
                     set_shape(value)
-                self._activate_crop_tool(current_gizmo or "translate")
+                self._activate_crop_tool(current_gizmo or "translate", infer_selection_shape=False)
             return
 
         if action == "crop_transform":
@@ -755,26 +820,16 @@ class _GizmoToolbarController:
                     if callable(set_operation):
                         set_operation(value)
                     return
-                self._activate_crop_tool(value)
+                self._activate_crop_tool(value, infer_selection_shape=False)
             return
 
         if action == "crop_trim":
-            if self._active_crop_shape() == "box":
-                fit_cropbox = getattr(lf.ui, "fit_cropbox_to_scene", None)
-                if callable(fit_cropbox):
-                    fit_cropbox(True)
-                    return
             fit_crop = getattr(lf.ui, "fit_crop_tool", None)
             if callable(fit_crop):
                 fit_crop(True)
             return
 
         if action == "crop_apply":
-            if self._active_crop_shape() == "box":
-                apply_cropbox = getattr(lf.ui, "apply_cropbox", None)
-                if callable(apply_cropbox):
-                    apply_cropbox()
-                    return
             apply_crop_tool = getattr(lf.ui, "apply_crop_tool", None)
             if callable(apply_crop_tool):
                 apply_crop_tool()
