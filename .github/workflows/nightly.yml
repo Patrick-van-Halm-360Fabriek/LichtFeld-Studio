@@ -5,11 +5,6 @@
 name: Windows Package Publish
 
 on:
-  schedule:
-    - cron: '0 1 * * *'  # 2 AM CET (1 AM UTC)
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       force_build:
@@ -35,7 +30,6 @@ env:
 
 jobs:
   precheck:
-    if: github.repository == 'MrNeRF/LichtFeld-Studio'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -176,8 +170,9 @@ jobs:
 
   build-windows:
     needs: precheck
-    if: github.repository == 'MrNeRF/LichtFeld-Studio' && needs.precheck.outputs.should_build == 'true'
     runs-on: windows-2022
+    permissions:
+      contents: write
     env:
       VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
       VCPKG_BUILD_TYPE: release
@@ -409,117 +404,97 @@ jobs:
           "full_sha=$fullSha" >> $env:GITHUB_OUTPUT
           "built_at=$builtAt" >> $env:GITHUB_OUTPUT
 
-      # Package binaries must not be uploaded as GitHub Actions artifacts.
-      # Keep the generated zip on the runner and publish it directly to R2.
-      # AWS CLI is preinstalled on windows-2022 hosted runners.
-      - name: Verify AWS CLI
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          aws --version
-
-      - name: Upload package to Cloudflare R2
+      - name: Prepare GitHub release
+        id: release
         shell: pwsh
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
           BUILD_CHANNEL: ${{ steps.package.outputs.build_channel }}
           FILE_NAME: ${{ steps.package.outputs.package_name }}
-          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.package_version }}
+          FULL_SHA: ${{ steps.package.outputs.full_sha }}
+          BUILT_AT: ${{ steps.package.outputs.built_at }}
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($name in @('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'R2_ACCOUNT_ID', 'R2_BUCKET', 'BUILD_CHANNEL', 'FILE_NAME')) {
-            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
-              throw "Missing $name"
-            }
+          if ($env:BUILD_CHANNEL -eq 'nightly') {
+            $tagName = 'nightly'
+            $releaseName = 'Nightly Build'
+            $prerelease = 'true'
+            $body = @(
+              "Automated nightly build from ``$env:FULL_SHA``",
+              '',
+              "**Nightly version:** ``v$env:PACKAGE_VERSION``",
+              "**Built:** $env:BUILT_AT",
+              "**Branch:** $env:GITHUB_REF_NAME",
+              "**Assets retained:** latest 7 builds",
+              '',
+              'This is an unstable development build. For stable releases, see the [Releases](../../releases) page.'
+            )
+          } elseif ($env:BUILD_CHANNEL -eq 'stable') {
+            $tagName = "v$env:PACKAGE_VERSION"
+            $releaseName = "LichtFeld Studio v$env:PACKAGE_VERSION"
+            $prerelease = 'false'
+            $body = @(
+              "Stable Windows package for ``v$env:PACKAGE_VERSION``.",
+              '',
+              "**Commit:** ``$env:FULL_SHA``",
+              "**Built:** $env:BUILT_AT"
+            )
+          } else {
+            throw "Unsupported build channel '$env:BUILD_CHANNEL'."
           }
 
-          $endpointUrl = "https://$($env:R2_ACCOUNT_ID).r2.cloudflarestorage.com"
-          $versionedKey = "windows/$($env:BUILD_CHANNEL)/$($env:FILE_NAME)"
-          $checksumFile = "$($env:FILE_NAME).sha256"
-          $checksumKey = "$versionedKey.sha256"
-          $checksum = (Get-FileHash -Algorithm SHA256 -Path $env:FILE_NAME).Hash.ToLowerInvariant()
-          Set-Content -Path $checksumFile -Value "$checksum  $($env:FILE_NAME)" -Encoding ascii
+          $body | Out-File -FilePath release-notes.md -Encoding utf8
+          "tag_name=$tagName" >> $env:GITHUB_OUTPUT
+          "release_name=$releaseName" >> $env:GITHUB_OUTPUT
+          "prerelease=$prerelease" >> $env:GITHUB_OUTPUT
 
-          aws s3 cp $checksumFile "s3://$($env:R2_BUCKET)/$checksumKey" `
-            --endpoint-url $endpointUrl `
-            --content-type text/plain `
-            --only-show-errors `
-            2>$null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to upload private R2 checksum object."
-          }
-          aws s3 cp $env:FILE_NAME "s3://$($env:R2_BUCKET)/$versionedKey" `
-            --endpoint-url $endpointUrl `
-            --content-type application/zip `
-            --only-show-errors `
-            2>$null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to upload private R2 package object."
-          }
+      - name: Upload package to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag_name }}
+          name: ${{ steps.release.outputs.release_name }}
+          body_path: release-notes.md
+          overwrite_files: true
+          prerelease: ${{ steps.release.outputs.prerelease }}
+          target_commitish: ${{ steps.package.outputs.full_sha }}
+          files: ${{ steps.package.outputs.package_name }}
 
-      # Confirms the zip landed intact before reporting success. Size mismatch
-      # is the most likely failure mode on flaky networks; a missing sidecar .sha256
-      # would silently break download verification.
-      - name: Verify R2 upload
+      - name: Trim nightly release assets to latest 7 builds
+        if: steps.package.outputs.build_channel == 'nightly'
         shell: pwsh
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          BUILD_CHANNEL: ${{ steps.package.outputs.build_channel }}
-          FILE_NAME: ${{ steps.package.outputs.package_name }}
-          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $endpointUrl = "https://$($env:R2_ACCOUNT_ID).r2.cloudflarestorage.com"
-          $versionedKey = "windows/$($env:BUILD_CHANNEL)/$($env:FILE_NAME)"
-          $checksumKey = "$versionedKey.sha256"
-          $localSize = (Get-Item $env:FILE_NAME).Length
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/nightly" | ConvertFrom-Json
+          $oldAssets = @(
+            $release.assets |
+              Where-Object { $_.name -match '^LichtFeld-Studio-windows-v[0-9]+\.[0-9]+(\.[0-9]+)?\.dev[0-9]{8}\+[0-9a-f]+\.zip$' } |
+              Sort-Object created_at -Descending |
+              Select-Object -Skip 7
+          )
 
-          $headOutput = aws s3api head-object `
-            --bucket $env:R2_BUCKET `
-            --key $versionedKey `
-            --endpoint-url $endpointUrl `
-            2>$null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to verify private R2 package object."
+          foreach ($asset in $oldAssets) {
+            Write-Host "Deleting old nightly asset: $($asset.name)"
+            gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/assets/$($asset.id)"
           }
-
-          $headJson = $headOutput | ConvertFrom-Json
-          if ($headJson.ContentLength -ne $localSize) {
-            throw "Private R2 package object size mismatch (local=$localSize, remote=$($headJson.ContentLength))"
-          }
-
-          $checksumOutput = aws s3api head-object `
-            --bucket $env:R2_BUCKET `
-            --key $checksumKey `
-            --endpoint-url $endpointUrl `
-            2>$null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to verify private R2 checksum object."
-          }
-
-          Write-Host "Verified private R2 package upload and checksum sidecar."
 
       - name: Publish summary
         shell: pwsh
         env:
           BUILD_CHANNEL: ${{ steps.package.outputs.build_channel }}
+          FILE_NAME: ${{ steps.package.outputs.package_name }}
           FULL_SHA: ${{ steps.package.outputs.full_sha }}
           BUILT_AT: ${{ steps.package.outputs.built_at }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
         run: |
           $ErrorActionPreference = 'Stop'
           $summary = @(
-            '### Private Package Upload'
-            ''
-            '- Private R2 upload completed.'
-            "- Channel: ``$env:BUILD_CHANNEL``"
-            "- Commit: ``$env:FULL_SHA``"
+            '### GitHub Package Upload',
+            '',
+            "- Uploaded ``$env:FILE_NAME`` to GitHub release ``$env:RELEASE_TAG``.",
+            "- Channel: ``$env:BUILD_CHANNEL``",
+            "- Commit: ``$env:FULL_SHA``",
             "- Built at: ``$env:BUILT_AT``"
-            '- Public download URL: not published.'
           )
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
