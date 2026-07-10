@@ -223,7 +223,7 @@ void apply_ellipsoid_filter(
     if (!applies) return;
 
     float3 local = transform_point_rows(overlay_params, flags_idx + 2u, mean_ws);
-    float3 radii = overlay_params[flags_idx + 1u].xyz;
+    float3 radii = max(abs(overlay_params[flags_idx + 1u].xyz), float3(1e-8f));
     float norm = (local.x * local.x) / (radii.x * radii.x) +
                  (local.y * local.y) / (radii.y * radii.y) +
                  (local.z * local.z) / (radii.z * radii.z);
