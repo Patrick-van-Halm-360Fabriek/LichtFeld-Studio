@@ -4674,6 +4674,28 @@ namespace lfs::python {
             "Fit the active crop tool primitive through the node-backed crop command path");
 
         m.def(
+            "reset_crop_tool",
+            []() {
+                if (auto* const gui = lfs::python::get_gui_manager()) {
+                    if (gui->gizmo().cropToolShape() == "ellipsoid") {
+                        lfs::core::events::cmd::ResetEllipsoid{}.emit();
+                    } else {
+                        lfs::core::events::cmd::ResetCropBox{}.emit();
+                    }
+                }
+            },
+            "Reset the active crop tool primitive through the node-backed crop command path");
+
+        m.def(
+            "delete_crop_tool_volume",
+            []() {
+                if (auto* const gui = lfs::python::get_gui_manager()) {
+                    gui->gizmo().deleteActiveCropToolVolume();
+                }
+            },
+            "Delete the active crop tool primitive and leave the crop tool");
+
+        m.def(
             "fit_cropbox_to_scene",
             [](bool use_percentile) { lfs::core::events::cmd::FitCropBoxToScene{.use_percentile = use_percentile}.emit(); },
             nb::arg("use_percentile") = false, "Fit cropbox to scene bounds");

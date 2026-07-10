@@ -27,6 +27,19 @@ namespace lfs::vis {
             return nullptr;
         }
 
+        [[nodiscard]] const lfs::core::Scene::RenderableCropBox* findEnabledPointCloudCropBox(
+            const std::vector<lfs::core::Scene::RenderableCropBox>& cropboxes,
+            const core::NodeId node_id) {
+            if (node_id == core::NULL_NODE) {
+                return nullptr;
+            }
+            for (const auto& cb : cropboxes) {
+                if (cb.node_id == node_id && cb.data && cb.data->enabled) {
+                    return &cb;
+                }
+            }
+            return nullptr;
+        }
         [[nodiscard]] const lfs::core::Scene::RenderableCropBox* singleEnabledCropBox(
             const std::vector<lfs::core::Scene::RenderableCropBox>& cropboxes) {
             const lfs::core::Scene::RenderableCropBox* selected = nullptr;
@@ -56,6 +69,19 @@ namespace lfs::vis {
             return nullptr;
         }
 
+        [[nodiscard]] const lfs::core::Scene::RenderableEllipsoid* findEnabledPointCloudEllipsoid(
+            const std::vector<lfs::core::Scene::RenderableEllipsoid>& ellipsoids,
+            const core::NodeId node_id) {
+            if (node_id == core::NULL_NODE) {
+                return nullptr;
+            }
+            for (const auto& el : ellipsoids) {
+                if (el.node_id == node_id && el.data && el.data->enabled) {
+                    return &el;
+                }
+            }
+            return nullptr;
+        }
         [[nodiscard]] const lfs::core::Scene::RenderableEllipsoid* singleEnabledEllipsoid(
             const std::vector<lfs::core::Scene::RenderableEllipsoid>& ellipsoids) {
             const lfs::core::Scene::RenderableEllipsoid* selected = nullptr;
@@ -94,6 +120,27 @@ namespace lfs::vis {
             return singleEnabledCropBox(cropboxes);
         }
 
+        [[nodiscard]] const lfs::core::Scene::RenderableCropBox* activePointCloudCropBoxFilter(const FrameContext& ctx) {
+            const auto& cropboxes = ctx.scene_state.cropboxes;
+            const core::NodeId selected_cropbox_id =
+                ctx.scene_manager ? ctx.scene_manager->getSelectedNodeCropBoxId() : core::NULL_NODE;
+            if (const auto* const cb = findEnabledPointCloudCropBox(cropboxes, selected_cropbox_id)) {
+                return cb;
+            }
+
+            const auto selected_idx = ctx.scene_state.selected_cropbox_index;
+            if (selected_idx >= 0) {
+                const size_t idx = static_cast<size_t>(selected_idx);
+                if (idx < cropboxes.size() && cropboxes[idx].data && cropboxes[idx].data->enabled) {
+                    return &cropboxes[idx];
+                }
+            }
+
+            if (ctx.scene_manager && ctx.scene_manager->hasSelectedNode()) {
+                return nullptr;
+            }
+            return singleEnabledCropBox(cropboxes);
+        }
         [[nodiscard]] const lfs::core::Scene::RenderableEllipsoid* activeEllipsoidFilter(const FrameContext& ctx) {
             const auto& ellipsoids = ctx.scene_state.ellipsoids;
             const core::NodeId selected_ellipsoid_id =
@@ -108,6 +155,19 @@ namespace lfs::vis {
             return singleEnabledEllipsoid(ellipsoids);
         }
 
+        [[nodiscard]] const lfs::core::Scene::RenderableEllipsoid* activePointCloudEllipsoidFilter(const FrameContext& ctx) {
+            const auto& ellipsoids = ctx.scene_state.ellipsoids;
+            const core::NodeId selected_ellipsoid_id =
+                ctx.scene_manager ? ctx.scene_manager->getSelectedNodeEllipsoidId() : core::NULL_NODE;
+            if (const auto* const el = findEnabledPointCloudEllipsoid(ellipsoids, selected_ellipsoid_id)) {
+                return el;
+            }
+
+            if (ctx.scene_manager && ctx.scene_manager->hasSelectedNode()) {
+                return nullptr;
+            }
+            return singleEnabledEllipsoid(ellipsoids);
+        }
         void upsertScopedCropBox(std::vector<lfs::rendering::GaussianScopedBoxFilter>& filters,
                                  lfs::rendering::GaussianScopedBoxFilter filter) {
             if (filter.parent_node_index < 0) {
@@ -154,28 +214,51 @@ namespace lfs::vis {
                 filters.crop_region = filters.crop_regions.front();
             }
         }
-        void applyPointCloudCropBox(lfs::rendering::PointCloudFilterState& filters, const FrameContext& ctx) {
+        void applyPointCloudCropVolume(lfs::rendering::PointCloudFilterState& filters, const FrameContext& ctx) {
+            if (ctx.gizmo.ellipsoid_active && ctx.gizmo.ellipsoid_affects_render &&
+                ctx.gizmo.ellipsoid_parent_node_index >= 0) {
+                filters.crop_ellipsoid = lfs::rendering::Ellipsoid{
+                    .radii = ctx.gizmo.ellipsoid_radii,
+                    .transform = glm::inverse(ctx.gizmo.ellipsoid_transform)};
+                filters.crop_box.reset();
+                filters.crop_inverse = false;
+                filters.crop_desaturate = ctx.settings.desaturate_cropping;
+                return;
+            }
+
             if (ctx.gizmo.cropbox_active && ctx.gizmo.cropbox_affects_render &&
                 ctx.gizmo.cropbox_parent_node_index >= 0) {
                 filters.crop_box = lfs::rendering::BoundingBox{
                     .min = ctx.gizmo.cropbox_min,
                     .max = ctx.gizmo.cropbox_max,
                     .transform = glm::inverse(ctx.gizmo.cropbox_transform)};
+                filters.crop_ellipsoid.reset();
                 filters.crop_inverse = false;
                 filters.crop_desaturate = ctx.settings.desaturate_cropping;
                 return;
             }
 
-            const auto* const cb = activeCropBoxFilter(ctx);
-            if (!cb) {
+            if (const auto* const cb = activePointCloudCropBoxFilter(ctx)) {
+                filters.crop_box = lfs::rendering::BoundingBox{
+                    .min = cb->data->min,
+                    .max = cb->data->max,
+                    .transform = glm::inverse(cb->world_transform)};
+                filters.crop_ellipsoid.reset();
+                filters.crop_inverse = cb->data->inverse;
+                filters.crop_desaturate = ctx.settings.desaturate_cropping;
                 return;
             }
 
-            filters.crop_box = lfs::rendering::BoundingBox{
-                .min = cb->data->min,
-                .max = cb->data->max,
-                .transform = glm::inverse(cb->world_transform)};
-            filters.crop_inverse = cb->data->inverse;
+            const auto* const el = activePointCloudEllipsoidFilter(ctx);
+            if (!el) {
+                return;
+            }
+
+            filters.crop_ellipsoid = lfs::rendering::Ellipsoid{
+                .radii = el->data->radii,
+                .transform = glm::inverse(el->world_transform)};
+            filters.crop_box.reset();
+            filters.crop_inverse = el->data->inverse;
             filters.crop_desaturate = ctx.settings.desaturate_cropping;
         }
 
@@ -378,7 +461,7 @@ namespace lfs::vis {
             state.overlay.transient_mask.additive = ctx.cursor_preview.add_mode;
             populateSelectionColors(state.overlay.selection_colors, ctx);
         }
-        applyPointCloudCropBox(state.filters, ctx);
+        applyPointCloudCropVolume(state.filters, ctx);
         return state;
     }
 
@@ -410,7 +493,7 @@ namespace lfs::vis {
             populateSelectionColors(request.overlay.selection_colors, ctx);
         }
 
-        applyPointCloudCropBox(request.filters, ctx);
+        applyPointCloudCropVolume(request.filters, ctx);
         return request;
     }
 

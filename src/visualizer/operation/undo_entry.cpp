@@ -1785,10 +1785,6 @@ namespace lfs::vis::op {
         transform_after_ = scene_.getNodeTransform(node_name_);
         show_after_ = node->visible;
         use_after_ = node->cropbox->enabled;
-        if (rendering_manager_) {
-            const auto settings = rendering_manager_->getSettings();
-            (void)settings;
-        }
     }
 
     void CropBoxUndoEntry::undo() {
@@ -1872,10 +1868,6 @@ namespace lfs::vis::op {
         transform_after_ = scene_.getNodeTransform(node_name_);
         show_after_ = node->visible;
         use_after_ = node->ellipsoid->enabled;
-        if (rendering_manager_) {
-            const auto settings = rendering_manager_->getSettings();
-            (void)settings;
-        }
     }
 
     void EllipsoidUndoEntry::undo() {

@@ -318,6 +318,8 @@ namespace lfs::vis::gui {
                    type != core::NodeType::CAMERA_GROUP &&
                    type != core::NodeType::KEYFRAME &&
                    type != core::NodeType::KEYFRAME_GROUP &&
+                   type != core::NodeType::CROPBOX &&
+                   type != core::NodeType::ELLIPSOID &&
                    !parent_is_dataset;
         }
 
@@ -344,8 +346,6 @@ namespace lfs::vis::gui {
             case core::NodeType::PLY_SEQUENCE:
             case core::NodeType::POINTCLOUD:
             case core::NodeType::MESH:
-            case core::NodeType::CROPBOX:
-            case core::NodeType::ELLIPSOID:
                 return true;
             default:
                 return false;
@@ -2079,36 +2079,7 @@ namespace lfs::vis::gui {
                     prefixedAction(std::format("delete:{}", node_id)),
                     !items.empty()));
                 break;
-            case core::NodeType::CROPBOX:
-                items.push_back(makeAction(tr("common.apply"), prefixedAction("apply_cropbox")));
-                items.push_back(makeAction(
-                    tr("scene.fit_to_scene"),
-                    prefixedAction("fit_cropbox:0"),
-                    true));
-                items.push_back(makeAction(
-                    tr("scene.fit_to_scene_trimmed"),
-                    prefixedAction("fit_cropbox:1")));
-                items.push_back(makeAction(tr("scene.reset_crop"), prefixedAction("reset_cropbox")));
-                items.push_back(makeAction(
-                    tr(string_keys::Scene::DELETE_ITEM),
-                    prefixedAction(std::format("delete:{}", node_id)),
-                    true));
-                break;
-            case core::NodeType::ELLIPSOID:
-                items.push_back(makeAction(tr("common.apply"), prefixedAction("apply_ellipsoid")));
-                items.push_back(makeAction(
-                    tr("scene.fit_to_scene"),
-                    prefixedAction("fit_ellipsoid:0"),
-                    true));
-                items.push_back(makeAction(
-                    tr("scene.fit_to_scene_trimmed"),
-                    prefixedAction("fit_ellipsoid:1")));
-                items.push_back(makeAction(tr("scene.reset_crop"), prefixedAction("reset_ellipsoid")));
-                items.push_back(makeAction(
-                    tr(string_keys::Scene::DELETE_ITEM),
-                    prefixedAction(std::format("delete:{}", node_id)),
-                    true));
-                break;
+
             default:
                 break;
             }
@@ -2125,15 +2096,9 @@ namespace lfs::vis::gui {
 
             if (node->type == core::NodeType::SPLAT || node->type == core::NodeType::POINTCLOUD) {
                 items.push_back(makeAction(
-                    tr("scene.add_crop_box"),
-                    prefixedAction(std::format("add_cropbox:{}", node_id)),
-                    !items.empty()));
-                items.push_back(makeAction(
-                    tr("scene.add_crop_ellipsoid"),
-                    prefixedAction(std::format("add_ellipsoid:{}", node_id))));
-                items.push_back(makeAction(
                     tr("scene.save_to_disk"),
-                    prefixedAction(std::format("save_node:{}", node_id))));
+                    prefixedAction(std::format("save_node:{}", node_id)),
+                    !items.empty()));
             }
 
             // Add Save Asset for asset-compatible node types
@@ -2357,28 +2322,12 @@ namespace lfs::vis::gui {
                 }
             };
             gui->enqueueModal(std::move(request));
-        } else if ((kind == "add_cropbox" || kind == "add_ellipsoid" || kind == "save_node") && parts.size() >= 2) {
+        } else if (kind == "save_node" && parts.size() >= 2) {
             core::NodeId node_id = core::NULL_NODE;
             if (!parseNodeId(parts[1], node_id))
                 return;
-            if (kind == "add_cropbox")
-                cmd::AddCropBoxById{.node_id = static_cast<int32_t>(node_id)}.emit();
-            else if (kind == "add_ellipsoid")
-                cmd::AddCropEllipsoidById{.node_id = static_cast<int32_t>(node_id)}.emit();
-            else if (scene->getNodeById(node_id))
+            if (scene->getNodeById(node_id))
                 saveNodeToDisk(*scene, node_id);
-        } else if (kind == "apply_cropbox") {
-            cmd::ApplyCropBox{}.emit();
-        } else if (kind == "fit_cropbox" && parts.size() >= 2) {
-            cmd::FitCropBoxToScene{.use_percentile = parts[1] == "1"}.emit();
-        } else if (kind == "reset_cropbox") {
-            cmd::ResetCropBox{}.emit();
-        } else if (kind == "apply_ellipsoid") {
-            cmd::ApplyEllipsoid{}.emit();
-        } else if (kind == "fit_ellipsoid" && parts.size() >= 2) {
-            cmd::FitEllipsoidToScene{.use_percentile = parts[1] == "1"}.emit();
-        } else if (kind == "reset_ellipsoid") {
-            cmd::ResetEllipsoid{}.emit();
         } else if (kind == "enable_all_selected_train") {
             toggleSelectedTraining(true);
         } else if (kind == "disable_all_selected_train") {

@@ -1533,6 +1533,148 @@ namespace lfs::vis {
         EXPECT_TRUE(redone->cropbox->inverse);
     }
 
+    TEST_F(SceneManagerRenderStateTest, PointCloudRequestUsesSelectedEnabledEllipsoidCrop) {
+        SceneManager manager;
+        auto& scene = manager.getScene();
+        const auto parent_id = scene.addPointCloud("Model", makeTestPointCloud());
+        ASSERT_NE(parent_id, lfs::core::NULL_NODE);
+
+        auto ellipsoid_result = cap::ensureEllipsoid(manager, nullptr, parent_id);
+        ASSERT_TRUE(ellipsoid_result) << ellipsoid_result.error();
+        auto* ellipsoid_node = scene.getNodeById(*ellipsoid_result);
+        ASSERT_NE(ellipsoid_node, nullptr);
+        ASSERT_TRUE(ellipsoid_node->ellipsoid);
+        ellipsoid_node->ellipsoid->enabled = true;
+        ellipsoid_node->ellipsoid->inverse = true;
+        ellipsoid_node->ellipsoid->radii = {2.0f, 3.0f, 4.0f};
+        const auto transform = glm::translate(glm::mat4(1.0f), glm::vec3(1.0f, 2.0f, 3.0f));
+        scene.setNodeTransform(ellipsoid_node->name, transform);
+        manager.selectNode(ellipsoid_node->name);
+
+        Viewport viewport(640, 480);
+        auto scene_state = manager.buildRenderState();
+        ASSERT_EQ(scene_state.ellipsoids.size(), 1u);
+        RenderSettings settings;
+        const FrameContext ctx{
+            .viewport = viewport,
+            .scene_manager = &manager,
+            .scene_state = scene_state,
+            .settings = settings,
+            .render_size = {640, 480},
+        };
+        const std::vector<glm::mat4> transforms = scene_state.model_transforms;
+
+        const auto request = buildPointCloudRenderRequest(ctx, {640, 480}, transforms);
+
+        ASSERT_TRUE(request.filters.crop_ellipsoid.has_value());
+        EXPECT_FALSE(request.filters.crop_box.has_value());
+        EXPECT_EQ(request.filters.crop_ellipsoid->radii, glm::vec3(2.0f, 3.0f, 4.0f));
+        EXPECT_EQ(request.filters.crop_ellipsoid->transform,
+                  glm::inverse(scene_state.ellipsoids.front().world_transform));
+        EXPECT_TRUE(request.filters.crop_inverse);
+        EXPECT_TRUE(request.filters.crop_desaturate);
+    }
+
+    TEST_F(SceneManagerRenderStateTest, PointCloudRequestIgnoresDisabledSelectedEllipsoidCrop) {
+        SceneManager manager;
+        auto& scene = manager.getScene();
+        const auto parent_id = scene.addPointCloud("Model", makeTestPointCloud());
+        ASSERT_NE(parent_id, lfs::core::NULL_NODE);
+
+        auto ellipsoid_result = cap::ensureEllipsoid(manager, nullptr, parent_id);
+        ASSERT_TRUE(ellipsoid_result) << ellipsoid_result.error();
+        auto* ellipsoid_node = scene.getNodeById(*ellipsoid_result);
+        ASSERT_NE(ellipsoid_node, nullptr);
+        ASSERT_TRUE(ellipsoid_node->ellipsoid);
+        ellipsoid_node->ellipsoid->enabled = false;
+        manager.selectNode(ellipsoid_node->name);
+
+        Viewport viewport(640, 480);
+        auto scene_state = manager.buildRenderState();
+        RenderSettings settings;
+        const FrameContext ctx{
+            .viewport = viewport,
+            .scene_manager = &manager,
+            .scene_state = scene_state,
+            .settings = settings,
+            .render_size = {640, 480},
+        };
+        const std::vector<glm::mat4> transforms = scene_state.model_transforms;
+
+        const auto request = buildPointCloudRenderRequest(ctx, {640, 480}, transforms);
+
+        EXPECT_FALSE(request.filters.crop_ellipsoid.has_value());
+        EXPECT_FALSE(request.filters.crop_box.has_value());
+    }
+
+    TEST(ViewportRequestBuilderTest, PointCloudRequestUsesActiveEllipsoidGizmoCrop) {
+        Viewport viewport(640, 480);
+        SceneRenderState scene_state;
+        RenderSettings settings;
+        settings.desaturate_cropping = false;
+        const auto ellipsoid_transform = glm::translate(glm::mat4(1.0f), glm::vec3(4.0f, 5.0f, 6.0f));
+        const FrameContext ctx{
+            .viewport = viewport,
+            .scene_state = scene_state,
+            .settings = settings,
+            .render_size = {640, 480},
+            .gizmo =
+                {.cropbox_active = true,
+                 .cropbox_min = {-1.0f, -1.0f, -1.0f},
+                 .cropbox_max = {1.0f, 1.0f, 1.0f},
+                 .cropbox_transform = glm::mat4(1.0f),
+                 .cropbox_affects_render = true,
+                 .cropbox_parent_node_index = 0,
+                 .ellipsoid_active = true,
+                 .ellipsoid_radii = {3.0f, 4.0f, 5.0f},
+                 .ellipsoid_transform = ellipsoid_transform,
+                 .ellipsoid_affects_render = true,
+                 .ellipsoid_parent_node_index = 0},
+        };
+        const std::vector<glm::mat4> transforms{glm::mat4(1.0f)};
+
+        const auto request = buildPointCloudRenderRequest(ctx, {640, 480}, transforms);
+
+        ASSERT_TRUE(request.filters.crop_ellipsoid.has_value());
+        EXPECT_FALSE(request.filters.crop_box.has_value());
+        EXPECT_EQ(request.filters.crop_ellipsoid->radii, glm::vec3(3.0f, 4.0f, 5.0f));
+        EXPECT_EQ(request.filters.crop_ellipsoid->transform, glm::inverse(ellipsoid_transform));
+        EXPECT_FALSE(request.filters.crop_inverse);
+        EXPECT_FALSE(request.filters.crop_desaturate);
+    }
+
+    TEST(ViewportRequestBuilderTest, PointCloudRequestKeepsActiveCropBoxBehavior) {
+        Viewport viewport(640, 480);
+        SceneRenderState scene_state;
+        RenderSettings settings;
+        settings.desaturate_cropping = true;
+        const auto cropbox_transform = glm::translate(glm::mat4(1.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+        const FrameContext ctx{
+            .viewport = viewport,
+            .scene_state = scene_state,
+            .settings = settings,
+            .render_size = {640, 480},
+            .gizmo =
+                {.cropbox_active = true,
+                 .cropbox_min = {-2.0f, -3.0f, -4.0f},
+                 .cropbox_max = {2.0f, 3.0f, 4.0f},
+                 .cropbox_transform = cropbox_transform,
+                 .cropbox_affects_render = true,
+                 .cropbox_parent_node_index = 0},
+        };
+        const std::vector<glm::mat4> transforms{glm::mat4(1.0f)};
+
+        const auto request = buildPointCloudRenderRequest(ctx, {640, 480}, transforms);
+
+        ASSERT_TRUE(request.filters.crop_box.has_value());
+        EXPECT_FALSE(request.filters.crop_ellipsoid.has_value());
+        EXPECT_EQ(request.filters.crop_box->min, glm::vec3(-2.0f, -3.0f, -4.0f));
+        EXPECT_EQ(request.filters.crop_box->max, glm::vec3(2.0f, 3.0f, 4.0f));
+        EXPECT_EQ(request.filters.crop_box->transform, glm::inverse(cropbox_transform));
+        EXPECT_FALSE(request.filters.crop_inverse);
+        EXPECT_TRUE(request.filters.crop_desaturate);
+    }
+
     TEST(ViewportRequestBuilderTest, PointCloudRequestCarriesSelectionOverlay) {
         using lfs::core::DataType;
         using lfs::core::Device;

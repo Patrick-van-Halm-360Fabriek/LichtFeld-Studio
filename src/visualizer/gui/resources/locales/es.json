@@ -88,8 +88,6 @@
     "go_to_cam_view": "Ir a la Vista de Cámara",
     "fit_to_scene": "Ajustar a la Escena",
     "fit_to_scene_trimmed": "Ajustar a la escena (recortado)",
-    "add_crop_box": "Añadir Caja de Recorte",
-    "add_crop_ellipsoid": "Añadir Elipsoide de Recorte",
     "reset_crop": "Restablecer",
     "merge_to_single_ply": "Combinar en un Solo PLY",
     "move_to": "Mover A",

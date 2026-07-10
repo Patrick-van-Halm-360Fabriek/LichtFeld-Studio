@@ -3962,8 +3962,7 @@ namespace lfs::vis {
 
         // Emit PLYRemoved for all original children and the group
         for (const auto& child_name : children_to_remove) {
-
-        state::PLYRemoved{
+            state::PLYRemoved{
                 .name = child_name,
                 .children_kept = false,
                 .parent_of_removed = {},
@@ -3971,7 +3970,6 @@ namespace lfs::vis {
             }
                 .emit();
         }
-
 
         state::PLYRemoved{
             .name = name,
@@ -4042,17 +4040,12 @@ namespace lfs::vis {
         if (!cropbox || !parent)
             return;
 
-        if (!cropbox->visible)
-
-
+        if (!cropbox->visible) {
             setNodeVisibilityTransient(*cropbox_id, true);
-
+        }
 
         selectNode(*cropbox_id);
-
-
         activateCropToolShape("box");
-
 
         LOG_INFO("Added cropbox '{}' as child of '{}'", cropbox->name, parent->name);
     }
@@ -4085,17 +4078,12 @@ namespace lfs::vis {
         if (!ellipsoid || !parent)
             return;
 
-        if (!ellipsoid->visible)
-
-
+        if (!ellipsoid->visible) {
             setNodeVisibilityTransient(*ellipsoid_id, true);
-
+        }
 
         selectNode(*ellipsoid_id);
-
-
         activateCropToolShape("ellipsoid");
-
 
         LOG_INFO("Added ellipsoid '{}' as child of '{}'", ellipsoid->name, parent->name);
     }

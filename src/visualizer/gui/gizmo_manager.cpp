@@ -982,6 +982,13 @@ namespace lfs::vis::gui {
         deleteCropVolumeAfterApply(applied_volume_node_id);
     }
 
+    void GizmoManager::deleteActiveCropToolVolume() {
+        if (!isCropToolActive() || !ensureCropToolState())
+            return;
+
+        deleteCropVolumeAfterApply(crop_tool_volume_node_id_);
+    }
+
     void GizmoManager::setupEvents() {
         using namespace lfs::core::events;
 

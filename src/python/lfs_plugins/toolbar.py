@@ -140,9 +140,10 @@ def _panel_enabled(panel_id):
 
 def _button_record(button_id, action, value, icon_src, *,
                    tooltip_key="", tooltip_text="", action_id="",
-                   shortcut_text="", selected=False, enabled=True):
+                   shortcut_text="", selected=False, enabled=True,
+                   separator_before=False):
     enabled = bool(enabled)
-    return {
+    record = {
         "button_id": button_id,
         "action": action,
         "value": value,
@@ -155,7 +156,9 @@ def _button_record(button_id, action, value, icon_src, *,
         "enabled": enabled,
         "opacity": "1" if enabled else "0.25",
     }
-
+    if separator_before:
+        record["separator_before"] = True
+    return record
 
 class _GizmoToolbarController:
     _TOOL_LOCALE_KEYS = {
@@ -570,12 +573,30 @@ class _GizmoToolbarController:
         active = active_tool_id == self._CROP_TOOL_ID
         return [
             _button_record(
+                "crop-fit",
+                "crop_fit",
+                "",
+                _icon_src("arrows-maximize"),
+                tooltip_key="scene.fit_to_scene",
+                tooltip_text="Fit to Scene",
+                enabled=active,
+            ),
+            _button_record(
                 "crop-trim",
                 "crop_trim",
                 "",
                 _icon_src("arrows-minimize"),
                 tooltip_key="scene.fit_to_scene_trimmed",
                 tooltip_text="Fit to Scene (Trimmed)",
+                enabled=active,
+            ),
+            _button_record(
+                "crop-reset",
+                "crop_reset",
+                "",
+                _icon_src("reset"),
+                tooltip_key="scene.reset_crop",
+                tooltip_text="Reset",
                 enabled=active,
             ),
             _button_record(
@@ -586,7 +607,17 @@ class _GizmoToolbarController:
                 tooltip_key="common.apply",
                 tooltip_text="Apply",
                 enabled=active,
-            )
+            ),
+            _button_record(
+                "crop-delete",
+                "crop_delete",
+                "",
+                _icon_src("scene/trash"),
+                tooltip_key="scene.delete",
+                tooltip_text="Delete",
+                enabled=active,
+                separator_before=True,
+            ),
         ]
 
     @staticmethod
@@ -823,16 +854,34 @@ class _GizmoToolbarController:
                 self._activate_crop_tool(value, infer_selection_shape=False)
             return
 
+        if action == "crop_fit":
+            fit_crop = getattr(lf.ui, "fit_crop_tool", None)
+            if callable(fit_crop):
+                fit_crop(False)
+            return
+
         if action == "crop_trim":
             fit_crop = getattr(lf.ui, "fit_crop_tool", None)
             if callable(fit_crop):
                 fit_crop(True)
             return
 
+        if action == "crop_reset":
+            reset_crop_tool = getattr(lf.ui, "reset_crop_tool", None)
+            if callable(reset_crop_tool):
+                reset_crop_tool()
+            return
+
         if action == "crop_apply":
             apply_crop_tool = getattr(lf.ui, "apply_crop_tool", None)
             if callable(apply_crop_tool):
                 apply_crop_tool()
+            return
+
+        if action == "crop_delete":
+            delete_crop_tool = getattr(lf.ui, "delete_crop_tool_volume", None)
+            if callable(delete_crop_tool):
+                delete_crop_tool()
             return
 
         if action == "submode":
@@ -1445,8 +1494,11 @@ class _ViewportToolbarController:
             "selection_mode",
             "crop_object",
             "crop_transform",
+            "crop_fit",
             "crop_trim",
+            "crop_reset",
             "crop_apply",
+            "crop_delete",
         }:
             self._viewport_export_controls.close(notify=False)
             self._gizmo.dispatch(action, value)

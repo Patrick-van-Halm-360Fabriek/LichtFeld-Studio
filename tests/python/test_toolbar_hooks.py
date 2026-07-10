@@ -630,6 +630,8 @@ def test_crop_tool_uses_centered_object_and_transform_rows(toolbar_module, monke
         raising=False,
     )
     monkeypatch.setattr(lf_stub.ui, "apply_crop_tool", lambda: state.calls.append(("apply_crop_tool",)), raising=False)
+    monkeypatch.setattr(lf_stub.ui, "reset_crop_tool", lambda: state.calls.append(("reset_crop_tool",)), raising=False)
+    monkeypatch.setattr(lf_stub.ui, "delete_crop_tool_volume", lambda: state.calls.append(("delete_crop_tool_volume",)), raising=False)
     monkeypatch.setattr(module.ToolRegistry, "get_all", staticmethod(lambda: [crop_tool]), raising=False)
     monkeypatch.setattr(
         module.ToolRegistry,
@@ -645,10 +647,29 @@ def test_crop_tool_uses_centered_object_and_transform_rows(toolbar_module, monke
     assert snapshot["crop_group_buttons"][0]["selected"] is True
     assert [button["value"] for button in snapshot["crop_object_buttons"]] == ["box", "ellipsoid"]
     assert [button["value"] for button in snapshot["crop_transform_buttons"]] == ["translate", "rotate", "scale"]
-    assert [button["action"] for button in snapshot["crop_action_buttons"]] == ["crop_trim", "crop_apply"]
+    assert [button["action"] for button in snapshot["crop_action_buttons"]] == [
+        "crop_fit",
+        "crop_trim",
+        "crop_reset",
+        "crop_apply",
+        "crop_delete",
+    ]
     assert next(button for button in snapshot["crop_object_buttons"] if button["value"] == "ellipsoid")["icon_src"] == "../icon/sphere.png"
-    assert snapshot["crop_action_buttons"][0]["icon_src"] == "../icon/arrows-minimize.png"
-    assert snapshot["crop_action_buttons"][1]["icon_src"] == "../icon/check.png"
+    assert [button["icon_src"] for button in snapshot["crop_action_buttons"]] == [
+        "../icon/arrows-maximize.png",
+        "../icon/arrows-minimize.png",
+        "../icon/reset.png",
+        "../icon/check.png",
+        "../icon/scene/trash.png",
+    ]
+    assert [button["tooltip_key"] for button in snapshot["crop_action_buttons"]] == [
+        "scene.fit_to_scene",
+        "scene.fit_to_scene_trimmed",
+        "scene.reset_crop",
+        "common.apply",
+        "scene.delete",
+    ]
+    assert snapshot["crop_action_buttons"][-1]["separator_before"] is True
     assert next(button for button in snapshot["crop_object_buttons"] if button["value"] == "box")["selected"] is True
     assert next(button for button in snapshot["crop_transform_buttons"] if button["value"] == "rotate")["selected"] is True
 
@@ -664,13 +685,25 @@ def test_crop_tool_uses_centered_object_and_transform_rows(toolbar_module, monke
     assert state.gizmo_type == "scale"
     assert state.calls[-1] == ("set_active_operator", "builtin.cropbox", "scale")
 
+    controller.dispatch("crop_fit", "")
+
+    assert state.calls[-1] == ("fit_crop_tool", False)
+
     controller.dispatch("crop_trim", "")
 
     assert state.calls[-1] == ("fit_crop_tool", True)
 
+    controller.dispatch("crop_reset", "")
+
+    assert state.calls[-1] == ("reset_crop_tool",)
+
     controller.dispatch("crop_apply", "")
 
     assert state.calls[-1] == ("apply_crop_tool",)
+
+    controller.dispatch("crop_delete", "")
+
+    assert state.calls[-1] == ("delete_crop_tool_volume",)
 
 
 def test_crop_tool_activation_creates_explicitly_but_snapshot_is_passive(toolbar_module, monkeypatch):
