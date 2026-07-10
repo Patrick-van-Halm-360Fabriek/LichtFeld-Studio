@@ -322,47 +322,63 @@ namespace lfs::vis::gui {
         }
         return image.contiguous();
     }
-
-        void applyVideoExportPointCloudFilters(rendering::PointCloudFilterState& filters,
-                                               const VideoExportSceneSnapshot& snapshot,
-                                               const RenderSettings& render_settings) {
-        if (snapshot.cropboxes.empty()) {
-            return;
-        }
-
+    [[nodiscard]] const VideoExportCropBoxSnapshot* activeVideoExportPointCloudCropBox(
+        const VideoExportSceneSnapshot& snapshot) {
         const VideoExportCropBoxSnapshot* selected = nullptr;
         if (snapshot.selected_cropbox_index >= 0) {
             const size_t idx = static_cast<size_t>(snapshot.selected_cropbox_index);
             if (idx < snapshot.cropboxes.size() && snapshot.cropboxes[idx].has_data &&
-                snapshot.cropboxes[idx].data.enabled && snapshot.cropboxes[idx].parent_node_index >= 0) {
+                snapshot.cropboxes[idx].data.enabled) {
                 selected = &snapshot.cropboxes[idx];
             }
         }
-        if (!selected) {
-            const VideoExportCropBoxSnapshot* single = nullptr;
-            for (const auto& cb : snapshot.cropboxes) {
-                if (!cb.has_data || !cb.data.enabled || cb.parent_node_index < 0) {
-                    continue;
-                }
-                if (single) {
-                    single = nullptr;
-                    break;
-                }
-                single = &cb;
-            }
-            selected = single;
+        if (selected) {
+            return selected;
         }
-        if (!selected) {
+
+        const VideoExportCropBoxSnapshot* single = nullptr;
+        for (const auto& cb : snapshot.cropboxes) {
+            if (!cb.has_data || !cb.data.enabled) {
+                continue;
+            }
+            if (single) {
+                return nullptr;
+            }
+            single = &cb;
+        }
+        return single;
+    }
+
+    [[nodiscard]] const VideoExportEllipsoidSnapshot* activeVideoExportPointCloudEllipsoid(
+        const VideoExportSceneSnapshot& snapshot) {
+        if (!snapshot.active_ellipsoid || !snapshot.active_ellipsoid->data.enabled) {
+            return nullptr;
+        }
+        return &*snapshot.active_ellipsoid;
+    }
+
+    void applyVideoExportPointCloudFilters(rendering::PointCloudFilterState& filters,
+                                           const VideoExportSceneSnapshot& snapshot,
+                                           const RenderSettings& render_settings) {
+        if (const auto* const cb = activeVideoExportPointCloudCropBox(snapshot)) {
+            filters.crop_box = rendering::BoundingBox{
+                .min = cb->data.min,
+                .max = cb->data.max,
+                .transform = glm::inverse(cb->world_transform)};
+            filters.crop_ellipsoid.reset();
+            filters.crop_inverse = cb->data.inverse;
+            filters.crop_desaturate = render_settings.desaturate_cropping;
             return;
         }
 
-        const auto& cb = *selected;
-        filters.crop_box = rendering::BoundingBox{
-            .min = cb.data.min,
-            .max = cb.data.max,
-            .transform = glm::inverse(cb.world_transform)};
-        filters.crop_inverse = cb.data.inverse;
-        filters.crop_desaturate = render_settings.desaturate_cropping;
+        if (const auto* const el = activeVideoExportPointCloudEllipsoid(snapshot)) {
+            filters.crop_ellipsoid = rendering::Ellipsoid{
+                .radii = el->data.radii,
+                .transform = glm::inverse(el->world_transform)};
+            filters.crop_box.reset();
+            filters.crop_inverse = el->data.inverse;
+            filters.crop_desaturate = render_settings.desaturate_cropping;
+        }
     }
 
     rendering::MeshRenderOptions makeVideoExportMeshOptions(const RenderSettings& render_settings,

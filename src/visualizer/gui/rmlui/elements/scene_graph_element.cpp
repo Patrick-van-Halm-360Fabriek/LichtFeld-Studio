@@ -2116,7 +2116,9 @@ namespace lfs::vis::gui {
                     !items.empty()));
             }
 
-            if (node->type != core::NodeType::CAMERA) {
+            if (node->type != core::NodeType::CAMERA &&
+                node->type != core::NodeType::CROPBOX &&
+                node->type != core::NodeType::ELLIPSOID) {
                 items.push_back(makeAction(
                     tr("scene.duplicate"),
                     prefixedAction(std::format("duplicate:{}", node_id))));

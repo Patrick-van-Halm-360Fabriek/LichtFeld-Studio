@@ -3312,8 +3312,11 @@ namespace lfs::vis::gui {
         if (!pie_menu_.isOpen())
             return;
 
-        auto* drawlist = ImGui::GetForegroundDrawList();
-        pie_menu_.draw(drawlist);
+        auto* const rendering_manager = viewer_->getRenderingManager();
+        if (!rendering_manager)
+            return;
+
+        pie_menu_.draw(*rendering_manager->getScreenOverlayRenderer());
     }
 
     void GizmoManager::handlePieMenuSelection() {

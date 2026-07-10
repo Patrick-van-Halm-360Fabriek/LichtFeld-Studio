@@ -511,14 +511,6 @@ namespace lfs::vis {
             handleAddCropEllipsoid(cmd.node_name);
         });
 
-        cmd::AddCropBoxById::when([this](const auto& cmd) {
-            handleAddCropBox(static_cast<core::NodeId>(cmd.node_id));
-        });
-
-        cmd::AddCropEllipsoidById::when([this](const auto& cmd) {
-            handleAddCropEllipsoid(static_cast<core::NodeId>(cmd.node_id));
-        });
-
         cmd::ResetCropBox::when([this](const auto&) {
             handleResetCropBox();
         });
@@ -4647,12 +4639,28 @@ namespace lfs::vis {
     }
 
     std::expected<SceneManager::GaussianDeletionPlan, std::string> SceneManager::buildSelectedGaussianDeletionPlan() {
+        const bool crop_volume_node_selected = [&] {
+            std::shared_lock slock(selection_.mutex());
+            for (const auto node_id : selection_.selectedNodeIds()) {
+                const auto* node = scene_.getNodeById(node_id);
+                if (node && (node->type == core::NodeType::CROPBOX || node->type == core::NodeType::ELLIPSOID)) {
+                    return true;
+                }
+            }
+            return false;
+        }();
         auto selection = scene_.getSelectionMask();
         if (!selection || !selection->is_valid()) {
+            if (crop_volume_node_selected) {
+                return std::unexpected("Use the Crop toolbar Delete action to remove selected crop volumes");
+            }
             return std::unexpected("Nothing selected");
         }
 
         if (selection->count_nonzero() == 0) {
+            if (crop_volume_node_selected) {
+                return std::unexpected("Use the Crop toolbar Delete action to remove selected crop volumes");
+            }
             return std::unexpected("Nothing selected");
         }
 
