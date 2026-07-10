@@ -3244,6 +3244,7 @@ namespace lfs::core {
             if (!node->cropbox)
                 continue;
             const bool effectively_visible = isNodeEffectivelyVisible(node->id);
+            const bool parent_effectively_visible = isNodeEffectivelyVisible(node->parent_id);
             if (!effectively_visible && !node->cropbox->enabled)
                 continue;
 
@@ -3255,6 +3256,7 @@ namespace lfs::core {
             rcb.world_transform = getWorldTransform(node->id);
             rcb.local_transform = node->local_transform.get();
             rcb.effectively_visible = effectively_visible;
+            rcb.parent_effectively_visible = parent_effectively_visible;
             result.push_back(rcb);
         }
 
@@ -3337,6 +3339,7 @@ namespace lfs::core {
             if (!node->ellipsoid)
                 continue;
             const bool effectively_visible = isNodeEffectivelyVisible(node->id);
+            const bool parent_effectively_visible = isNodeEffectivelyVisible(node->parent_id);
             if (!effectively_visible && !node->ellipsoid->enabled)
                 continue;
 
@@ -3348,6 +3351,7 @@ namespace lfs::core {
             rel.world_transform = getWorldTransform(node->id);
             rel.local_transform = node->local_transform.get();
             rel.effectively_visible = effectively_visible;
+            rel.parent_effectively_visible = parent_effectively_visible;
             result.push_back(rel);
         }
 

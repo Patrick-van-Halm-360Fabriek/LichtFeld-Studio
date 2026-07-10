@@ -30,7 +30,7 @@ namespace lfs::vis {
             const std::vector<lfs::core::Scene::RenderableCropBox>& cropboxes) {
             const lfs::core::Scene::RenderableCropBox* selected = nullptr;
             for (const auto& cb : cropboxes) {
-                if (!cb.data || !cb.data->enabled) {
+                if (!cb.data || !cb.data->enabled || !cb.parent_effectively_visible) {
                     continue;
                 }
                 if (selected) {
@@ -58,7 +58,7 @@ namespace lfs::vis {
             const std::vector<lfs::core::Scene::RenderableEllipsoid>& ellipsoids) {
             const lfs::core::Scene::RenderableEllipsoid* selected = nullptr;
             for (const auto& el : ellipsoids) {
-                if (!el.data || !el.data->enabled) {
+                if (!el.data || !el.data->enabled || !el.parent_effectively_visible) {
                     continue;
                 }
                 if (selected) {

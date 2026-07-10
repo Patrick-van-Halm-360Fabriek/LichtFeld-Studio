@@ -1646,12 +1646,15 @@ namespace lfs::vis {
         cropbox_node->cropbox->min = {-1.0f, -2.0f, -3.0f};
         cropbox_node->cropbox->max = {1.0f, 2.0f, 3.0f};
         scene.setNodeTransform(cropbox_node->name, glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 3.0f, 4.0f)));
+        scene.setNodeVisibility(*cropbox_result, false);
         manager.clearSelection();
 
         Viewport viewport(640, 480);
         auto scene_state = manager.buildRenderState();
         ASSERT_EQ(scene_state.cropboxes.size(), 1u);
         EXPECT_LT(scene_state.cropboxes.front().parent_node_index, 0);
+        EXPECT_FALSE(scene_state.cropboxes.front().effectively_visible);
+        EXPECT_TRUE(scene_state.cropboxes.front().parent_effectively_visible);
         RenderSettings settings;
         settings.desaturate_cropping = false;
         const FrameContext ctx{
@@ -1674,6 +1677,44 @@ namespace lfs::vis {
         EXPECT_FALSE(request.filters.crop_desaturate);
     }
 
+    TEST_F(SceneManagerRenderStateTest, PointCloudRequestIgnoresHiddenSplatCropBoxFallback) {
+        SceneManager manager;
+        auto& scene = manager.getScene();
+        const auto hidden_splat_id = scene.addSplat("HiddenSplat", makeTestSplat(0.0f));
+        ASSERT_NE(hidden_splat_id, lfs::core::NULL_NODE);
+        const auto point_cloud_id = scene.addPointCloud("VisiblePoints", makeTestPointCloud());
+        ASSERT_NE(point_cloud_id, lfs::core::NULL_NODE);
+
+        auto cropbox_result = cap::ensureCropBox(manager, nullptr, hidden_splat_id);
+        ASSERT_TRUE(cropbox_result) << cropbox_result.error();
+        auto* cropbox_node = scene.getNodeById(*cropbox_result);
+        ASSERT_NE(cropbox_node, nullptr);
+        ASSERT_TRUE(cropbox_node->cropbox);
+        cropbox_node->cropbox->enabled = true;
+        scene.setNodeVisibility("HiddenSplat", false);
+        manager.clearSelection();
+
+        Viewport viewport(640, 480);
+        auto scene_state = manager.buildRenderState();
+        ASSERT_EQ(scene_state.cropboxes.size(), 1u);
+        EXPECT_FALSE(scene_state.cropboxes.front().effectively_visible);
+        EXPECT_FALSE(scene_state.cropboxes.front().parent_effectively_visible);
+        RenderSettings settings;
+        const FrameContext ctx{
+            .viewport = viewport,
+            .scene_manager = &manager,
+            .scene_state = scene_state,
+            .settings = settings,
+            .render_size = {640, 480},
+        };
+        const std::vector<glm::mat4> transforms = scene_state.model_transforms;
+
+        const auto request = buildPointCloudRenderRequest(ctx, {640, 480}, transforms);
+
+        EXPECT_FALSE(request.filters.crop_box.has_value());
+        EXPECT_FALSE(request.filters.crop_ellipsoid.has_value());
+    }
+
     TEST_F(SceneManagerRenderStateTest, PointCloudRequestKeepsSingleEnabledEllipsoidAfterDeselection) {
         SceneManager manager;
         auto& scene = manager.getScene();
@@ -1689,12 +1730,15 @@ namespace lfs::vis {
         ellipsoid_node->ellipsoid->inverse = true;
         ellipsoid_node->ellipsoid->radii = {2.0f, 3.0f, 4.0f};
         scene.setNodeTransform(ellipsoid_node->name, glm::translate(glm::mat4(1.0f), glm::vec3(3.0f, 4.0f, 5.0f)));
+        scene.setNodeVisibility(*ellipsoid_result, false);
         manager.clearSelection();
 
         Viewport viewport(640, 480);
         auto scene_state = manager.buildRenderState();
         ASSERT_EQ(scene_state.ellipsoids.size(), 1u);
         EXPECT_LT(scene_state.ellipsoids.front().parent_node_index, 0);
+        EXPECT_FALSE(scene_state.ellipsoids.front().effectively_visible);
+        EXPECT_TRUE(scene_state.ellipsoids.front().parent_effectively_visible);
         RenderSettings settings;
         settings.desaturate_cropping = false;
         const FrameContext ctx{
@@ -1715,6 +1759,45 @@ namespace lfs::vis {
         EXPECT_TRUE(request.filters.crop_inverse);
         EXPECT_FALSE(request.filters.crop_desaturate);
     }
+
+    TEST_F(SceneManagerRenderStateTest, PointCloudRequestIgnoresHiddenSplatEllipsoidFallback) {
+        SceneManager manager;
+        auto& scene = manager.getScene();
+        const auto hidden_splat_id = scene.addSplat("HiddenSplat", makeTestSplat(0.0f));
+        ASSERT_NE(hidden_splat_id, lfs::core::NULL_NODE);
+        const auto point_cloud_id = scene.addPointCloud("VisiblePoints", makeTestPointCloud());
+        ASSERT_NE(point_cloud_id, lfs::core::NULL_NODE);
+
+        auto ellipsoid_result = cap::ensureEllipsoid(manager, nullptr, hidden_splat_id);
+        ASSERT_TRUE(ellipsoid_result) << ellipsoid_result.error();
+        auto* ellipsoid_node = scene.getNodeById(*ellipsoid_result);
+        ASSERT_NE(ellipsoid_node, nullptr);
+        ASSERT_TRUE(ellipsoid_node->ellipsoid);
+        ellipsoid_node->ellipsoid->enabled = true;
+        scene.setNodeVisibility("HiddenSplat", false);
+        manager.clearSelection();
+
+        Viewport viewport(640, 480);
+        auto scene_state = manager.buildRenderState();
+        ASSERT_EQ(scene_state.ellipsoids.size(), 1u);
+        EXPECT_FALSE(scene_state.ellipsoids.front().effectively_visible);
+        EXPECT_FALSE(scene_state.ellipsoids.front().parent_effectively_visible);
+        RenderSettings settings;
+        const FrameContext ctx{
+            .viewport = viewport,
+            .scene_manager = &manager,
+            .scene_state = scene_state,
+            .settings = settings,
+            .render_size = {640, 480},
+        };
+        const std::vector<glm::mat4> transforms = scene_state.model_transforms;
+
+        const auto request = buildPointCloudRenderRequest(ctx, {640, 480}, transforms);
+
+        EXPECT_FALSE(request.filters.crop_box.has_value());
+        EXPECT_FALSE(request.filters.crop_ellipsoid.has_value());
+    }
+
     TEST(ViewportRequestBuilderTest, PointCloudRequestUsesCropBoxWhenBothPointCloudGizmosAffectRender) {
         Viewport viewport(640, 480);
         SceneRenderState scene_state;
