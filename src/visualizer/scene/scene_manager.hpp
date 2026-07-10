@@ -123,6 +123,7 @@ namespace lfs::vis {
         void setPLYVisibility(const std::string& name, bool visible);
         void removeNode(core::NodeId id, bool keep_children = false);
         void setNodeVisibility(core::NodeId id, bool visible);
+        void setNodeVisibilityTransient(core::NodeId id, bool visible);
 
         // Node selection
         void selectNode(const std::string& name);

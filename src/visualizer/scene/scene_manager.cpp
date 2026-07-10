@@ -57,6 +57,14 @@ namespace lfs::vis {
             return std::ranges::any_of(renderables, [node_id](const auto& item) { return item.node_id == node_id; });
         }
 
+        template <typename TRenderable>
+        [[nodiscard]] bool containsEnabledScopedRenderableNode(const std::vector<TRenderable>& renderables,
+                                                              const core::NodeId node_id) {
+            return std::ranges::any_of(renderables, [node_id](const auto& item) {
+                return item.node_id == node_id && item.data && item.data->enabled && item.parent_node_index >= 0;
+            });
+        }
+
         void activateCropToolShape(const char* shape) {
             if (auto* editor = services().editorOrNull()) {
                 editor->setActiveOperator("builtin.cropbox", "translate");
@@ -1395,6 +1403,21 @@ namespace lfs::vis {
             op::SceneGraphMetadataEntry::captureNodes(*this, {name}));
     }
 
+    void SceneManager::setNodeVisibilityTransient(const core::NodeId id, const bool visible) {
+        const auto* node = scene_.getNodeById(id);
+        if (!node || static_cast<bool>(node->visible) == visible) {
+            return;
+        }
+
+        scene_.setNodeVisibility(id, visible);
+        selection_.invalidateNodeMask();
+        if (visible) {
+            if (const auto* updated = scene_.getNodeById(id))
+                syncCropToolRenderSettings(updated);
+        }
+        syncCropBoxToRenderSettings();
+    }
+
     void SceneManager::removeNode(const core::NodeId id, const bool keep_children) {
         const auto* node = scene_.getNodeById(id);
         if (!node)
@@ -2281,11 +2304,11 @@ namespace lfs::vis {
     }
 
     core::NodeId SceneManager::getActiveSelectionCropBoxId() const {
-        const auto visible_cropboxes = scene_.getVisibleCropBoxes();
+        const auto renderable_cropboxes = scene_.getRenderableCropBoxes();
 
         const core::NodeId selected_cropbox_id = getSelectedNodeCropBoxId();
         if (selected_cropbox_id != core::NULL_NODE &&
-            containsRenderableNode(visible_cropboxes, selected_cropbox_id)) {
+            containsEnabledScopedRenderableNode(renderable_cropboxes, selected_cropbox_id)) {
             return selected_cropbox_id;
         }
 
@@ -2295,11 +2318,18 @@ namespace lfs::vis {
             return core::NULL_NODE;
         }
 
-        if (visible_cropboxes.size() == 1 && visible_cropboxes.front().data) {
-            return visible_cropboxes.front().node_id;
+        core::NodeId single_id = core::NULL_NODE;
+        for (const auto& cropbox : renderable_cropboxes) {
+            if (!cropbox.data || !cropbox.data->enabled || cropbox.parent_node_index < 0) {
+                continue;
+            }
+            if (single_id != core::NULL_NODE) {
+                return core::NULL_NODE;
+            }
+            single_id = cropbox.node_id;
         }
 
-        return core::NULL_NODE;
+        return single_id;
     }
 
     void SceneManager::syncCropBoxToRenderSettings() {
@@ -2354,11 +2384,11 @@ namespace lfs::vis {
     }
 
     core::NodeId SceneManager::getActiveSelectionEllipsoidId() const {
-        const auto visible_ellipsoids = scene_.getVisibleEllipsoids();
+        const auto renderable_ellipsoids = scene_.getRenderableEllipsoids();
 
         const core::NodeId selected_ellipsoid_id = getSelectedNodeEllipsoidId();
         if (selected_ellipsoid_id != core::NULL_NODE &&
-            containsRenderableNode(visible_ellipsoids, selected_ellipsoid_id)) {
+            containsEnabledScopedRenderableNode(renderable_ellipsoids, selected_ellipsoid_id)) {
             return selected_ellipsoid_id;
         }
 
@@ -2368,11 +2398,18 @@ namespace lfs::vis {
             return core::NULL_NODE;
         }
 
-        if (visible_ellipsoids.size() == 1 && visible_ellipsoids.front().data) {
-            return visible_ellipsoids.front().node_id;
+        core::NodeId single_id = core::NULL_NODE;
+        for (const auto& ellipsoid : renderable_ellipsoids) {
+            if (!ellipsoid.data || !ellipsoid.data->enabled || ellipsoid.parent_node_index < 0) {
+                continue;
+            }
+            if (single_id != core::NULL_NODE) {
+                return core::NULL_NODE;
+            }
+            single_id = ellipsoid.node_id;
         }
 
-        return core::NULL_NODE;
+        return single_id;
     }
 
     void SceneManager::syncEllipsoidToRenderSettings() {
@@ -4008,7 +4045,7 @@ namespace lfs::vis {
         if (!cropbox->visible)
 
 
-            setNodeVisibility(*cropbox_id, true);
+            setNodeVisibilityTransient(*cropbox_id, true);
 
 
         selectNode(*cropbox_id);
@@ -4051,7 +4088,7 @@ namespace lfs::vis {
         if (!ellipsoid->visible)
 
 
-            setNodeVisibility(*ellipsoid_id, true);
+            setNodeVisibilityTransient(*ellipsoid_id, true);
 
 
         selectNode(*ellipsoid_id);

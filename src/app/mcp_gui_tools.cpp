@@ -471,6 +471,31 @@ namespace lfs::app {
             const std::optional<std::string>& requested_node) {
             return vis::cap::resolveCropBoxId(scene_manager, requested_node);
         }
+        std::expected<core::NodeId, std::string> resolve_legacy_render_cropbox_id(
+            const vis::SceneManager& scene_manager) {
+            if (auto selected = vis::cap::resolveCropBoxId(scene_manager, std::nullopt))
+                return selected;
+
+            if (const core::NodeId active_id = scene_manager.getActiveSelectionCropBoxId();
+                active_id != core::NULL_NODE) {
+                return active_id;
+            }
+
+            core::NodeId single_id = core::NULL_NODE;
+            for (const auto* const node : scene_manager.getScene().getNodes()) {
+                if (!node || node->type != core::NodeType::CROPBOX || !node->cropbox) {
+                    continue;
+                }
+                if (single_id != core::NULL_NODE) {
+                    return std::unexpected("Legacy crop box render settings are ambiguous; select a target crop box");
+                }
+                single_id = node->id;
+            }
+
+            if (single_id == core::NULL_NODE)
+                return std::unexpected("Legacy crop box render settings require an existing crop box node");
+            return single_id;
+        }
 
         json crop_box_info_json(const vis::SceneManager& scene_manager,
                                 const vis::RenderingManager* rendering_manager,
@@ -1264,6 +1289,31 @@ namespace lfs::app {
             const vis::SceneManager& scene_manager,
             const std::optional<std::string>& requested_node) {
             return vis::cap::resolveEllipsoidId(scene_manager, requested_node);
+        }
+        std::expected<core::NodeId, std::string> resolve_legacy_render_ellipsoid_id(
+            const vis::SceneManager& scene_manager) {
+            if (auto selected = vis::cap::resolveEllipsoidId(scene_manager, std::nullopt))
+                return selected;
+
+            if (const core::NodeId active_id = scene_manager.getActiveSelectionEllipsoidId();
+                active_id != core::NULL_NODE) {
+                return active_id;
+            }
+
+            core::NodeId single_id = core::NULL_NODE;
+            for (const auto* const node : scene_manager.getScene().getNodes()) {
+                if (!node || node->type != core::NodeType::ELLIPSOID || !node->ellipsoid) {
+                    continue;
+                }
+                if (single_id != core::NULL_NODE) {
+                    return std::unexpected("Legacy ellipsoid render settings are ambiguous; select a target ellipsoid");
+                }
+                single_id = node->id;
+            }
+
+            if (single_id == core::NULL_NODE)
+                return std::unexpected("Legacy ellipsoid render settings require an existing ellipsoid node");
+            return single_id;
         }
 
         std::expected<core::NodeId, std::string> ensure_ellipsoid(
@@ -2250,26 +2300,38 @@ namespace lfs::app {
 
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     auto* const rendering_manager = viewer_impl->getRenderingManager();
-                    if (scene_manager && (args.contains("show_crop_box") || args.contains("use_crop_box"))) {
-                        auto cropbox_id = resolve_cropbox_id(*scene_manager, std::nullopt);
-                        if (cropbox_id) {
-                            vis::cap::CropBoxUpdate update;
-                            update.has_show = args.contains("show_crop_box");
-                            update.show = update.has_show ? args["show_crop_box"].get<bool>() : false;
-                            update.has_use = args.contains("use_crop_box");
-                            update.use = update.has_use ? args["use_crop_box"].get<bool>() : false;
-                            (void)vis::cap::updateCropBox(*scene_manager, rendering_manager, *cropbox_id, update);
+                    if (args.contains("show_crop_box") || args.contains("use_crop_box")) {
+                        if (!scene_manager)
+                            return json{{"error", "Legacy crop box render settings require a scene"}};
+                        auto cropbox_id = resolve_legacy_render_cropbox_id(*scene_manager);
+                        if (!cropbox_id)
+                            return json{{"error", cropbox_id.error()}};
+
+                        vis::cap::CropBoxUpdate update;
+                        update.has_show = args.contains("show_crop_box");
+                        update.show = update.has_show ? args["show_crop_box"].get<bool>() : false;
+                        update.has_use = args.contains("use_crop_box");
+                        update.use = update.has_use ? args["use_crop_box"].get<bool>() : false;
+                        if (auto result = vis::cap::updateCropBox(*scene_manager, rendering_manager, *cropbox_id, update);
+                            !result) {
+                            return json{{"error", result.error()}};
                         }
                     }
-                    if (scene_manager && (args.contains("show_ellipsoid") || args.contains("use_ellipsoid"))) {
-                        auto ellipsoid_id = resolve_ellipsoid_id(*scene_manager, std::nullopt);
-                        if (ellipsoid_id) {
-                            vis::cap::EllipsoidUpdate update;
-                            update.has_show = args.contains("show_ellipsoid");
-                            update.show = update.has_show ? args["show_ellipsoid"].get<bool>() : false;
-                            update.has_use = args.contains("use_ellipsoid");
-                            update.use = update.has_use ? args["use_ellipsoid"].get<bool>() : false;
-                            (void)vis::cap::updateEllipsoid(*scene_manager, rendering_manager, *ellipsoid_id, update);
+                    if (args.contains("show_ellipsoid") || args.contains("use_ellipsoid")) {
+                        if (!scene_manager)
+                            return json{{"error", "Legacy ellipsoid render settings require a scene"}};
+                        auto ellipsoid_id = resolve_legacy_render_ellipsoid_id(*scene_manager);
+                        if (!ellipsoid_id)
+                            return json{{"error", ellipsoid_id.error()}};
+
+                        vis::cap::EllipsoidUpdate update;
+                        update.has_show = args.contains("show_ellipsoid");
+                        update.show = update.has_show ? args["show_ellipsoid"].get<bool>() : false;
+                        update.has_use = args.contains("use_ellipsoid");
+                        update.use = update.has_use ? args["use_ellipsoid"].get<bool>() : false;
+                        if (auto result = vis::cap::updateEllipsoid(*scene_manager, rendering_manager, *ellipsoid_id, update);
+                            !result) {
+                            return json{{"error", result.error()}};
                         }
                     }
 

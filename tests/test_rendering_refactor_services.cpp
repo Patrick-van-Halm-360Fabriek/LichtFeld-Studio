@@ -948,7 +948,7 @@ namespace lfs::vis {
         scene.setNodeVisibility(cropbox_id, false);
         state = manager.buildRenderState();
         EXPECT_EQ(manager.getSelectedNodeCropBoxId(), cropbox_id);
-        EXPECT_EQ(manager.getActiveSelectionCropBoxId(), lfs::core::NULL_NODE);
+        EXPECT_EQ(manager.getActiveSelectionCropBoxId(), cropbox_id);
         ASSERT_EQ(state.cropboxes.size(), 1u);
         EXPECT_EQ(state.cropboxes.front().node_id, cropbox_id);
         EXPECT_FALSE(state.cropboxes.front().effectively_visible);
@@ -1024,6 +1024,15 @@ namespace lfs::vis {
         ASSERT_EQ(request.filters.crop_regions.size(), 2u);
         EXPECT_FALSE(request.filters.crop_regions[0].desaturate);
         EXPECT_FALSE(request.filters.crop_regions[1].desaturate);
+
+        scene.setNodeVisibility(model_a_id, false);
+        ctx.scene_state = manager.buildRenderState();
+        request = buildViewportRenderRequest(ctx, {640, 480});
+        ASSERT_TRUE(request.filters.crop_region.has_value());
+        ASSERT_EQ(request.filters.crop_regions.size(), 1u);
+        EXPECT_EQ(request.filters.crop_regions.front().parent_node_index, scene.getVisibleNodeIndex(model_b_id));
+        EXPECT_EQ(request.filters.crop_regions.front().bounds.min, cropbox_b->min);
+        EXPECT_EQ(request.filters.crop_regions.front().bounds.max, cropbox_b->max);
     }
 
     TEST_F(SceneManagerRenderStateTest, MultipleEnabledCropBoxesWithoutSelectionRemainParentScoped) {
@@ -1058,6 +1067,8 @@ namespace lfs::vis {
         ASSERT_TRUE(request.filters.crop_region.has_value());
         ASSERT_EQ(request.filters.crop_regions.size(), 2u);
         EXPECT_NE(request.filters.crop_regions[0].parent_node_index, request.filters.crop_regions[1].parent_node_index);
+        EXPECT_TRUE(request.filters.crop_regions[0].desaturate);
+        EXPECT_TRUE(request.filters.crop_regions[1].desaturate);
     }
 
     TEST_F(SceneManagerRenderStateTest, LiveCropboxPreviewOverridesOnlyEditedParent) {

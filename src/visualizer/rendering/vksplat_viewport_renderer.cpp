@@ -860,6 +860,8 @@ namespace lfs::vis {
             EllipsoidExtraCount = 15,
             ParamCount = EllipsoidExtraBase + EllipsoidParamStride * EllipsoidExtraCount,
         };
+        static_assert(EllipsoidFlags + EllipsoidParamStride <= ViewFlags);
+        static_assert(EllipsoidExtraBase + EllipsoidParamStride * EllipsoidExtraCount == ParamCount);
 
         [[nodiscard]] bool hasTransformIndices(const std::shared_ptr<Tensor>& tensor,
                                                const std::size_t num_splats) {
@@ -1078,6 +1080,17 @@ namespace lfs::vis {
             }
         }
 
+        void writeMat4AffineRows(float* dst, const std::size_t index, const glm::mat4& matrix) {
+            for (int row = 0; row < 3; ++row) {
+                writeVec4(dst,
+                          index + static_cast<std::size_t>(row),
+                          glm::vec4(matrix[0][row],
+                                    matrix[1][row],
+                                    matrix[2][row],
+                                    matrix[3][row]));
+            }
+        }
+
         // Builds the overlay parameter table on CPU only. The H2D transfer is
         // performed at the call site, conditionally on an output-bytes diff.
         [[nodiscard]] std::expected<std::vector<float>, std::string> buildOverlayParamsCpuFloats(
@@ -1112,7 +1125,7 @@ namespace lfs::vis {
                                         ellipsoid.desaturate ? 1.0f : 0.0f,
                                         static_cast<float>(ellipsoid.parent_node_index)));
                     writeVec4(dst, flags_index + 1, glm::vec4(ellipsoid.bounds.radii, 0.0f));
-                    writeMat4Rows(dst, flags_index + 2, ellipsoid.bounds.transform);
+                    writeMat4AffineRows(dst, flags_index + 2, ellipsoid.bounds.transform);
                 };
 
                 const auto& crop_regions = request.filters.crop_regions;

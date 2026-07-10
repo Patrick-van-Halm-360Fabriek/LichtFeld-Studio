@@ -227,7 +227,7 @@ namespace lfs::vis {
             void setCropToolBounds(core::NodeId target_id,
                                    const glm::vec3& bounds_min,
                                    const glm::vec3& bounds_max);
-            [[nodiscard]] bool syncCropToolStateFromNode(core::NodeId target_id, core::NodeId volume_node_id);
+            [[nodiscard]] bool syncCropToolStateFromNode(core::NodeId target_id, core::NodeId volume_node_id, bool* changed = nullptr);
             [[nodiscard]] bool persistActiveCropToolToNode(bool enable);
             void updateCropToolOverlayState();
             void clearCropToolOverlayState();

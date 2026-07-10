@@ -20,7 +20,7 @@ namespace lfs::vis {
                 return nullptr;
             }
             for (const auto& cb : cropboxes) {
-                if (cb.node_id == node_id && cb.data && cb.data->enabled) {
+                if (cb.node_id == node_id && cb.data && cb.data->enabled && cb.parent_node_index >= 0) {
                     return &cb;
                 }
             }
@@ -31,7 +31,7 @@ namespace lfs::vis {
             const std::vector<lfs::core::Scene::RenderableCropBox>& cropboxes) {
             const lfs::core::Scene::RenderableCropBox* selected = nullptr;
             for (const auto& cb : cropboxes) {
-                if (!cb.data || !cb.data->enabled) {
+                if (!cb.data || !cb.data->enabled || cb.parent_node_index < 0) {
                     continue;
                 }
                 if (selected) {
@@ -49,7 +49,7 @@ namespace lfs::vis {
                 return nullptr;
             }
             for (const auto& el : ellipsoids) {
-                if (el.node_id == node_id && el.data && el.data->enabled) {
+                if (el.node_id == node_id && el.data && el.data->enabled && el.parent_node_index >= 0) {
                     return &el;
                 }
             }
@@ -60,7 +60,7 @@ namespace lfs::vis {
             const std::vector<lfs::core::Scene::RenderableEllipsoid>& ellipsoids) {
             const lfs::core::Scene::RenderableEllipsoid* selected = nullptr;
             for (const auto& el : ellipsoids) {
-                if (!el.data || !el.data->enabled) {
+                if (!el.data || !el.data->enabled || el.parent_node_index < 0) {
                     continue;
                 }
                 if (selected) {
@@ -82,7 +82,8 @@ namespace lfs::vis {
             const auto selected_idx = ctx.scene_state.selected_cropbox_index;
             if (selected_idx >= 0) {
                 const size_t idx = static_cast<size_t>(selected_idx);
-                if (idx < cropboxes.size() && cropboxes[idx].data && cropboxes[idx].data->enabled) {
+                if (idx < cropboxes.size() && cropboxes[idx].data && cropboxes[idx].data->enabled &&
+                    cropboxes[idx].parent_node_index >= 0) {
                     return &cropboxes[idx];
                 }
             }
@@ -109,22 +110,21 @@ namespace lfs::vis {
 
         void upsertScopedCropBox(std::vector<lfs::rendering::GaussianScopedBoxFilter>& filters,
                                  lfs::rendering::GaussianScopedBoxFilter filter) {
-            if (filter.parent_node_index >= 0) {
-                for (auto& existing : filters) {
-                    if (existing.parent_node_index == filter.parent_node_index) {
-                        existing = std::move(filter);
-                        return;
-                    }
+            if (filter.parent_node_index < 0) {
+                return;
+            }
+            for (auto& existing : filters) {
+                if (existing.parent_node_index == filter.parent_node_index) {
+                    existing = std::move(filter);
+                    return;
                 }
-            } else {
-                filters.clear();
             }
             filters.push_back(std::move(filter));
         }
 
         void applyGaussianCropBox(lfs::rendering::GaussianFilterState& filters, const FrameContext& ctx) {
             for (const auto& cb : ctx.scene_state.cropboxes) {
-                if (!cb.data || !cb.data->enabled) {
+                if (!cb.data || !cb.data->enabled || cb.parent_node_index < 0) {
                     continue;
                 }
                 filters.crop_regions.push_back(lfs::rendering::GaussianScopedBoxFilter{
@@ -137,7 +137,8 @@ namespace lfs::vis {
                     .parent_node_index = cb.parent_node_index});
             }
 
-            if (ctx.gizmo.cropbox_active && ctx.gizmo.cropbox_affects_render) {
+            if (ctx.gizmo.cropbox_active && ctx.gizmo.cropbox_affects_render &&
+                ctx.gizmo.cropbox_parent_node_index >= 0) {
                 upsertScopedCropBox(filters.crop_regions,
                                     lfs::rendering::GaussianScopedBoxFilter{
                                         .bounds =
@@ -154,13 +155,14 @@ namespace lfs::vis {
             }
         }
         void applyPointCloudCropBox(lfs::rendering::PointCloudFilterState& filters, const FrameContext& ctx) {
-            if (ctx.gizmo.cropbox_active && ctx.gizmo.cropbox_affects_render) {
+            if (ctx.gizmo.cropbox_active && ctx.gizmo.cropbox_affects_render &&
+                ctx.gizmo.cropbox_parent_node_index >= 0) {
                 filters.crop_box = lfs::rendering::BoundingBox{
                     .min = ctx.gizmo.cropbox_min,
                     .max = ctx.gizmo.cropbox_max,
                     .transform = glm::inverse(ctx.gizmo.cropbox_transform)};
                 filters.crop_inverse = false;
-                filters.crop_desaturate = true;
+                filters.crop_desaturate = ctx.settings.desaturate_cropping;
                 return;
             }
 
@@ -179,22 +181,21 @@ namespace lfs::vis {
 
         void upsertScopedEllipsoid(std::vector<lfs::rendering::GaussianScopedEllipsoidFilter>& filters,
                                    lfs::rendering::GaussianScopedEllipsoidFilter filter) {
-            if (filter.parent_node_index >= 0) {
-                for (auto& existing : filters) {
-                    if (existing.parent_node_index == filter.parent_node_index) {
-                        existing = std::move(filter);
-                        return;
-                    }
+            if (filter.parent_node_index < 0) {
+                return;
+            }
+            for (auto& existing : filters) {
+                if (existing.parent_node_index == filter.parent_node_index) {
+                    existing = std::move(filter);
+                    return;
                 }
-            } else {
-                filters.clear();
             }
             filters.push_back(std::move(filter));
         }
 
         void applyGaussianEllipsoid(lfs::rendering::GaussianFilterState& filters, const FrameContext& ctx) {
             for (const auto& el : ctx.scene_state.ellipsoids) {
-                if (!el.data || !el.data->enabled) {
+                if (!el.data || !el.data->enabled || el.parent_node_index < 0) {
                     continue;
                 }
                 filters.ellipsoid_regions.push_back(lfs::rendering::GaussianScopedEllipsoidFilter{
@@ -206,7 +207,8 @@ namespace lfs::vis {
                     .parent_node_index = el.parent_node_index});
             }
 
-            if (ctx.gizmo.ellipsoid_active && ctx.gizmo.ellipsoid_affects_render) {
+            if (ctx.gizmo.ellipsoid_active && ctx.gizmo.ellipsoid_affects_render &&
+                ctx.gizmo.ellipsoid_parent_node_index >= 0) {
                 upsertScopedEllipsoid(filters.ellipsoid_regions,
                                       lfs::rendering::GaussianScopedEllipsoidFilter{
                                           .bounds =

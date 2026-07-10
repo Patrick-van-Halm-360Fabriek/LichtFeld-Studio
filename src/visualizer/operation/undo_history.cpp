@@ -1052,6 +1052,10 @@ namespace lfs::vis::op {
         return totalMemoryLocked();
     }
 
+    bool UndoHistory::isPlaybackActive() const {
+        std::lock_guard lock(mutex_);
+        return playback_depth_ > 0 && playback_thread_id_ == std::this_thread::get_id();
+    }
     bool UndoHistory::hasActiveTransaction() const {
         std::lock_guard lock(mutex_);
         return !transactions_.empty();

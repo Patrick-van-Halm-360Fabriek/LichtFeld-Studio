@@ -309,6 +309,23 @@ namespace lfs::vis::gui {
                              glm::length(glm::vec3(m[2])));
         }
 
+        [[nodiscard]] bool nearlyEqual(const glm::vec3& a, const glm::vec3& b) {
+            constexpr float EPSILON = 1e-6f;
+            return std::abs(a.x - b.x) <= EPSILON && std::abs(a.y - b.y) <= EPSILON &&
+                   std::abs(a.z - b.z) <= EPSILON;
+        }
+
+        [[nodiscard]] bool nearlyEqual(const glm::mat4& a, const glm::mat4& b) {
+            constexpr float EPSILON = 1e-6f;
+            for (int col = 0; col < 4; ++col) {
+                for (int row = 0; row < 4; ++row) {
+                    if (std::abs(a[col][row] - b[col][row]) > EPSILON)
+                        return false;
+                }
+            }
+            return true;
+        }
+
     } // namespace
 
     GizmoManager::GizmoManager(VisualizerImpl* viewer)
@@ -435,7 +452,7 @@ namespace lfs::vis::gui {
         if (const auto* node = sm->getScene().getNodeById(*volume_id)) {
             const std::string node_name = node->name;
             if (!node->visible)
-                sm->setNodeVisibility(*volume_id, true);
+                sm->setNodeVisibilityTransient(*volume_id, true);
             sm->selectNode(node_name);
             return true;
         }
@@ -487,7 +504,9 @@ namespace lfs::vis::gui {
         crop_tool_initialized_ = true;
     }
 
-    bool GizmoManager::syncCropToolStateFromNode(const core::NodeId target_id, const core::NodeId volume_node_id) {
+    bool GizmoManager::syncCropToolStateFromNode(const core::NodeId target_id,
+                                                 const core::NodeId volume_node_id,
+                                                 bool* const changed) {
         auto* const sm = viewer_ ? viewer_->getSceneManager() : nullptr;
         if (!sm)
             return false;
@@ -497,24 +516,33 @@ namespace lfs::vis::gui {
         if (!node)
             return false;
 
+        const glm::mat4 next_transform = scene_coords::nodeVisualizerWorldTransform(scene, volume_node_id);
+        bool state_changed = !crop_tool_initialized_ || crop_tool_target_node_id_ != target_id ||
+                             crop_tool_volume_node_id_ != volume_node_id ||
+                             !nearlyEqual(crop_tool_visualizer_transform_, next_transform);
+
         if (crop_tool_shape_ == CropToolShape::Box) {
             if (!node->cropbox)
                 return false;
+            state_changed = state_changed || !nearlyEqual(crop_tool_box_min_, node->cropbox->min) ||
+                            !nearlyEqual(crop_tool_box_max_, node->cropbox->max);
             crop_tool_box_min_ = node->cropbox->min;
             crop_tool_box_max_ = node->cropbox->max;
         } else {
             if (!node->ellipsoid)
                 return false;
+            state_changed = state_changed || !nearlyEqual(crop_tool_ellipsoid_radii_, node->ellipsoid->radii);
             crop_tool_ellipsoid_radii_ = node->ellipsoid->radii;
         }
 
-        crop_tool_visualizer_transform_ = scene_coords::nodeVisualizerWorldTransform(scene, volume_node_id);
+        crop_tool_visualizer_transform_ = next_transform;
         crop_tool_target_node_id_ = target_id;
         crop_tool_volume_node_id_ = volume_node_id;
         crop_tool_initialized_ = true;
+        if (changed)
+            *changed = state_changed;
         return true;
     }
-
     bool GizmoManager::persistActiveCropToolToNode(const bool enable) {
         auto* const sm = viewer_ ? viewer_->getSceneManager() : nullptr;
         auto* const rm = viewer_ ? viewer_->getRenderingManager() : nullptr;
@@ -618,7 +646,8 @@ namespace lfs::vis::gui {
             return false;
         }
 
-        if (!syncCropToolStateFromNode(*target_id, *volume_id)) {
+        bool state_changed = false;
+        if (!syncCropToolStateFromNode(*target_id, *volume_id, &state_changed)) {
             crop_tool_initialized_ = false;
             crop_tool_target_node_id_ = core::NULL_NODE;
             crop_tool_volume_node_id_ = core::NULL_NODE;
@@ -626,7 +655,8 @@ namespace lfs::vis::gui {
             return false;
         }
 
-        updateCropToolOverlayState();
+        if (state_changed)
+            updateCropToolOverlayState();
         return true;
     }
 
@@ -665,7 +695,7 @@ namespace lfs::vis::gui {
             if (node && (node->type == core::NodeType::CROPBOX || node->type == core::NodeType::ELLIPSOID)) {
                 parent_node_id = node->parent_id;
                 if (hide_volume && node->visible) {
-                    sm->setNodeVisibility(volume_node_id, false);
+                    sm->setNodeVisibilityTransient(volume_node_id, false);
                 }
             }
         }
@@ -967,29 +997,32 @@ namespace lfs::vis::gui {
             const bool active_crop_operator = UnifiedToolRegistry::instance().getActiveTool() == "builtin.cropbox" ||
                                               viewer_->getEditorContext().getActiveOperator() == "builtin.cropbox";
 
-            if (selected_crop_volume) {
-                if (!selected_node->visible)
-                    sm->setNodeVisibility(selected_node->id, true);
-                viewer_->getEditorContext().setActiveOperator("builtin.cropbox", "translate");
-                UnifiedToolRegistry::instance().setActiveTool("builtin.cropbox");
-                setCropToolShape(selected_node->type == core::NodeType::ELLIPSOID ? "ellipsoid" : "box");
-                if (ensureCropToolState())
-                    updateCropToolOverlayState();
-            } else {
-                if (active_crop_operator) {
-                    leaveCropTool(true, false, true);
+            const bool history_playback = op::undoHistory().isPlaybackActive();
+            if (!history_playback) {
+                if (selected_crop_volume) {
+                    if (!selected_node->visible)
+                        sm->setNodeVisibilityTransient(selected_node->id, true);
+                    viewer_->getEditorContext().setActiveOperator("builtin.cropbox", "translate");
+                    UnifiedToolRegistry::instance().setActiveTool("builtin.cropbox");
+                    setCropToolShape(selected_node->type == core::NodeType::ELLIPSOID ? "ellipsoid" : "box");
+                    if (ensureCropToolState())
+                        updateCropToolOverlayState();
                 } else {
-                    python::cancel_active_operator();
-                }
+                    if (active_crop_operator) {
+                        leaveCropTool(true, false, true);
+                    } else {
+                        python::cancel_active_operator();
+                    }
 
-                if (selected_crop_target) {
-                    const auto& scene = sm->getScene();
-                    const core::NodeId cropbox_id = scene.getCropBoxForSplat(selected_node->id);
-                    const core::NodeId ellipsoid_id = scene.getEllipsoidForSplat(selected_node->id);
-                    if (const auto* cropbox = scene.getNodeById(cropbox_id); cropbox && cropbox->visible)
-                        sm->setNodeVisibility(cropbox_id, false);
-                    if (const auto* ellipsoid = scene.getNodeById(ellipsoid_id); ellipsoid && ellipsoid->visible)
-                        sm->setNodeVisibility(ellipsoid_id, false);
+                    if (selected_crop_target) {
+                        const auto& scene = sm->getScene();
+                        const core::NodeId cropbox_id = scene.getCropBoxForSplat(selected_node->id);
+                        const core::NodeId ellipsoid_id = scene.getEllipsoidForSplat(selected_node->id);
+                        if (const auto* cropbox = scene.getNodeById(cropbox_id); cropbox && cropbox->visible)
+                            sm->setNodeVisibilityTransient(cropbox_id, false);
+                        if (const auto* ellipsoid = scene.getNodeById(ellipsoid_id); ellipsoid && ellipsoid->visible)
+                            sm->setNodeVisibilityTransient(ellipsoid_id, false);
+                    }
                 }
             }
 
@@ -1948,9 +1981,10 @@ namespace lfs::vis::gui {
                     const auto* cropbox_node = scene.getNodeById(cropbox_id);
                     if (cropbox_node && cropbox_node->cropbox && scene.isNodeEffectivelyVisible(cropbox_id)) {
                         const glm::mat4 cropbox_world = scene_coords::nodeVisualizerWorldTransform(scene, cropbox_id);
+                        const int parent_node_index = scene.getVisibleNodeIndex(node->id);
                         render_manager->setCropboxGizmoState(
                             true, cropbox_node->cropbox->min, cropbox_node->cropbox->max, cropbox_world,
-                            cropbox_node->cropbox->enabled);
+                            cropbox_node->cropbox->enabled, parent_node_index);
                     }
                 }
 
@@ -1959,9 +1993,10 @@ namespace lfs::vis::gui {
                     const auto* ellipsoid_node = scene.getNodeById(ellipsoid_id);
                     if (ellipsoid_node && ellipsoid_node->ellipsoid && scene.isNodeEffectivelyVisible(ellipsoid_id)) {
                         const glm::mat4 ellipsoid_world = scene_coords::nodeVisualizerWorldTransform(scene, ellipsoid_id);
+                        const int parent_node_index = scene.getVisibleNodeIndex(node->id);
                         render_manager->setEllipsoidGizmoState(
                             true, ellipsoid_node->ellipsoid->radii, ellipsoid_world,
-                            ellipsoid_node->ellipsoid->enabled);
+                            ellipsoid_node->ellipsoid->enabled, parent_node_index);
                     }
                 }
             }
@@ -2457,10 +2492,11 @@ namespace lfs::vis::gui {
         }
 
         if (cropbox_gizmo_active_) {
+            const int parent_node_index = scene_manager->getScene().getVisibleNodeIndex(cropbox_node->parent_id);
             render_manager->setCropboxGizmoState(
                 true, cropbox_node->cropbox->min, cropbox_node->cropbox->max,
                 scene_coords::nodeVisualizerWorldTransform(scene_manager->getScene(), cropbox_id),
-                cropbox_node->cropbox->enabled);
+                cropbox_node->cropbox->enabled, parent_node_index);
         } else {
             render_manager->setCropboxGizmoActive(false);
         }
@@ -2944,9 +2980,11 @@ namespace lfs::vis::gui {
         if (ellipsoid_gizmo_active_) {
             const glm::mat4 current_world_transform =
                 scene_coords::nodeVisualizerWorldTransform(scene_manager->getScene(), ellipsoid_id);
+            const int parent_node_index = scene_manager->getScene().getVisibleNodeIndex(ellipsoid_node->parent_id);
             render_manager->setEllipsoidGizmoState(true, ellipsoid_node->ellipsoid->radii,
                                                    current_world_transform,
-                                                   ellipsoid_node->ellipsoid->enabled);
+                                                   ellipsoid_node->ellipsoid->enabled,
+                                                   parent_node_index);
         } else {
             render_manager->setEllipsoidGizmoActive(false);
         }
