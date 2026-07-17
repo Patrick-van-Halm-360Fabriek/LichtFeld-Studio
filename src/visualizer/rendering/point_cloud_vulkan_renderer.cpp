@@ -53,6 +53,7 @@ namespace lfs::vis {
             kFlagPreviewSelectionAdditive = 1 << 7,
             kFlagDepthViewGrayscale = 1 << 8,
             kFlagHasDeletedMask = 1 << 9,
+            kFlagCropEllipsoid = 1 << 10,
         };
         struct PushConstants {
             float view_proj[16];        // 64
@@ -251,10 +252,16 @@ namespace lfs::vis {
             std::memcpy(pc.view_proj, glm::value_ptr(req.view_projection), sizeof(pc.view_proj));
             std::memcpy(pc.view, glm::value_ptr(req.view), sizeof(pc.view));
 
-            const glm::mat4 crop_to_local = req.crop ? req.crop->to_local : glm::mat4(1.0f);
+            const bool has_crop = req.crop.has_value() || req.crop_ellipsoid.has_value();
+            const bool crop_is_ellipsoid = req.crop_ellipsoid.has_value();
+            const glm::mat4 crop_to_local = crop_is_ellipsoid
+                                                ? req.crop_ellipsoid->to_local
+                                                : (req.crop ? req.crop->to_local : glm::mat4(1.0f));
             std::memcpy(pc.crop_to_local, glm::value_ptr(crop_to_local), sizeof(pc.crop_to_local));
 
-            const glm::vec3 crop_min = req.crop ? req.crop->min : glm::vec3(0.0f);
+            const glm::vec3 crop_min = crop_is_ellipsoid
+                                           ? req.crop_ellipsoid->radii
+                                           : (req.crop ? req.crop->min : glm::vec3(0.0f));
             const glm::vec3 crop_max = req.crop ? req.crop->max : glm::vec3(0.0f);
             pc.crop_min[0] = crop_min.x;
             pc.crop_min[1] = crop_min.y;
@@ -275,12 +282,16 @@ namespace lfs::vis {
             pc.voxel_focal_ortho[3] = req.depth_view ? 1.0f : 0.0f;
 
             int flags = 0;
-            if (req.crop) {
+            if (has_crop) {
                 flags |= kFlagHasCrop;
-                if (req.crop->inverse)
+                const bool inverse = crop_is_ellipsoid ? req.crop_ellipsoid->inverse : req.crop->inverse;
+                const bool desaturate = crop_is_ellipsoid ? req.crop_ellipsoid->desaturate : req.crop->desaturate;
+                if (inverse)
                     flags |= kFlagCropInverse;
-                if (req.crop->desaturate)
+                if (desaturate)
                     flags |= kFlagCropDesaturate;
+                if (crop_is_ellipsoid)
+                    flags |= kFlagCropEllipsoid;
             }
             if (req.orthographic) {
                 flags |= kFlagOrthographic;

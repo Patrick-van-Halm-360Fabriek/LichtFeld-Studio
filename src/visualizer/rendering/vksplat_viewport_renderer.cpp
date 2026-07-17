@@ -1006,8 +1006,16 @@ namespace lfs::vis {
             SelectionCursor = 23,
             SelectionFlags = 24,
             VisibilityFlags = 25,
-            ParamCount = 26,
+            CropExtraBase = 26,
+            CropParamStride = 7,
+            CropExtraCount = 15,
+            EllipsoidExtraBase = CropExtraBase + CropParamStride * CropExtraCount,
+            EllipsoidParamStride = 5,
+            EllipsoidExtraCount = 15,
+            ParamCount = EllipsoidExtraBase + EllipsoidParamStride * EllipsoidExtraCount,
         };
+        static_assert(EllipsoidFlags + EllipsoidParamStride <= ViewFlags);
+        static_assert(EllipsoidExtraBase + EllipsoidParamStride * EllipsoidExtraCount == ParamCount);
 
         [[nodiscard]] bool hasTransformIndices(const std::shared_ptr<Tensor>& tensor,
                                                const std::size_t num_splats) {
@@ -1226,6 +1234,17 @@ namespace lfs::vis {
             }
         }
 
+        void writeMat4AffineRows(float* dst, const std::size_t index, const glm::mat4& matrix) {
+            for (int row = 0; row < 3; ++row) {
+                writeVec4(dst,
+                          index + static_cast<std::size_t>(row),
+                          glm::vec4(matrix[0][row],
+                                    matrix[1][row],
+                                    matrix[2][row],
+                                    matrix[3][row]));
+            }
+        }
+
         // Builds the overlay parameter table on CPU only. The H2D transfer is
         // performed at the call site, conditionally on an output-bytes diff.
         [[nodiscard]] std::expected<std::vector<float>, std::string> buildOverlayParamsCpuFloats(
@@ -1239,29 +1258,50 @@ namespace lfs::vis {
                 std::vector<float> cpu(static_cast<std::size_t>(ParamCount) * 4u, 0.0f);
                 float* const dst = cpu.data();
 
-                if (request.filters.crop_region) {
-                    const auto& crop = *request.filters.crop_region;
+                const auto write_crop = [&](const lfs::rendering::GaussianScopedBoxFilter& crop,
+                                            const std::size_t flags_index) {
                     writeVec4(dst,
-                              CropFlags,
+                              flags_index,
                               glm::vec4(1.0f,
                                         crop.inverse ? 1.0f : 0.0f,
                                         crop.desaturate ? 1.0f : 0.0f,
                                         static_cast<float>(crop.parent_node_index)));
-                    writeVec4(dst, CropMin, glm::vec4(crop.bounds.min, 0.0f));
-                    writeVec4(dst, CropMax, glm::vec4(crop.bounds.max, 0.0f));
-                    writeMat4Rows(dst, CropTransform, crop.bounds.transform);
-                }
-
-                if (request.filters.ellipsoid_region) {
-                    const auto& ellipsoid = *request.filters.ellipsoid_region;
+                    writeVec4(dst, flags_index + 1, glm::vec4(crop.bounds.min, 0.0f));
+                    writeVec4(dst, flags_index + 2, glm::vec4(crop.bounds.max, 0.0f));
+                    writeMat4Rows(dst, flags_index + 3, crop.bounds.transform);
+                };
+                const auto write_ellipsoid = [&](const lfs::rendering::GaussianScopedEllipsoidFilter& ellipsoid,
+                                                 const std::size_t flags_index) {
                     writeVec4(dst,
-                              EllipsoidFlags,
+                              flags_index,
                               glm::vec4(1.0f,
                                         ellipsoid.inverse ? 1.0f : 0.0f,
                                         ellipsoid.desaturate ? 1.0f : 0.0f,
                                         static_cast<float>(ellipsoid.parent_node_index)));
-                    writeVec4(dst, EllipsoidRadii, glm::vec4(ellipsoid.bounds.radii, 0.0f));
-                    writeMat4Rows(dst, EllipsoidTransform, ellipsoid.bounds.transform);
+                    writeVec4(dst, flags_index + 1, glm::vec4(ellipsoid.bounds.radii, 0.0f));
+                    writeMat4AffineRows(dst, flags_index + 2, ellipsoid.bounds.transform);
+                };
+
+                const auto& crop_regions = request.filters.crop_regions;
+                if (!crop_regions.empty()) {
+                    write_crop(crop_regions.front(), CropFlags);
+                    const std::size_t extra_count = std::min<std::size_t>(crop_regions.size() - 1u, CropExtraCount);
+                    for (std::size_t i = 0; i < extra_count; ++i) {
+                        write_crop(crop_regions[i + 1u], CropExtraBase + i * CropParamStride);
+                    }
+                } else if (request.filters.crop_region) {
+                    write_crop(*request.filters.crop_region, CropFlags);
+                }
+
+                const auto& ellipsoid_regions = request.filters.ellipsoid_regions;
+                if (!ellipsoid_regions.empty()) {
+                    write_ellipsoid(ellipsoid_regions.front(), EllipsoidFlags);
+                    const std::size_t extra_count = std::min<std::size_t>(ellipsoid_regions.size() - 1u, EllipsoidExtraCount);
+                    for (std::size_t i = 0; i < extra_count; ++i) {
+                        write_ellipsoid(ellipsoid_regions[i + 1u], EllipsoidExtraBase + i * EllipsoidParamStride);
+                    }
+                } else if (request.filters.ellipsoid_region) {
+                    write_ellipsoid(*request.filters.ellipsoid_region, EllipsoidFlags);
                 }
 
                 if (request.filters.view_volume) {

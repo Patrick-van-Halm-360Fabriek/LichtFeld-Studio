@@ -533,8 +533,6 @@
     "go_to_cam_view": "Go to Cam View",
     "fit_to_scene": "Fit to Scene",
     "fit_to_scene_trimmed": "Fit to Scene (Trimmed)",
-    "add_crop_box": "Add Crop Box",
-    "add_crop_ellipsoid": "Add Crop Ellipsoid",
     "reset_crop": "Reset",
     "merge_to_single_ply": "Merge to Single PLY",
     "move_to": "Move To",

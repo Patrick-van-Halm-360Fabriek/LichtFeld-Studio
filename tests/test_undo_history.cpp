@@ -997,11 +997,10 @@ TEST_F(UndoHistoryTest, CropBoxUndoEntryRoundTripsAndHandlesDeletedNode) {
     auto changed_data = before_data;
     changed_data.min = glm::vec3(-2.0f);
     changed_data.max = glm::vec3(3.0f);
+    changed_data.enabled = true;
     scene_manager->getScene().setCropBoxData(cropbox_id, changed_data);
     scene_manager->setNodeTransform(cropbox_node->name, glm::translate(glm::mat4(1.0f), glm::vec3(1.0f, 2.0f, 3.0f)));
-    crop_settings.show_crop_box = false;
-    crop_settings.use_crop_box = true;
-    rendering_manager->updateSettings(crop_settings);
+    scene_manager->setNodeVisibility(cropbox_id, false);
 
     lfs::vis::op::CropBoxUndoEntry entry(
         *scene_manager,
@@ -1019,6 +1018,7 @@ TEST_F(UndoHistoryTest, CropBoxUndoEntryRoundTripsAndHandlesDeletedNode) {
     EXPECT_EQ(cropbox_node->cropbox->inverse, before_data.inverse);
     EXPECT_EQ(cropbox_node->cropbox->enabled, before_data.enabled);
     EXPECT_EQ(scene_manager->getNodeTransform(cropbox_node->name), before_transform);
+    EXPECT_TRUE(cropbox_node->visible);
     crop_settings = rendering_manager->getSettings();
     EXPECT_TRUE(crop_settings.show_crop_box);
     EXPECT_FALSE(crop_settings.use_crop_box);
@@ -1028,6 +1028,7 @@ TEST_F(UndoHistoryTest, CropBoxUndoEntryRoundTripsAndHandlesDeletedNode) {
     EXPECT_EQ(cropbox_node->cropbox->max, changed_data.max);
     EXPECT_EQ(cropbox_node->cropbox->inverse, changed_data.inverse);
     EXPECT_EQ(cropbox_node->cropbox->enabled, changed_data.enabled);
+    EXPECT_FALSE(cropbox_node->visible);
     crop_settings = rendering_manager->getSettings();
     EXPECT_FALSE(crop_settings.show_crop_box);
     EXPECT_TRUE(crop_settings.use_crop_box);
@@ -1072,11 +1073,10 @@ TEST_F(UndoHistoryTest, EllipsoidUndoEntryRoundTripsAndHandlesDeletedNode) {
 
     auto changed_data = before_data;
     changed_data.radii = glm::vec3(4.0f, 5.0f, 6.0f);
+    changed_data.enabled = true;
     scene_manager->getScene().setEllipsoidData(ellipsoid_id, changed_data);
     scene_manager->setNodeTransform(ellipsoid_node->name, glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.0f, 1.0f)));
-    ellipsoid_settings.show_ellipsoid = false;
-    ellipsoid_settings.use_ellipsoid = true;
-    rendering_manager->updateSettings(ellipsoid_settings);
+    scene_manager->setNodeVisibility(ellipsoid_id, false);
 
     lfs::vis::op::EllipsoidUndoEntry entry(
         *scene_manager,
@@ -1093,6 +1093,7 @@ TEST_F(UndoHistoryTest, EllipsoidUndoEntryRoundTripsAndHandlesDeletedNode) {
     EXPECT_EQ(ellipsoid_node->ellipsoid->inverse, before_data.inverse);
     EXPECT_EQ(ellipsoid_node->ellipsoid->enabled, before_data.enabled);
     EXPECT_EQ(scene_manager->getNodeTransform(ellipsoid_node->name), before_transform);
+    EXPECT_TRUE(ellipsoid_node->visible);
     ellipsoid_settings = rendering_manager->getSettings();
     EXPECT_TRUE(ellipsoid_settings.show_ellipsoid);
     EXPECT_FALSE(ellipsoid_settings.use_ellipsoid);
@@ -1101,6 +1102,7 @@ TEST_F(UndoHistoryTest, EllipsoidUndoEntryRoundTripsAndHandlesDeletedNode) {
     EXPECT_EQ(ellipsoid_node->ellipsoid->radii, changed_data.radii);
     EXPECT_EQ(ellipsoid_node->ellipsoid->inverse, changed_data.inverse);
     EXPECT_EQ(ellipsoid_node->ellipsoid->enabled, changed_data.enabled);
+    EXPECT_FALSE(ellipsoid_node->visible);
     ellipsoid_settings = rendering_manager->getSettings();
     EXPECT_FALSE(ellipsoid_settings.show_ellipsoid);
     EXPECT_TRUE(ellipsoid_settings.use_ellipsoid);
@@ -1239,7 +1241,7 @@ TEST_F(UndoHistoryTest, GaussianShWriteScattersOnlySelectedRowsAndIsUndoable) {
               std::vector<float>(replacement.begin() + 9, replacement.end()));
 }
 
-TEST_F(UndoHistoryTest, CropBoxCapabilityUndoRestoresRenderSettings) {
+TEST_F(UndoHistoryTest, CropBoxCapabilityUndoRestoresNodeVisibilityAndEnabledState) {
     auto scene_manager = std::make_unique<lfs::vis::SceneManager>();
     auto rendering_manager = std::make_unique<lfs::vis::RenderingManager>();
     lfs::vis::services().set(scene_manager.get());
@@ -1268,21 +1270,30 @@ TEST_F(UndoHistoryTest, CropBoxCapabilityUndoRestoresRenderSettings) {
     settings = rendering_manager->getSettings();
     EXPECT_FALSE(settings.show_crop_box);
     EXPECT_TRUE(settings.use_crop_box);
+    const auto* cropbox_node = scene_manager->getScene().getNodeById(cropbox_id);
+    ASSERT_NE(cropbox_node, nullptr);
+    ASSERT_NE(cropbox_node->cropbox, nullptr);
+    EXPECT_FALSE(cropbox_node->visible);
+    EXPECT_TRUE(cropbox_node->cropbox->enabled);
 
     auto undo_result = lfs::vis::op::undoHistory().undo();
     EXPECT_TRUE(undo_result.success);
     settings = rendering_manager->getSettings();
     EXPECT_TRUE(settings.show_crop_box);
     EXPECT_FALSE(settings.use_crop_box);
+    EXPECT_TRUE(cropbox_node->visible);
+    EXPECT_FALSE(cropbox_node->cropbox->enabled);
 
     auto redo_result = lfs::vis::op::undoHistory().redo();
     EXPECT_TRUE(redo_result.success);
     settings = rendering_manager->getSettings();
     EXPECT_FALSE(settings.show_crop_box);
     EXPECT_TRUE(settings.use_crop_box);
+    EXPECT_FALSE(cropbox_node->visible);
+    EXPECT_TRUE(cropbox_node->cropbox->enabled);
 }
 
-TEST_F(UndoHistoryTest, CropBoxResetUndoRestoresUseToggle) {
+TEST_F(UndoHistoryTest, CropBoxResetUndoRestoresEnabledState) {
     auto scene_manager = std::make_unique<lfs::vis::SceneManager>();
     auto rendering_manager = std::make_unique<lfs::vis::RenderingManager>();
     lfs::vis::services().set(scene_manager.get());
@@ -1301,17 +1312,21 @@ TEST_F(UndoHistoryTest, CropBoxResetUndoRestoresUseToggle) {
 
     auto* cropbox_node = scene_manager->getScene().getMutableNode("model_cropbox");
     ASSERT_NE(cropbox_node, nullptr);
+    ASSERT_NE(cropbox_node->cropbox, nullptr);
+    cropbox_node->cropbox->enabled = true;
     scene_manager->setNodeTransform(cropbox_node->name, glm::translate(glm::mat4(1.0f), glm::vec3(0.5f, 0.0f, 0.0f)));
 
     auto reset_result = lfs::vis::cap::resetCropBox(*scene_manager, rendering_manager.get(), cropbox_id);
     ASSERT_TRUE(reset_result) << reset_result.error();
     settings = rendering_manager->getSettings();
     EXPECT_FALSE(settings.use_crop_box);
+    EXPECT_FALSE(cropbox_node->cropbox->enabled);
 
     auto undo_result = lfs::vis::op::undoHistory().undo();
     EXPECT_TRUE(undo_result.success);
     settings = rendering_manager->getSettings();
     EXPECT_TRUE(settings.use_crop_box);
+    EXPECT_TRUE(cropbox_node->cropbox->enabled);
     EXPECT_EQ(scene_manager->getNodeTransform(cropbox_node->name),
               glm::translate(glm::mat4(1.0f), glm::vec3(0.5f, 0.0f, 0.0f)));
 }

@@ -526,8 +526,6 @@
     "go_to_cam_view": "Zur Kameraansicht",
     "fit_to_scene": "An Szene anpassen",
     "fit_to_scene_trimmed": "An Szene anpassen (beschnitten)",
-    "add_crop_box": "Zuschneidebox hinzufügen",
-    "add_crop_ellipsoid": "Zuschneidellipse hinzufügen",
     "reset_crop": "Zurücksetzen",
     "merge_to_single_ply": "Zu einzelner PLY zusammenführen",
     "move_to": "Verschieben nach",

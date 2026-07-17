@@ -182,6 +182,7 @@ namespace lfs::vis {
             DynamicBuffer shape_overlay;
             DynamicBuffer ui_shape_overlay;
             DynamicBuffer textured_overlay;
+            DynamicBuffer ui_textured_overlay;
             DynamicBuffer grid_uniform;
             DynamicBuffer frustum_instances;
             VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;
@@ -359,7 +360,9 @@ namespace lfs::vis {
                            frame.textured_overlay.buffer != VK_NULL_HANDLE && !p.textured_overlays.empty();
                 },
                 [this](const ViewportRecordContext& c, const VulkanViewportPassParams& p) {
-                    recordTexturedOverlayPass(c, p);
+                    const auto& frame = resourcesForFrame(p.frame_slot);
+                    recordTexturedOverlayPass(c, p, p.textured_overlays, frame.textured_overlay,
+                                              c.world_depth_params_push);
                 });
             addGraphPass(
                 "base_overlay", P::WorldOverlay,
@@ -429,6 +432,19 @@ namespace lfs::vis {
                 },
                 [this](const ViewportRecordContext& c, const VulkanViewportPassParams& p) {
                     recordUiShapePass(c, p);
+                });
+            addGraphPass(
+                "ui_textured_overlay", P::UiOverlay,
+                [this](const VulkanViewportPassParams& p) {
+                    const auto& frame = resourcesForFrame(p.frame_slot);
+                    return frame.ui_textured_overlay.count > 0 && textured_overlay_pipeline != VK_NULL_HANDLE &&
+                           frame.ui_textured_overlay.buffer != VK_NULL_HANDLE && !p.ui_textured_overlays.empty();
+                },
+                [this](const ViewportRecordContext& c, const VulkanViewportPassParams& p) {
+                    const auto& frame = resourcesForFrame(p.frame_slot);
+                    // depth_params = 0 → UI text/icons always render in front of the scene.
+                    recordTexturedOverlayPass(c, p, p.ui_textured_overlays, frame.ui_textured_overlay,
+                                              glm::vec4(0.0f));
                 });
             addGraphPass(
                 "post_ui_overlay", P::UiOverlay,
@@ -1512,40 +1528,44 @@ namespace lfs::vis {
                 std::min<std::size_t>(vertices.size(), std::numeric_limits<std::uint32_t>::max()));
         }
 
-        void updateTexturedOverlayBuffer(FrameResources& frame, const VulkanViewportPassParams& params) {
-            frame.textured_overlay.count = 0;
-            if (params.textured_overlays.empty()) {
+        void updateTexturedOverlayBuffer(const std::vector<VulkanViewportTexturedOverlay>& overlays,
+                                         DynamicBuffer& resource,
+                                         const std::size_t frame_slot,
+                                         const std::string_view label) {
+            resource.count = 0;
+            if (overlays.empty()) {
                 return;
             }
-            const std::size_t vertex_count = params.textured_overlays.size() * 6u;
-            const VkBuffer previous_buffer = frame.textured_overlay.buffer;
-            if (!ensureDynamicBuffer(frame.textured_overlay,
+            const std::size_t vertex_count = overlays.size() * 6u;
+            const VkBuffer previous_buffer = resource.buffer;
+            if (!ensureDynamicBuffer(resource,
                                      vertex_count,
                                      sizeof(VulkanViewportTexturedOverlayVertex),
                                      64,
                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) {
                 return;
             }
-            if (frame.textured_overlay.buffer != previous_buffer) {
+            if (resource.buffer != previous_buffer) {
                 context->setDebugObjectNamef(VK_OBJECT_TYPE_BUFFER,
-                                             frame.textured_overlay.buffer,
-                                             "viewport.textured_overlay[{}].vertex[{}]",
-                                             params.frame_slot,
-                                             frame.textured_overlay.capacity);
+                                             resource.buffer,
+                                             "viewport.{}[{}].vertex[{}]",
+                                             label,
+                                             frame_slot,
+                                             resource.capacity);
             }
 
             std::vector<VulkanViewportTexturedOverlayVertex> vertices;
             vertices.reserve(vertex_count);
-            for (const auto& overlay : params.textured_overlays) {
+            for (const auto& overlay : overlays) {
                 vertices.insert(vertices.end(), overlay.vertices.begin(), overlay.vertices.end());
             }
 
             const VkDeviceSize bytes =
                 static_cast<VkDeviceSize>(sizeof(VulkanViewportTexturedOverlayVertex) * vertices.size());
-            if (!writeAllocation(frame.textured_overlay.allocation, vertices.data(), bytes)) {
+            if (!writeAllocation(resource.allocation, vertices.data(), bytes)) {
                 return;
             }
-            frame.textured_overlay.count = static_cast<std::uint32_t>(
+            resource.count = static_cast<std::uint32_t>(
                 std::min<std::size_t>(vertices.size(), std::numeric_limits<std::uint32_t>::max()));
         }
 
@@ -1799,7 +1819,14 @@ namespace lfs::vis {
             updateQuadBuffer(params.scene_image_flip_y);
             updateGridUniforms(params);
             updateFrustumInstances(params);
-            updateTexturedOverlayBuffer(frame, params);
+            updateTexturedOverlayBuffer(params.textured_overlays,
+                                        frame.textured_overlay,
+                                        params.frame_slot,
+                                        "textured_overlay");
+            updateTexturedOverlayBuffer(params.ui_textured_overlays,
+                                        frame.ui_textured_overlay,
+                                        params.frame_slot,
+                                        "ui_textured_overlay");
             updateOverlayBuffer(frame, params);
             updateShapeOverlayBuffer(params.shape_overlay_triangles,
                                      frame.shape_overlay,
@@ -2094,21 +2121,24 @@ namespace lfs::vis {
         }
 
         void recordTexturedOverlayPass(const ViewportRecordContext& ctx,
-                                       const VulkanViewportPassParams& params) {
+                                       const VulkanViewportPassParams& params,
+                                       const std::vector<VulkanViewportTexturedOverlay>& overlays,
+                                       const DynamicBuffer& resource,
+            const glm::vec4& depth_params) {
             const VkCommandBuffer command_buffer = ctx.cmd;
             auto& frame = resourcesForFrame(params.frame_slot);
             LFS_VK_DEBUG_ASSERT(
-                frame.textured_overlay.count > 0 && textured_overlay_pipeline != VK_NULL_HANDLE &&
-                    frame.textured_overlay.buffer != VK_NULL_HANDLE && !params.textured_overlays.empty(),
+                resource.count > 0 && textured_overlay_pipeline != VK_NULL_HANDLE &&
+                    resource.buffer != VK_NULL_HANDLE && !overlays.empty(),
                 "Viewport textured-overlay pass requires vertices, overlays, a vertex buffer, and a pipeline (frame_slot={}, vertex_count={}, overlay_count={}, vertex_buffer={:#x}, pipeline={:#x})",
                 params.frame_slot,
-                frame.textured_overlay.count,
-                params.textured_overlays.size(),
-                vkHandleValue(frame.textured_overlay.buffer),
+                resource.count,
+                overlays.size(),
+                vkHandleValue(resource.buffer),
                 vkHandleValue(textured_overlay_pipeline));
             const VkDeviceSize offset = 0;
             vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, textured_overlay_pipeline);
-            vkCmdBindVertexBuffers(command_buffer, 0, 1, &frame.textured_overlay.buffer, &offset);
+            vkCmdBindVertexBuffers(command_buffer, 0, 1, &resource.buffer, &offset);
             if (frame.shape_overlay_descriptor_set != VK_NULL_HANDLE) {
                 vkCmdBindDescriptorSets(command_buffer,
                                         VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -2120,8 +2150,8 @@ namespace lfs::vis {
                                         nullptr);
             }
             std::uint32_t first_vertex = 0;
-            for (const auto& overlay : params.textured_overlays) {
-                if (overlay.texture_id == 0 || first_vertex + 6u > frame.textured_overlay.count) {
+            for (const auto& overlay : overlays) {
+                if (overlay.texture_id == 0 || first_vertex + 6u > resource.count) {
                     first_vertex += 6u;
                     continue;
                 }
@@ -2134,7 +2164,7 @@ namespace lfs::vis {
                 push.tint_opacity = overlay.tint_opacity;
                 push.effects = overlay.effects;
                 push.viewport_rect = ctx.viewport_rect_push;
-                push.depth_params = ctx.world_depth_params_push;
+                push.depth_params = depth_params;
                 vkCmdBindDescriptorSets(command_buffer,
                                         VK_PIPELINE_BIND_POINT_GRAPHICS,
                                         textured_overlay_pipeline_layout,
@@ -2425,6 +2455,7 @@ namespace lfs::vis {
                     destroyDynamicBuffer(frame.shape_overlay);
                     destroyDynamicBuffer(frame.ui_shape_overlay);
                     destroyDynamicBuffer(frame.textured_overlay);
+                    destroyDynamicBuffer(frame.ui_textured_overlay);
                     destroyDynamicBuffer(frame.grid_uniform);
                     destroyDynamicBuffer(frame.frustum_instances);
                 }

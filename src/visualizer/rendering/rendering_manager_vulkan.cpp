@@ -2390,6 +2390,13 @@ namespace lfs::vis {
                     crop.inverse = pc_request.filters.crop_inverse;
                     crop.desaturate = pc_request.filters.crop_desaturate;
                     vk_req.crop = crop;
+                } else if (pc_request.filters.crop_ellipsoid.has_value()) {
+                    PointCloudVulkanRenderer::CropEllipsoid crop{};
+                    crop.to_local = pc_request.filters.crop_ellipsoid->transform;
+                    crop.radii = pc_request.filters.crop_ellipsoid->radii;
+                    crop.inverse = pc_request.filters.crop_inverse;
+                    crop.desaturate = pc_request.filters.crop_desaturate;
+                    vk_req.crop_ellipsoid = crop;
                 }
                 vk_req.view = view;
                 vk_req.view_projection = view_proj;

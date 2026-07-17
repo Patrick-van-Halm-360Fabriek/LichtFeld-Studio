@@ -557,6 +557,16 @@ namespace lfs::rendering {
                 params.crop.inverse = request.filters.crop_inverse;
                 params.crop.desaturate = request.filters.crop_desaturate;
             }
+            params.has_crop_ellipsoid = request.filters.crop_ellipsoid.has_value();
+            if (params.has_crop_ellipsoid) {
+                const auto& ellipsoid = *request.filters.crop_ellipsoid;
+                std::copy_n(glm::value_ptr(ellipsoid.transform), 16, params.crop_ellipsoid.to_local);
+                params.crop_ellipsoid.radii[0] = ellipsoid.radii.x;
+                params.crop_ellipsoid.radii[1] = ellipsoid.radii.y;
+                params.crop_ellipsoid.radii[2] = ellipsoid.radii.z;
+                params.crop_ellipsoid.inverse = request.filters.crop_inverse;
+                params.crop_ellipsoid.desaturate = request.filters.crop_desaturate;
+            }
             std::copy_n(glm::value_ptr(view), 16, params.view);
             std::copy_n(glm::value_ptr(view_proj), 16, params.view_proj);
             params.width = width;

@@ -1783,14 +1783,8 @@ namespace lfs::vis::op {
         }
         after_ = *node->cropbox;
         transform_after_ = scene_.getNodeTransform(node_name_);
-        if (rendering_manager_) {
-            const auto settings = rendering_manager_->getSettings();
-            show_after_ = settings.show_crop_box;
-            use_after_ = settings.use_crop_box;
-        } else {
-            show_after_ = show_before_;
-            use_after_ = use_before_;
-        }
+        show_after_ = node->visible;
+        use_after_ = node->cropbox->enabled;
     }
 
     void CropBoxUndoEntry::undo() {
@@ -1798,11 +1792,12 @@ namespace lfs::vis::op {
         if (node && node->cropbox) {
             *node->cropbox = before_;
             scene_.setNodeTransform(node_name_, transform_before_);
+            scene_.setNodeVisibility(node->id, show_before_);
         }
         if (rendering_manager_) {
             auto settings = rendering_manager_->getSettings();
             settings.show_crop_box = show_before_;
-            settings.use_crop_box = use_before_;
+            settings.use_crop_box = before_.enabled;
             rendering_manager_->updateSettings(settings);
         }
     }
@@ -1812,11 +1807,12 @@ namespace lfs::vis::op {
         if (node && node->cropbox) {
             *node->cropbox = after_;
             scene_.setNodeTransform(node_name_, transform_after_);
+            scene_.setNodeVisibility(node->id, show_after_);
         }
         if (rendering_manager_) {
             auto settings = rendering_manager_->getSettings();
             settings.show_crop_box = show_after_;
-            settings.use_crop_box = use_after_;
+            settings.use_crop_box = after_.enabled;
             rendering_manager_->updateSettings(settings);
         }
     }
@@ -1870,14 +1866,8 @@ namespace lfs::vis::op {
         }
         after_ = *node->ellipsoid;
         transform_after_ = scene_.getNodeTransform(node_name_);
-        if (rendering_manager_) {
-            const auto settings = rendering_manager_->getSettings();
-            show_after_ = settings.show_ellipsoid;
-            use_after_ = settings.use_ellipsoid;
-        } else {
-            show_after_ = show_before_;
-            use_after_ = use_before_;
-        }
+        show_after_ = node->visible;
+        use_after_ = node->ellipsoid->enabled;
     }
 
     void EllipsoidUndoEntry::undo() {
@@ -1885,11 +1875,12 @@ namespace lfs::vis::op {
         if (node && node->ellipsoid) {
             *node->ellipsoid = before_;
             scene_.setNodeTransform(node_name_, transform_before_);
+            scene_.setNodeVisibility(node->id, show_before_);
         }
         if (rendering_manager_) {
             auto settings = rendering_manager_->getSettings();
             settings.show_ellipsoid = show_before_;
-            settings.use_ellipsoid = use_before_;
+            settings.use_ellipsoid = before_.enabled;
             rendering_manager_->updateSettings(settings);
         }
     }
@@ -1899,11 +1890,12 @@ namespace lfs::vis::op {
         if (node && node->ellipsoid) {
             *node->ellipsoid = after_;
             scene_.setNodeTransform(node_name_, transform_after_);
+            scene_.setNodeVisibility(node->id, show_after_);
         }
         if (rendering_manager_) {
             auto settings = rendering_manager_->getSettings();
             settings.show_ellipsoid = show_after_;
-            settings.use_ellipsoid = use_after_;
+            settings.use_ellipsoid = after_.enabled;
             rendering_manager_->updateSettings(settings);
         }
     }

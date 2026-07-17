@@ -521,12 +521,14 @@ namespace lfs::vis {
 
         // Gizmo state for wireframe sync during manipulation
         void setCropboxGizmoState(bool active, const glm::vec3& min, const glm::vec3& max,
-                                  const glm::mat4& world_transform, bool affects_render = true) {
-            viewport_overlay_service_.setCropbox(active, min, max, world_transform, affects_render);
+                                  const glm::mat4& world_transform, bool affects_render,
+                                  int parent_node_index) {
+            viewport_overlay_service_.setCropbox(active, min, max, world_transform, affects_render, parent_node_index);
         }
         void setEllipsoidGizmoState(bool active, const glm::vec3& radii,
-                                    const glm::mat4& world_transform, bool affects_render = true) {
-            viewport_overlay_service_.setEllipsoid(active, radii, world_transform, affects_render);
+                                    const glm::mat4& world_transform, bool affects_render,
+                                    int parent_node_index) {
+            viewport_overlay_service_.setEllipsoid(active, radii, world_transform, affects_render, parent_node_index);
         }
         void setCropboxGizmoActive(bool active) { viewport_overlay_service_.setCropboxActive(active); }
         void setEllipsoidGizmoActive(bool active) { viewport_overlay_service_.setEllipsoidActive(active); }
