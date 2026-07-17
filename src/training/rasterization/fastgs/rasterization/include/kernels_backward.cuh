@@ -124,7 +124,11 @@ namespace fast_lfs::rasterization::kernels::backward {
             fminf(raw_scale.y, config::max_raw_scale),
             fminf(raw_scale.z, config::max_raw_scale));
         const float3 variance = make_float3(expf(2.0f * clamped_scale.x), expf(2.0f * clamped_scale.y), expf(2.0f * clamped_scale.z));
-        auto [qr, qx, qy, qz] = raw_rotations[primitive_idx];
+        const float4 raw_rotation = raw_rotations[primitive_idx];
+        const float qr = raw_rotation.x;
+        const float qx = raw_rotation.y;
+        const float qy = raw_rotation.z;
+        const float qz = raw_rotation.w;
         const float qrr_raw = qr * qr, qxx_raw = qx * qx, qyy_raw = qy * qy, qzz_raw = qz * qz;
         const float q_norm_sq = qrr_raw + qxx_raw + qyy_raw + qzz_raw;
         const float q_norm_sq_safe = fmaxf(q_norm_sq, 1e-7f);
@@ -535,9 +539,9 @@ namespace fast_lfs::rasterization::kernels::backward {
                         normal = primitive_normals[primitive_idx];
                     }
                     color_grad_factor = make_float3(
-                        (color_unclamped.x >= 0.0f && color_unclamped.x <= config::max_blend_color) ? 1.0f : 0.0f,
-                        (color_unclamped.y >= 0.0f && color_unclamped.y <= config::max_blend_color) ? 1.0f : 0.0f,
-                        (color_unclamped.z >= 0.0f && color_unclamped.z <= config::max_blend_color) ? 1.0f : 0.0f);
+                        color_unclamped.x <= config::max_blend_color ? 1.0f : 0.0f,
+                        color_unclamped.y <= config::max_blend_color ? 1.0f : 0.0f,
+                        color_unclamped.z <= config::max_blend_color ? 1.0f : 0.0f);
                 }
             }
 

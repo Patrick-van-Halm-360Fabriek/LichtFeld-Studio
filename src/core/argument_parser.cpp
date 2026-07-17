@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/argument_parser.hpp"
+#include "core/environment.hpp"
 #include "core/logger.hpp"
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
@@ -187,7 +188,7 @@ namespace {
                 "lichtfeld-studio plugin create my_plugin\n"
                 "\n"
                 "ENVIRONMENT:\n"
-                "LOG_LEVEL -- Set log level (trace/debug/info/perf/warn/error)\n");
+                "LFS_LOG_LEVEL -- Set log level (trace/debug/info/perf/warn/error)\n");
             parser.helpParams.width = 240;
 
             // =============================================================================
@@ -213,6 +214,7 @@ namespace {
             ::args::ValueFlag<std::string> init_path(paths_group, "path", "Initialize from splat file (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume)", {"init"});
             ::args::ValueFlagList<std::string> add_splats(paths_group, "path", "Append trained splat file(s) to the training model before optimizer initialization", {"add-splat"});
             ::args::CounterFlag freeze(paths_group, "freeze", "Freeze the immediately preceding --add-splat rows from optimizer gradients and densification", {"freeze"});
+            ::args::ValueFlag<float> freeze_lr_scale(paths_group, "scale", "Learning-rate scale for frozen splats (0 = fully frozen, default; try 0.01-0.1 to let frozen splats absorb small appearance mismatch)", {"freeze-lr-scale"});
             ::args::Flag exclude_export(paths_group, "exclude_export", "Exclude frozen --add-splat rows from PLY exports", {"exclude-export"});
 
             ::args::ValueFlag<std::string> import_cameras(paths_group, "path", "Import COLMAP cameras from sparse folder (no images required)", {"import-cameras"});
@@ -399,8 +401,8 @@ namespace {
                 std::string filter_pattern;
 
                 // Check environment variable first
-                if (const char* env_level = std::getenv("LOG_LEVEL")) {
-                    level = parse_log_level(env_level);
+                if (const auto env_level = lfs::core::environment::value("LFS_LOG_LEVEL")) {
+                    level = parse_log_level(std::string(*env_level));
                 }
                 // Verbose/quiet flags override environment variable
                 if (verbose) {
@@ -819,6 +821,7 @@ namespace {
                                         use_normal_loss_flag = bool(use_normal_loss),
                                         no_error_map_flag = bool(no_error_map),
                                         no_edge_map_flag = bool(no_edge_map),
+                                        freeze_lr_scale_val = cli_option_present({"--freeze-lr-scale"}) ? std::optional<float>(::args::get(freeze_lr_scale)) : std::optional<float>(),
                                         exclude_export_flag = bool(exclude_export),
                                         output_name_val = cli_option_present({"--output-name"}) ? std::optional<std::string>(::args::get(output_name)) : std::optional<std::string>()]() {
                 auto& opt = params.optimization;
@@ -907,6 +910,7 @@ namespace {
                     opt.use_error_map = false;
                 if (no_edge_map_flag)
                     opt.use_edge_map = false;
+                setVal(freeze_lr_scale_val, params.freeze_lr_scale);
                 setFlag(exclude_export_flag, params.exclude_frozen_add_splats_from_export);
 
                 // Mask parameters
