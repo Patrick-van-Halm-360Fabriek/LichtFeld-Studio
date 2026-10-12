@@ -5,16 +5,13 @@
 find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-if(NOT LFS_ONNXRUNTIME_TARGET OR NOT TARGET "${LFS_ONNXRUNTIME_TARGET}")
-    message(FATAL_ERROR "ONNX Runtime target was not configured; include cmake/SetupOnnxRuntime.cmake before src/preprocessing")
-endif()
-if(NOT LFS_ONNXRUNTIME_INCLUDE_DIR)
-    message(FATAL_ERROR "ONNX Runtime include directory was not configured")
-endif()
-
 add_library(lfs_preprocessing STATIC
     preprocess.cpp
+    lens_priors.cpp
+    lens_views.cu
+    lens_views.hpp
     include/preprocessing/preprocess.hpp
+    include/preprocessing/lens_priors.hpp
 )
 
 target_include_directories(lfs_preprocessing
@@ -25,7 +22,6 @@ target_include_directories(lfs_preprocessing
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/core/include
         ${CMAKE_SOURCE_DIR}/external
-        ${LFS_ONNXRUNTIME_INCLUDE_DIR}
 )
 
 target_link_libraries(lfs_preprocessing
@@ -34,13 +30,9 @@ target_link_libraries(lfs_preprocessing
     PRIVATE
         lfs_io                  # Scene import (Loader) for depth-anchor precompute
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
-        ${LFS_ONNXRUNTIME_TARGET}
         CURL::libcurl
         OpenSSL::Crypto
-        lfs_oiio
 )
-
-set_property(SOURCE preprocess.cpp APPEND PROPERTY COMPILE_DEFINITIONS FMT_HEADER_ONLY=1)
 
 target_compile_features(lfs_preprocessing PUBLIC cxx_std_23)
 
@@ -48,4 +40,14 @@ set_target_properties(lfs_preprocessing PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
+# The lens views include the rasterizer's camera models, built like the training kernels.
+target_compile_options(lfs_preprocessing PRIVATE
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:--extended-lambda --expt-relaxed-constexpr -Xcompiler=/utf-8 --diag-suppress=27>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:--extended-lambda --expt-relaxed-constexpr>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
 )

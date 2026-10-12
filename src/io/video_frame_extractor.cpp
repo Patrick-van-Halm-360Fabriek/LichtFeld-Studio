@@ -3,12 +3,16 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "video_frame_extractor.hpp"
+#include "core/image_codecs.hpp"
 #include "core/include/core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "hdr_libplacebo.hpp"
 #include "hdr_tonemap.hpp"
 #include "nvcodec_image_loader.hpp"
 #include "video/color_convert.cuh"
+#include "video/cuda_frame_handoff.hpp"
+#include "video/frame_color_range.hpp"
+#include "video/sws_packed_rgb.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -22,7 +26,6 @@ extern "C" {
 }
 
 #include <cuda_runtime.h>
-#include <stb_image_write.h>
 
 #include <nlohmann/json.hpp>
 
@@ -262,8 +265,11 @@ namespace lfs::io {
                 while (true) {
                     av_frame_unref(frame);
                     const int receive_result = avcodec_receive_frame(codec_context_, frame);
-                    if (receive_result == 0)
+                    if (receive_result == 0) {
+                        video::restoreCuvidFullRange(frame, codec_context_,
+                                                     format_context_->streams[stream_index_]->codecpar);
                         return DecoderPumpResult::Frame;
+                    }
                     if (receive_result == AVERROR_EOF)
                         return DecoderPumpResult::EndOfStream;
                     if (receive_result != AVERROR(EAGAIN)) {
@@ -366,19 +372,31 @@ namespace lfs::io {
                               const void* data,
                               ImageFormat format,
                               int jpg_quality) {
-            const std::string path_utf8 = lfs::core::path_to_utf8(path);
+            std::string error;
             if (format == ImageFormat::JPG) {
-                return stbi_write_jpg(path_utf8.c_str(), width, height, 3, data, jpg_quality) != 0;
+                const int quality = jpg_quality == 0 ? 90 : std::clamp(jpg_quality, 1, 100);
+                const bool success = lfs::core::image_codecs::write_jpeg(
+                    path, static_cast<const std::uint8_t*>(data), width, height, 3,
+                    quality, std::nullopt, error, quality > 90);
+                if (!success)
+                    LOG_ERROR("{}", error);
+                return success;
             }
-            return stbi_write_png(path_utf8.c_str(), width, height, 3, data, width * 3) != 0;
+            const bool success = lfs::core::image_codecs::write_png(
+                path, data, width, height, 3, 8, 6, std::nullopt, error);
+            if (!success)
+                LOG_ERROR("{}", error);
+            return success;
         }
 
-        void write_jpeg_to_file(const std::filesystem::path& path, const std::vector<uint8_t>& data) {
+        bool write_jpeg_to_file(const std::filesystem::path& path, const std::vector<uint8_t>& data) {
             std::ofstream file(path, std::ios::binary);
-            if (file) {
-                file.write(reinterpret_cast<const char*>(data.data()),
-                           static_cast<std::streamsize>(data.size()));
-            }
+            if (!file)
+                return false;
+            file.write(reinterpret_cast<const char*>(data.data()),
+                       static_cast<std::streamsize>(data.size()));
+            file.close();
+            return static_cast<bool>(file);
         }
 
         const char* get_hw_decoder_name(AVCodecID codec_id) {
@@ -390,7 +408,9 @@ namespace lfs::io {
             case AV_CODEC_ID_VP8:
                 return "vp8_cuvid";
             case AV_CODEC_ID_VP9:
-                return "vp9_cuvid";
+                // Keep FFmpeg's VP9 presentation timing, including show-existing frames,
+                // while using its CUDA hardware acceleration instead of the CUVID parser.
+                return "vp9";
             case AV_CODEC_ID_AV1:
                 return "av1_cuvid";
             case AV_CODEC_ID_MPEG1VIDEO:
@@ -410,6 +430,21 @@ namespace lfs::io {
             for (const AVPixelFormat* p = pix_fmts; *p != -1; p++) {
                 if (*p == AV_PIX_FMT_CUDA)
                     return *p;
+            }
+            return AV_PIX_FMT_NONE;
+        }
+
+        AVPixelFormat get_vp9_format(AVCodecContext* context, const AVPixelFormat* formats) {
+            const auto hardware_format = get_hw_format(context, formats);
+            auto& using_hardware = *static_cast<bool*>(context->opaque);
+            using_hardware = hardware_format != AV_PIX_FMT_NONE;
+            if (using_hardware)
+                return hardware_format;
+            // Native decoders negotiate hardware support on the first frame, not at open.
+            for (const AVPixelFormat* format = formats; *format != AV_PIX_FMT_NONE; ++format) {
+                const AVPixFmtDescriptor* descriptor = av_pix_fmt_desc_get(*format);
+                if (descriptor && !(descriptor->flags & AV_PIX_FMT_FLAG_HWACCEL))
+                    return *format;
             }
             return AV_PIX_FMT_NONE;
         }
@@ -695,82 +730,138 @@ namespace lfs::io {
         return true;
     }
 
-    std::string formatFrameFilenameStem(const std::string_view pattern, const int frame_number) {
-        const std::string_view effective_pattern = pattern.empty() ? std::string_view{"frame_%d"} : pattern;
-        std::string out;
-        out.reserve(effective_pattern.size() + 8);
-
-        bool consumed_value = false;
-        for (size_t i = 0; i < effective_pattern.size(); ++i) {
-            if (effective_pattern[i] != '%' || i + 1 >= effective_pattern.size()) {
-                out.push_back(effective_pattern[i]);
-                continue;
-            }
-
-            if (effective_pattern[i + 1] == '%') {
-                out.push_back('%');
-                ++i;
-                continue;
-            }
-
-            size_t j = i + 1;
+    namespace {
+        // A frame filename pattern as literal text and frame-number fields.
+        struct FrameNameSegment {
+            std::string literal;
+            bool number = false;
             int min_width = 0;
-            bool found_value = false;
+        };
 
-            if (effective_pattern[j] == 'd') {
-                found_value = true;
-            } else if (effective_pattern[j] == '0') {
-                size_t zero_count = 0;
-                while (j < effective_pattern.size() && effective_pattern[j] == '0') {
-                    ++zero_count;
-                    ++j;
+        std::vector<FrameNameSegment> parseFrameFilenamePattern(const std::string_view pattern) {
+            const std::string_view effective_pattern = pattern.empty() ? std::string_view{"frame_%d"} : pattern;
+            std::vector<FrameNameSegment> segments;
+            const auto literal = [&](const char c) {
+                if (segments.empty() || segments.back().number)
+                    segments.emplace_back();
+                segments.back().literal.push_back(c);
+            };
+
+            bool consumed_value = false;
+            for (size_t i = 0; i < effective_pattern.size(); ++i) {
+                if (effective_pattern[i] != '%' || i + 1 >= effective_pattern.size()) {
+                    literal(effective_pattern[i]);
+                    continue;
                 }
 
-                int parsed_width = 0;
-                while (j < effective_pattern.size() && std::isdigit(static_cast<unsigned char>(effective_pattern[j]))) {
-                    if (parsed_width < MAX_FILENAME_FRAME_WIDTH)
-                        parsed_width = std::min(parsed_width * 10 + (effective_pattern[j] - '0'),
-                                                MAX_FILENAME_FRAME_WIDTH);
-                    ++j;
+                if (effective_pattern[i + 1] == '%') {
+                    literal('%');
+                    ++i;
+                    continue;
                 }
 
-                const bool has_d_suffix = j < effective_pattern.size() && effective_pattern[j] == 'd';
-                const bool has_legacy_zero_run =
-                    parsed_width == 0 && zero_count > 1 &&
-                    (j >= effective_pattern.size() ||
-                     !std::isalpha(static_cast<unsigned char>(effective_pattern[j])));
-                found_value = has_d_suffix || has_legacy_zero_run;
+                size_t j = i + 1;
+                int min_width = 0;
+                bool found_value = false;
+
+                if (effective_pattern[j] == 'd') {
+                    found_value = true;
+                } else if (effective_pattern[j] == '0') {
+                    size_t zero_count = 0;
+                    while (j < effective_pattern.size() && effective_pattern[j] == '0') {
+                        ++zero_count;
+                        ++j;
+                    }
+
+                    int parsed_width = 0;
+                    while (j < effective_pattern.size() && std::isdigit(static_cast<unsigned char>(effective_pattern[j]))) {
+                        if (parsed_width < MAX_FILENAME_FRAME_WIDTH)
+                            parsed_width = std::min(parsed_width * 10 + (effective_pattern[j] - '0'),
+                                                    MAX_FILENAME_FRAME_WIDTH);
+                        ++j;
+                    }
+
+                    const bool has_d_suffix = j < effective_pattern.size() && effective_pattern[j] == 'd';
+                    const bool has_legacy_zero_run =
+                        parsed_width == 0 && zero_count > 1 &&
+                        (j >= effective_pattern.size() ||
+                         !std::isalpha(static_cast<unsigned char>(effective_pattern[j])));
+                    found_value = has_d_suffix || has_legacy_zero_run;
+
+                    if (found_value) {
+                        min_width = parsed_width > 0
+                                        ? parsed_width
+                                        : static_cast<int>(has_legacy_zero_run || zero_count > 1
+                                                               ? std::min<size_t>(zero_count + 1, MAX_FILENAME_FRAME_WIDTH)
+                                                               : 0);
+                        if (!has_d_suffix)
+                            --j;
+                    }
+                }
 
                 if (found_value) {
-                    min_width = parsed_width > 0
-                                    ? parsed_width
-                                    : static_cast<int>(has_legacy_zero_run || zero_count > 1
-                                                           ? std::min<size_t>(zero_count + 1, MAX_FILENAME_FRAME_WIDTH)
-                                                           : 0);
-                    if (!has_d_suffix)
-                        --j;
+                    segments.push_back({.number = true, .min_width = min_width});
+                    i = j;
+                    consumed_value = true;
+                    continue;
                 }
+
+                literal('%');
             }
 
-            if (found_value) {
-                appendFrameNumber(out, frame_number, min_width);
-                i = j;
-                consumed_value = true;
-                continue;
-            }
-
-            out.push_back('%');
+            if (!consumed_value)
+                segments.push_back({.number = true});
+            return segments;
         }
 
-        if (!consumed_value)
-            appendFrameNumber(out, frame_number, 0);
+        // Number fields accept any digit run that is not all zeros: earlier
+        // extractions may have used another padding width.
+        bool matchFrameNameSegments(const std::vector<FrameNameSegment>& segments, const size_t index,
+                                    const std::string_view name, const size_t pos) {
+            if (index == segments.size())
+                return pos == name.size();
+            const auto& segment = segments[index];
+            if (!segment.number) {
+                return name.substr(pos, segment.literal.size()) == segment.literal &&
+                       matchFrameNameSegments(segments, index + 1, name, pos + segment.literal.size());
+            }
+            bool nonzero = false;
+            for (size_t end = pos; end < name.size() && std::isdigit(static_cast<unsigned char>(name[end]));) {
+                nonzero |= name[end] != '0';
+                ++end;
+                if (nonzero && matchFrameNameSegments(segments, index + 1, name, end))
+                    return true;
+            }
+            return false;
+        }
+    } // namespace
 
+    std::string formatFrameFilenameStem(const std::string_view pattern, const int frame_number) {
+        std::string out;
+        out.reserve(pattern.size() + 8);
+        for (const auto& segment : parseFrameFilenamePattern(pattern)) {
+            if (segment.number)
+                appendFrameNumber(out, frame_number, segment.min_width);
+            else
+                out += segment.literal;
+        }
         return out;
+    }
+
+    bool isGeneratedFrameFilename(const std::string_view pattern, const std::string_view filename) {
+        constexpr std::string_view png = ".png";
+        constexpr std::string_view jpg = ".jpg";
+        if (!filename.ends_with(png) && !filename.ends_with(jpg))
+            return false;
+        return matchFrameNameSegments(parseFrameFilenamePattern(pattern), 0,
+                                      filename.substr(0, filename.size() - png.size()), 0);
     }
 
     class VideoFrameExtractor::Impl {
     public:
         bool extract(const Params& params, std::string& error) {
+            outcome_ = ExtractionOutcome::Failed;
+            error.clear();
             const auto extraction_started = std::chrono::steady_clock::now();
             AVFormatContext* fmt_ctx = nullptr;
             AVCodecContext* codec_ctx = nullptr;
@@ -786,8 +877,26 @@ namespace lfs::io {
             uint8_t* gpu_rotated_buffer = nullptr;
             uint8_t* cpu_contiguous_buffer = nullptr;
             std::vector<uint8_t> rot_buf;
+            std::vector<uint8_t> rgb_scratch;
             std::unique_ptr<NvCodecImageLoader> nvcodec;
             bool using_hw_decode = false;
+
+            const auto cleanup = [&]() {
+                if (sws_ctx)
+                    sws_freeContext(sws_ctx);
+                av_frame_free(&frame);
+                av_frame_free(&sw_frame);
+                av_frame_free(&sparse_previous_frame);
+                av_packet_free(&packet);
+                avcodec_free_context(&codec_ctx);
+                av_buffer_unref(&hw_device_ctx);
+                avformat_close_input(&fmt_ctx);
+                delete[] cpu_contiguous_buffer;
+                cpu_contiguous_buffer = nullptr;
+                freeCudaBuffer(gpu_rgb_buffer, "CUDA RGB buffer");
+                freeCudaBuffer(gpu_batch_buffer, "CUDA JPEG batch buffer");
+                freeCudaBuffer(gpu_rotated_buffer, "CUDA rotation buffer");
+            };
 
             try {
                 const std::string video_path_utf8 = lfs::core::path_to_utf8(params.video_path);
@@ -802,9 +911,13 @@ namespace lfs::io {
                 // description already stored in container headers, avoiding a
                 // global probe of audio tracks which this workflow never uses.
                 int video_stream_idx = findUsableHeaderVideoStream(fmt_ctx);
+                // avformat_find_stream_info frees its per-stream probe state; a
+                // second call on the same context dereferences it. Probe at most once.
+                bool stream_info_probed = false;
                 if (video_stream_idx < 0) {
                     // Preserve compatibility with containers that need packet
                     // probing to expose their video dimensions or codec.
+                    stream_info_probed = true;
                     if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
                         error = "Failed to find stream info";
                         avformat_close_input(&fmt_ctx);
@@ -826,7 +939,7 @@ namespace lfs::io {
                 // header (notably PQ/HLG signalling). Probe only after every
                 // non-video stream is discarded, then rewind so decoding and
                 // frame selection remain deterministic.
-                if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+                if (!stream_info_probed && avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
                     LOG_WARN("Could not complete video-only stream metadata probe; some source metadata may be unavailable");
                 }
                 av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
@@ -906,52 +1019,74 @@ namespace lfs::io {
                                                      : "CPU software");
                 }
 
-                codec_ctx = avcodec_alloc_context3(codec);
-                if (!codec_ctx) {
-                    error = "Failed to allocate codec context";
-                    if (hw_device_ctx)
-                        av_buffer_unref(&hw_device_ctx);
-                    avformat_close_input(&fmt_ctx);
-                    return false;
-                }
-
-                if (avcodec_parameters_to_context(codec_ctx, video_stream->codecpar) < 0) {
-                    error = "Failed to copy codec parameters";
-                    avcodec_free_context(&codec_ctx);
-                    if (hw_device_ctx)
-                        av_buffer_unref(&hw_device_ctx);
-                    avformat_close_input(&fmt_ctx);
-                    return false;
-                }
-
-                if (using_hw_decode) {
-                    codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-                    if (!codec_ctx->hw_device_ctx) {
-                        error = "Failed to retain CUDA video decoder context";
-                        avcodec_free_context(&codec_ctx);
-                        av_buffer_unref(&hw_device_ctx);
+                while (true) {
+                    codec_ctx = avcodec_alloc_context3(codec);
+                    if (!codec_ctx) {
+                        error = "Failed to allocate codec context";
+                        if (hw_device_ctx)
+                            av_buffer_unref(&hw_device_ctx);
                         avformat_close_input(&fmt_ctx);
                         return false;
                     }
-                    codec_ctx->get_format = get_hw_format;
-                } else {
-                    const unsigned int hardware_threads = std::max(1U, std::thread::hardware_concurrency());
-                    codec_ctx->thread_count = std::min(MAX_SW_DECODE_THREADS,
-                                                       static_cast<int>(hardware_threads));
-                    codec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-                    LOG_INFO("FFmpeg software decoder threads: {}", codec_ctx->thread_count);
-                }
+
+                    if (avcodec_parameters_to_context(codec_ctx, video_stream->codecpar) < 0) {
+                        error = "Failed to copy codec parameters";
+                        avcodec_free_context(&codec_ctx);
+                        if (hw_device_ctx)
+                            av_buffer_unref(&hw_device_ctx);
+                        avformat_close_input(&fmt_ctx);
+                        return false;
+                    }
+
+                    if (using_hw_decode) {
+                        codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+                        if (!codec_ctx->hw_device_ctx) {
+                            error = "Failed to retain CUDA video decoder context";
+                            avcodec_free_context(&codec_ctx);
+                            av_buffer_unref(&hw_device_ctx);
+                            avformat_close_input(&fmt_ctx);
+                            return false;
+                        }
+                        codec_ctx->get_format = get_hw_format;
+                        if (codec_id == AV_CODEC_ID_VP9) {
+                            codec_ctx->pkt_timebase = video_stream->time_base;
+                            codec_ctx->opaque = &using_hw_decode;
+                            codec_ctx->get_format = get_vp9_format;
+                        }
+                    } else {
+                        const unsigned int hardware_threads = std::max(1U, std::thread::hardware_concurrency());
+                        codec_ctx->thread_count = std::min(MAX_SW_DECODE_THREADS,
+                                                           static_cast<int>(hardware_threads));
+                        codec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+                        LOG_INFO("FFmpeg software decoder threads: {}", codec_ctx->thread_count);
+                    }
 #ifdef AV_CODEC_EXPORT_DATA_DOVI_RPU
-                codec_ctx->export_side_data |= AV_CODEC_EXPORT_DATA_DOVI_RPU;
+                    codec_ctx->export_side_data |= AV_CODEC_EXPORT_DATA_DOVI_RPU;
 #endif
 
-                if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
-                    error = "Failed to open codec";
+                    if (avcodec_open2(codec_ctx, codec, nullptr) >= 0)
+                        break;
+
+                    if (!using_hw_decode) {
+                        error = "Failed to open codec";
+                        avcodec_free_context(&codec_ctx);
+                        if (hw_device_ctx)
+                            av_buffer_unref(&hw_device_ctx);
+                        avformat_close_input(&fmt_ctx);
+                        return false;
+                    }
+
+                    LOG_WARN("Failed to open NVDEC hardware decoder {}, falling back to CPU", hw_decoder_name);
                     avcodec_free_context(&codec_ctx);
-                    if (hw_device_ctx)
-                        av_buffer_unref(&hw_device_ctx);
-                    avformat_close_input(&fmt_ctx);
-                    return false;
+                    av_buffer_unref(&hw_device_ctx);
+                    using_hw_decode = false;
+                    codec = avcodec_find_decoder(codec_id);
+                    if (!codec) {
+                        error = "Unsupported codec";
+                        avformat_close_input(&fmt_ctx);
+                        return false;
+                    }
+                    LOG_INFO("Using CPU software decoder");
                 }
 
                 const int src_width = codec_ctx->width;
@@ -961,6 +1096,10 @@ namespace lfs::io {
                     video_fps = validFrameRate(video_stream->r_frame_rate);
                 if (video_fps <= 0.0)
                     video_fps = 30.0;
+                // Source numbers use the timestamp grid, not the average cadence of a VFR stream.
+                double source_frame_fps = validFrameRate(video_stream->r_frame_rate);
+                if (source_frame_fps <= 0.0)
+                    source_frame_fps = video_fps;
                 double video_duration = validDurationSeconds(fmt_ctx->duration, AVRational{1, AV_TIME_BASE});
                 if (video_duration <= 0.0)
                     video_duration = validDurationSeconds(video_stream->duration, video_stream->time_base);
@@ -1011,15 +1150,25 @@ namespace lfs::io {
                 const double start_time = params.start_time;
                 double end_time =
                     params.end_time < 0.0 ? video_duration : params.end_time;
+                // Plain interval extraction can read to EOF when the duration estimate is short.
+                // FPS sampling and sharpness windows retain their existing time boundaries.
+                bool extract_to_stream_end = params.end_time < 0.0;
                 if (video_duration > 0.0) {
                     const double duration_tolerance =
                         std::max(1.0e-6, time_base);
-                    if (start_time >= video_duration ||
-                        end_time > video_duration + duration_tolerance) {
+                    if (start_time >= video_duration) {
                         error = "Invalid extraction parameters: trim range exceeds video duration";
                         throw std::invalid_argument(error);
                     }
+                    // A frame-count based duration estimate can run past the stream's end; an end
+                    // beyond the video extracts to its last frame.
+                    if (end_time > video_duration + duration_tolerance) {
+                        end_time = video_duration;
+                        extract_to_stream_end = true;
+                    }
                 }
+                extract_to_stream_end = extract_to_stream_end &&
+                                        !(params.sharpness.enabled && params.sharpness.window_mode);
                 const double trim_duration = end_time - start_time;
                 if (!std::isfinite(trim_duration) || trim_duration <= 0.0) {
                     error = "Invalid extraction parameters: invalid video trim range";
@@ -1168,7 +1317,7 @@ namespace lfs::io {
                             gpu_batch_buffer = nullptr;
                             jpeg_batch_size = 0;
                         }
-                    } else {
+                    } else if (memory_info_result == cudaSuccess) {
                         LOG_WARN(
                             "Insufficient CUDA memory headroom for JPEG batching; "
                             "falling back to CPU");
@@ -1264,10 +1413,8 @@ namespace lfs::io {
                         error = "Failed to configure video color conversion";
                         return false;
                     }
-                    uint8_t* dst_data[4] = {cpu_contiguous_buffer, nullptr, nullptr, nullptr};
-                    int dst_linesize[4] = {out_width * 3, 0, 0, 0};
-                    if (sws_scale(sws_ctx, source->data, source->linesize, 0,
-                                  source_height, dst_data, dst_linesize) <= 0) {
+                    if (scaleToPackedRgb24(sws_ctx, source->data, source->linesize, source_height,
+                                           cpu_contiguous_buffer, out_width, out_height, rgb_scratch) <= 0) {
                         error = "Video color conversion failed";
                         return false;
                     }
@@ -1371,7 +1518,10 @@ namespace lfs::io {
                     for (size_t i = 0; i < encoded.size(); i++) {
                         if (!encoded[i].empty()) {
                             const auto jpeg_write_started = std::chrono::steady_clock::now();
-                            write_jpeg_to_file(batch_filenames[i], encoded[i]);
+                            if (!write_jpeg_to_file(batch_filenames[i], encoded[i])) {
+                                throw std::runtime_error("Failed to write extracted frame: " +
+                                                         lfs::core::path_to_utf8(batch_filenames[i]));
+                            }
                             jpeg_write_seconds += elapsedSeconds(jpeg_write_started);
                             ++written_count;
                             if (params.generate_metadata && i < batch_meta.size()) {
@@ -1399,7 +1549,7 @@ namespace lfs::io {
 
                 const auto source_frame_for_time = [&](const double frame_time) {
                     return std::max(
-                        1, static_cast<int>(std::llround(frame_time * video_fps)) + 1);
+                        1, static_cast<int>(std::llround(frame_time * source_frame_fps)) + 1);
                 };
 
                 auto reserve_output_filename = [&](const std::filesystem::path& filename,
@@ -1487,8 +1637,8 @@ namespace lfs::io {
                     if (!write_image_file(fname, write_w, write_h,
                                           write_data, params.format,
                                           params.jpg_quality)) {
-                        LOG_WARN("Failed to write sharpest window frame: {}",
-                                 lfs::core::path_to_utf8(fname));
+                        throw std::runtime_error("Failed to write sharpest window frame: " +
+                                                 lfs::core::path_to_utf8(fname));
                     } else {
                         ++written_count;
                         if (params.generate_metadata) {
@@ -1523,13 +1673,17 @@ namespace lfs::io {
                     }
 
                     if (use_full_gpu_pipeline) {
+                        video::CudaFrameHandoff frame_handoff(hw_frame);
                         const uint8_t* y_plane = hw_frame->data[0];
                         const uint8_t* uv_plane = hw_frame->data[1];
                         const int y_pitch = hw_frame->linesize[0];
                         const int uv_pitch = hw_frame->linesize[1];
 
                         video::nv12ToRgbCuda(y_plane, uv_plane, gpu_rgb_buffer,
-                                             src_width, src_height, y_pitch, uv_pitch, nullptr);
+                                             src_width, src_height, y_pitch, uv_pitch, nullptr,
+                                             hw_frame->color_range == AVCOL_RANGE_JPEG ||
+                                                 (hw_frame->color_range == AVCOL_RANGE_UNSPECIFIED &&
+                                                  source_range == AVCOL_RANGE_JPEG));
                         requireCudaSuccess(cudaGetLastError(),
                                            "CUDA NV12-to-RGB conversion failed");
 
@@ -1592,6 +1746,7 @@ namespace lfs::io {
                             cudaMemcpy(dst_ptr, batch_src, frame_size,
                                        cudaMemcpyDeviceToDevice),
                             "CUDA JPEG batch copy failed");
+                        frame_handoff.finish();
 
                         batch_gpu_ptrs.push_back(dst_ptr);
                         batch_filenames.push_back(filename);
@@ -1720,7 +1875,8 @@ namespace lfs::io {
                                                         frame_score});
                             }
                         } else {
-                            LOG_WARN("Failed to write extracted frame: {}", lfs::core::path_to_utf8(filename));
+                            throw std::runtime_error("Failed to write extracted frame: " +
+                                                     lfs::core::path_to_utf8(filename));
                         }
                     }
 
@@ -1840,7 +1996,8 @@ namespace lfs::io {
                                                     frame_score});
                         }
                     } else {
-                        LOG_WARN("Failed to write extracted frame: {}", lfs::core::path_to_utf8(filename));
+                        throw std::runtime_error("Failed to write extracted frame: " +
+                                                 lfs::core::path_to_utf8(filename));
                     }
 
                     finish_selected_frame();
@@ -1891,7 +2048,7 @@ namespace lfs::io {
                     const bool past_end =
                         params.mode == ExtractionMode::FPS
                             ? frame_time >= end_time
-                            : frame_time > end_time;
+                            : !extract_to_stream_end && frame_time > end_time;
                     if (past_end)
                         return true;
 
@@ -2097,7 +2254,13 @@ namespace lfs::io {
                 // Flush remaining window candidates at end of video
                 flush_window();
 
+                // Completion reports files actually written, including delayed encoder batches.
+                if (params.progress_callback)
+                    params.progress_callback(written_count + skipped_count, written_count + skipped_count, skipped_count);
+
                 if (params.generate_metadata && !saved_frames.empty()) {
+                    const std::filesystem::path meta_path =
+                        params.output_dir / "extraction_metadata.json";
                     try {
                         nlohmann::json root;
                         root["schema_version"] = 2;
@@ -2271,14 +2434,14 @@ namespace lfs::io {
                                               {"sharpness_score", f.sharpness_score}});
                         }
 
-                        const std::filesystem::path meta_path =
-                            params.output_dir / "extraction_metadata.json";
-                        std::ofstream meta_file(meta_path);
-                        if (meta_file) {
-                            meta_file << root.dump(2);
-                        }
+                        std::ofstream meta_file(meta_path, std::ios::binary);
+                        meta_file << root.dump(2);
+                        meta_file.close();
+                        if (!meta_file)
+                            throw std::runtime_error("Could not write output file");
                     } catch (const std::exception& e) {
-                        LOG_WARN("Failed to write extraction metadata: {}", e.what());
+                        throw std::runtime_error("Failed to write extraction metadata " +
+                                                 lfs::core::path_to_utf8(meta_path) + ": " + e.what());
                     }
                 }
 
@@ -2298,50 +2461,27 @@ namespace lfs::io {
                              cuda_upload_seconds, jpeg_encode_seconds, jpeg_write_seconds);
                 }
 
-                // Cleanup
-                if (sws_ctx)
-                    sws_freeContext(sws_ctx);
-                av_frame_free(&frame);
-                av_frame_free(&sw_frame);
-                av_frame_free(&sparse_previous_frame);
-                av_packet_free(&packet);
-                avcodec_free_context(&codec_ctx);
-                if (hw_device_ctx)
-                    av_buffer_unref(&hw_device_ctx);
-                avformat_close_input(&fmt_ctx);
-                delete[] cpu_contiguous_buffer;
-                freeCudaBuffer(gpu_rgb_buffer, "CUDA RGB buffer");
-                freeCudaBuffer(gpu_batch_buffer, "CUDA JPEG batch buffer");
-                freeCudaBuffer(gpu_rotated_buffer, "CUDA rotation buffer");
+                cleanup();
 
+                outcome_ = ExtractionOutcome::Completed;
                 return true;
 
+            } catch (const ExtractionCancelled& e) {
+                cleanup();
+                outcome_ = ExtractionOutcome::Cancelled;
+                error = e.what();
+                return false;
             } catch (const std::exception& e) {
-                if (sws_ctx)
-                    sws_freeContext(sws_ctx);
-                if (frame)
-                    av_frame_free(&frame);
-                if (sw_frame)
-                    av_frame_free(&sw_frame);
-                if (sparse_previous_frame)
-                    av_frame_free(&sparse_previous_frame);
-                if (packet)
-                    av_packet_free(&packet);
-                if (codec_ctx)
-                    avcodec_free_context(&codec_ctx);
-                if (hw_device_ctx)
-                    av_buffer_unref(&hw_device_ctx);
-                if (fmt_ctx)
-                    avformat_close_input(&fmt_ctx);
-                delete[] cpu_contiguous_buffer;
-                freeCudaBuffer(gpu_rgb_buffer, "CUDA RGB buffer");
-                freeCudaBuffer(gpu_batch_buffer, "CUDA JPEG batch buffer");
-                freeCudaBuffer(gpu_rotated_buffer, "CUDA rotation buffer");
-
+                cleanup();
                 error = e.what();
                 return false;
             }
         }
+
+        [[nodiscard]] ExtractionOutcome lastOutcome() const { return outcome_; }
+
+    private:
+        ExtractionOutcome outcome_ = ExtractionOutcome::Failed;
     };
 
     VideoFrameExtractor::VideoFrameExtractor() : impl_(new Impl()) {}
@@ -2349,6 +2489,10 @@ namespace lfs::io {
 
     bool VideoFrameExtractor::extract(const Params& params, std::string& error) {
         return impl_->extract(params, error);
+    }
+
+    ExtractionOutcome VideoFrameExtractor::lastOutcome() const {
+        return impl_->lastOutcome();
     }
 
 } // namespace lfs::io

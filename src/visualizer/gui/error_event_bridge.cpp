@@ -9,7 +9,9 @@
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/resource_messages.hpp"
 #include "core/source_site.hpp"
+#include "gui/error_surface_types.hpp"
 #include "gui/string_keys.hpp"
 
 #include <algorithm>
@@ -38,7 +40,8 @@ namespace lfs::vis::gui {
                                                 const char* operation, const lfs::core::SourceSite site,
                                                 const lfs::ErrorSurface surface = lfs::ErrorSurface::Modal,
                                                 std::vector<lfs::ErrorAction> actions =
-                                                    operationFailureActions()) {
+                                                    operationFailureActions(),
+                                                lfs::SmallFields fields = {}) {
             lfs::Error base = lfs::make_error(lfs::ErrorInit{
                 .code = code,
                 .domain = domain,
@@ -48,7 +51,7 @@ namespace lfs::vis::gui {
                 .user_message = message,
                 .detail = std::move(message),
                 .detection = site,
-                .fields = lfs::SmallFields{},
+                .fields = std::move(fields),
                 .native = std::nullopt,
             });
 
@@ -81,8 +84,26 @@ namespace lfs::vis::gui {
         };
     }
 
+    std::optional<state::DiskSpaceSaveFailed> projectDiskSpaceFailure(const state::TrainingCompleted& e) {
+        if (e.success || e.user_stopped)
+            return std::nullopt;
+        std::string message = e.error_info ? e.error_info->message : e.error.value_or("");
+        if (!lfs::core::is_disk_space_save_error(message))
+            return std::nullopt;
+        return state::DiskSpaceSaveFailed{.iteration = e.iteration,
+                                          .path = {},
+                                          .error = std::move(message),
+                                          .required_bytes = 0,
+                                          .available_bytes = 0,
+                                          .is_disk_space_error = true,
+                                          .is_project_save = true};
+    }
+
     std::optional<lfs::ErrorNotification>
     translateTrainingCompleted(const state::TrainingCompleted& e) {
+        if (projectDiskSpaceFailure(e)) {
+            return std::nullopt; // the native disk-space modal offers Retry and Change Location
+        }
         if (e.user_stopped) {
             return std::nullopt; // a user-initiated Stop is not a failure
         }
@@ -91,9 +112,16 @@ namespace lfs::vis::gui {
         }
         const lfs::ErrorCode code =
             e.resource_exhausted ? lfs::ErrorCode::ResourceExhausted : lfs::ErrorCode::Internal;
-        std::string message = e.error.value_or("Unknown error occurred during training.");
+        std::string message = e.error.value_or(LOC(lichtfeld::Strings::Runtime::TRAINING_UNKNOWN_ERROR));
+        if (isHostMemorySaveMessage(message)) {
+            message = LOCF("runtime.training_save_no_memory", message);
+        }
+        lfs::SmallFields fields;
+        if (!e.error_message_key.empty())
+            fields.add("message_key", std::string_view(e.error_message_key));
         return makeNotification(code, lfs::ErrorDomain::Training, lfs::Severity::Error,
-                                std::move(message), error_op::kTrain, LFS_SOURCE_SITE_CURRENT());
+                                std::move(message), error_op::kTrain, LFS_SOURCE_SITE_CURRENT(),
+                                lfs::ErrorSurface::Modal, operationFailureActions(), std::move(fields));
     }
 
     std::optional<lfs::ErrorNotification>
@@ -107,8 +135,7 @@ namespace lfs::vis::gui {
 
     std::optional<lfs::ErrorNotification>
     translateConfigLoadFailed(const state::ConfigLoadFailed& e) {
-        std::string message = std::format("Could not load '{}':\n\n{}",
-                                          lfs::core::path_to_utf8(e.path.filename()), e.error);
+        std::string message = LOCF("runtime.config_load_failed", lfs::core::path_to_utf8(e.path.filename()), e.error);
         return makeNotification(lfs::ErrorCode::InvalidArgument, lfs::ErrorDomain::App,
                                 lfs::Severity::Error, std::move(message), error_op::kLoadConfig,
                                 LFS_SOURCE_SITE_CURRENT());
@@ -123,21 +150,21 @@ namespace lfs::vis::gui {
                                     lfs::ErrorSurface::StatusOnly, /*actions=*/{});
         }
         return makeNotification(lfs::ErrorCode::Internal, lfs::ErrorDomain::IO, lfs::Severity::Error,
-                                std::format("Failed to export:\n\n{}", e.error), error_op::kExport,
+                                LOCF("runtime.export_failed", e.error), error_op::kExport,
                                 LFS_SOURCE_SITE_CURRENT());
     }
 
     std::optional<lfs::ErrorNotification>
     translateVideoExportFailed(const state::VideoExportFailed& e) {
         return makeNotification(lfs::ErrorCode::Internal, lfs::ErrorDomain::IO, lfs::Severity::Error,
-                                std::format("Failed to export video:\n\n{}", e.error),
+                                LOCF("runtime.video_export_failed", e.error),
                                 error_op::kExportVideo, LFS_SOURCE_SITE_CURRENT());
     }
 
     std::optional<lfs::ErrorNotification>
     translateMesh2SplatFailed(const state::Mesh2SplatFailed& e) {
         return makeNotification(lfs::ErrorCode::Internal, lfs::ErrorDomain::Rendering,
-                                lfs::Severity::Error, std::format("Conversion failed:\n\n{}", e.error),
+                                lfs::Severity::Error, LOCF("runtime.conversion_failed", e.error),
                                 error_op::kMesh2Splat, LFS_SOURCE_SITE_CURRENT());
     }
 
@@ -181,12 +208,8 @@ namespace lfs::vis::gui {
 
     std::optional<lfs::ErrorNotification>
     translateCudaVersionUnsupported(const state::CudaVersionUnsupported& e) {
-        std::string message = std::format(
-            "Your CUDA driver version ({}.{}) is not supported.\n\n"
-            "LichtFeld Studio requires CUDA {}.{} or later\n"
-            "(NVIDIA driver 570+).\n\n"
-            "Please update your NVIDIA driver for full functionality.",
-            e.major, e.minor, e.min_major, e.min_minor);
+        std::string message = LOCF(lichtfeld::Strings::Runtime::CUDA_DRIVER_UNSUPPORTED,
+                                   e.major, e.minor, e.min_major, e.min_minor);
         return makeNotification(lfs::ErrorCode::FailedPrecondition, lfs::ErrorDomain::CUDA,
                                 lfs::Severity::Warning, std::move(message), error_op::kCudaCheck,
                                 LFS_SOURCE_SITE_CURRENT(), lfs::ErrorSurface::Toast, /*actions=*/{});
@@ -197,10 +220,7 @@ namespace lfs::vis::gui {
         if (e.is_disk_space_error) {
             return std::nullopt; // the native GuiManager rich disk-space modal owns this case
         }
-        std::string message =
-            e.is_checkpoint
-                ? std::format("Failed to save checkpoint at iteration {}:\n\n{}", e.iteration, e.error)
-                : std::format("Failed to export:\n\n{}", e.error);
+        std::string message = LOCF("runtime.export_failed", e.error);
         return makeNotification(lfs::ErrorCode::Internal, lfs::ErrorDomain::IO, lfs::Severity::Error,
                                 std::move(message), error_op::kSave, LFS_SOURCE_SITE_CURRENT());
     }
@@ -212,8 +232,13 @@ namespace lfs::vis::gui {
             }
         };
 
-        state::TrainingCompleted::when(
-            [publish](const auto& e) { publish(translateTrainingCompleted(e)); });
+        state::TrainingCompleted::when([publish](const auto& e) {
+            if (const auto disk_space = projectDiskSpaceFailure(e)) {
+                disk_space->emit();
+                return;
+            }
+            publish(translateTrainingCompleted(e));
+        });
         state::DatasetLoadCompleted::when(
             [publish](const auto& e) { publish(translateDatasetLoadCompleted(e)); });
         state::ConfigLoadFailed::when(

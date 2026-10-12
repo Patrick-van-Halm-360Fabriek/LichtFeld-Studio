@@ -4,6 +4,7 @@
 
 #include "control_boundary.hpp"
 #include "core/tensor.hpp"
+#include "training/training_snapshot_service.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -59,6 +60,8 @@ namespace lfs::training {
         ArgType type;
         bool required = true;
         std::optional<std::string> description;
+        std::optional<double> exclusive_minimum;
+        std::optional<double> maximum;
     };
 
     struct OperationInfo {
@@ -95,12 +98,42 @@ namespace lfs::training {
         bool stop_requested = false;
         TrainingPhase phase = TrainingPhase::Idle;
         Trainer* trainer = nullptr; // non-owning
+        std::string strategy;
+        bool session_hydrated = true;
+        TrainingSnapshotServiceMetrics project_snapshot;
+        std::string project_snapshot_path;
+        std::string project_snapshot_writer_error;
+        double project_snapshot_pre_step_mean_ms = 0.0;
+        double project_snapshot_post_step_mean_ms = 0.0;
+        double project_snapshot_step_regression_percent = 0.0;
+        int project_snapshot_pre_step_first_iteration = 0;
+        int project_snapshot_pre_step_last_iteration = 0;
+        std::size_t project_snapshot_pre_step_samples = 0;
+        int project_snapshot_post_step_first_iteration = 0;
+        int project_snapshot_post_step_last_iteration = 0;
+        std::size_t project_snapshot_post_step_samples = 0;
+        bool project_snapshot_step_regression_gate_evaluated = false;
+        bool project_snapshot_step_regression_within_gate = false;
+        bool project_snapshot_writer_in_flight = false;
     };
 
     struct LossHistoryPoint {
         int iteration;
         float loss;
     };
+
+    // Stateless helper shared by training consumers; no DLL-owned state.
+    inline core::Tensor expand_row_mask(const core::Tensor& row_mask, const core::TensorShape& target_shape) {
+        if (row_mask.shape().rank() == 0 || target_shape.rank() == 0) {
+            return row_mask;
+        }
+        if (row_mask.shape().rank() == 1 && target_shape.rank() > 1) {
+            std::vector<size_t> dims(target_shape.rank(), 1);
+            dims[0] = row_mask.shape()[0];
+            return row_mask.reshape(core::TensorShape{dims}).expand(target_shape);
+        }
+        return row_mask;
+    }
 
     class CommandCenter {
     public:
@@ -109,16 +142,20 @@ namespace lfs::training {
         void set_phase(TrainingPhase phase);
 
         void update_snapshot(const HookContext& ctx, int max_iterations, bool is_paused, bool is_running, bool stop_requested, TrainingPhase phase);
+        void overlay_stored_session(std::string strategy, bool hydrated);
+        LFS_BRIDGE_API void bind_state_events();
         void clear_snapshot(const Trainer* trainer);
+        // Drop trainer-owned snapshot fields after teardown (no trainer loaded).
+        void reset_snapshot();
 
         [[nodiscard]] TrainingSnapshot snapshot() const;
         [[nodiscard]] std::vector<LossHistoryPoint> loss_history() const;
         void clear_loss_history();
+        void replace_loss_history(
+            std::vector<LossHistoryPoint> history);
 
         std::expected<void, std::string> execute(const Command& cmd);
 
-        // Enqueue a command to be executed later on the training thread.
-        void enqueue_command(const Command& cmd);
         void drain_enqueued(TrainingSnapshot& view);
 
         std::vector<OperationInfo> operations(std::optional<CommandTarget> target = std::nullopt) const;
@@ -139,6 +176,8 @@ namespace lfs::training {
 
         static std::expected<core::Tensor*, std::string> resolve_attribute(lfs::core::SplatData& model, const std::string& name, size_t& row_dim_out);
 
+        void reset_snapshot_locked();
+
         // Registry
         std::vector<OperationInfo> ops_;
         std::vector<MutableFieldInfo> mutable_fields_;
@@ -150,6 +189,7 @@ namespace lfs::training {
         std::atomic<TrainingPhase> phase_{TrainingPhase::Idle};
         std::vector<LossHistoryPoint> loss_history_;
         int last_recorded_iteration_ = -1;
+        std::optional<std::size_t> training_paused_handler_id_;
     };
 
 } // namespace lfs::training

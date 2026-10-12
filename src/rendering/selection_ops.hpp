@@ -150,6 +150,14 @@ namespace lfs::rendering {
     [[nodiscard]] std::array<size_t, 256> count_selection_groups(
         const Tensor& selection_mask,
         Tensor& counts_scratch);
+    // Queue the group histogram and, optionally, a pinned-host copy. Neither
+    // function waits for the CUDA stream; callers that need the values can
+    // poll/synchronize their own event later.
+    void count_selection_groups_async(const Tensor& selection_mask,
+                                      Tensor& counts_scratch);
+    void enqueue_selection_group_count_read(const Tensor& counts_scratch,
+                                            int* pinned_host_counts,
+                                            cudaEvent_t ready_event);
     [[nodiscard]] SelectionGroupCountResult read_selection_group_count_result(
         const Tensor& counts_scratch);
     [[nodiscard]] SelectionGroupDeltaResult read_selection_group_delta_result(
@@ -175,7 +183,8 @@ namespace lfs::rendering {
         const Tensor* ellipsoid_radii,
         bool ellipsoid_inverse,
         const Tensor* model_transforms = nullptr,
-        const Tensor* transform_indices = nullptr);
+        const Tensor* transform_indices = nullptr,
+        int parent_node_index = -1);
 
     namespace config {
         void setSelectionGroupColor(int group_id, float3 color);

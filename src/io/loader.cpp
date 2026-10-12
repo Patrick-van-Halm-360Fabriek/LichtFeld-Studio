@@ -3,9 +3,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "io/loader.hpp"
+#include "core/file_extensions.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "io/filesystem_utils.hpp"
+#include "io/splat_path.hpp"
 #include "loader_service.hpp"
 #include <algorithm>
 #include <cctype>
@@ -39,8 +41,11 @@ namespace lfs::io {
                     return false;
                 }
 
+                if (is_ssog_path(path))
+                    return true;
+
                 // Check for SOG files
-                if (path.extension() == ".sog" || path.extension() == ".SOG") {
+                if (core::has_extension(path, ".sog")) {
                     LOG_TRACE("SOG file detected: {}", lfs::core::path_to_utf8(path));
                     return true;
                 }
@@ -137,6 +142,8 @@ namespace lfs::io {
     }
 
     bool Loader::isDatasetPath(const std::filesystem::path& path) {
+        if (is_ssog_path(path))
+            return false;
         if (!safe_exists(path)) {
             LOG_TRACE("Path does not exist for dataset check: {}", lfs::core::path_to_utf8(path));
             return false;
@@ -153,7 +160,7 @@ namespace lfs::io {
             }
 
             // SOG files are NOT datasets - they're single splat files like PLY
-            if (ext == ".sog") {
+            if (ext == ".sog" || ext == ".ssog") {
                 LOG_TRACE("SOG file detected, not a dataset: {}", lfs::core::path_to_utf8(path));
                 return false;
             }
@@ -204,8 +211,8 @@ namespace lfs::io {
         }
 
         // Blender/NeRF markers
-        if (safe_exists(path / "transforms.json") ||
-            safe_exists(path / "transforms_train.json")) {
+        if (safe_exists(path / TRANSFORMS_DATASET_MARKERS[0]) ||
+            safe_exists(path / TRANSFORMS_DATASET_MARKERS[1])) {
             LOG_TRACE("Blender/NeRF dataset detected at: {}", lfs::core::path_to_utf8(path));
             return true;
         }
@@ -227,6 +234,8 @@ namespace lfs::io {
 
     // Static method to determine dataset type
     DatasetType Loader::getDatasetType(const std::filesystem::path& path) {
+        if (is_ssog_path(path))
+            return DatasetType::Unknown;
         if (!safe_exists(path)) {
             return DatasetType::Unknown;
         }
@@ -238,7 +247,7 @@ namespace lfs::io {
                 return DatasetType::Transforms;
             }
             // SOG files are not datasets
-            if (ext == ".sog") {
+            if (ext == ".sog" || ext == ".ssog") {
                 return DatasetType::Unknown;
             }
             return DatasetType::Unknown;
@@ -269,8 +278,8 @@ namespace lfs::io {
         }
 
         // Check for Transforms markers
-        if (safe_exists(path / "transforms.json") ||
-            safe_exists(path / "transforms_train.json")) {
+        if (safe_exists(path / TRANSFORMS_DATASET_MARKERS[0]) ||
+            safe_exists(path / TRANSFORMS_DATASET_MARKERS[1])) {
             return DatasetType::Transforms;
         }
 

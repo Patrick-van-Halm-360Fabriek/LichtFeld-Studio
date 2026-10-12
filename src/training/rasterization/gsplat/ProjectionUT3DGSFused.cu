@@ -55,7 +55,9 @@ namespace gsplat_lfs {
 
         // shift pointers to the current gaussian
         const glm::fvec3 mean = glm::make_vec3(means + gid * 3);
-        const glm::fvec3 scale = glm::make_vec3(scales + gid * 3);
+        const glm::fvec3 scale_raw = glm::make_vec3(scales + gid * 3);
+        const glm::fvec3 scale = glm::fvec3(
+            expf(scale_raw.x), expf(scale_raw.y), expf(scale_raw.z));
         glm::fquat quat = glm::fquat{
             quats[gid * 4 + 0],
             quats[gid * 4 + 1],
@@ -76,7 +78,8 @@ namespace gsplat_lfs {
         // Interpolate to *center* shutter pose as single per-Gaussian camera pose
         const auto shutter_pose = interpolate_shutter_pose(0.5f, rs_params);
         const vec3 mean_c = glm::rotate(shutter_pose.q, mean) + shutter_pose.t;
-        if ((mean_c.z < near_plane && camera_model_type != CameraModelType::EQUIRECTANGULAR) || mean_c.z > far_plane) {
+        const float depth = camera_model_type == CameraModelType::PINHOLE ? mean_c.z : glm::length(mean_c);
+        if (depth < near_plane || depth > far_plane) {
             radii[idx * 2] = 0;
             radii[idx * 2 + 1] = 0;
             return;
@@ -198,7 +201,7 @@ namespace gsplat_lfs {
 
         float extend = 3.33f;
         if (opacities != nullptr) {
-            float opacity = opacities[gid];
+            float opacity = activated_opacity(opacities[gid]);
             opacity *= compensation;
             if (opacity < ALPHA_THRESHOLD) {
                 radii[idx * 2] = 0;
@@ -238,7 +241,7 @@ namespace gsplat_lfs {
         radii[idx * 2 + 1] = (int32_t)radius_y;
         means2d[idx * 2] = mean2d.x;
         means2d[idx * 2 + 1] = mean2d.y;
-        depths[idx] = mean_c.z;
+        depths[idx] = depth;
         conics[idx * 3] = covar2d_inv[0][0];
         conics[idx * 3 + 1] = covar2d_inv[0][1];
         conics[idx * 3 + 2] = covar2d_inv[1][1];

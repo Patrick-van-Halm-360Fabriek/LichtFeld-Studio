@@ -23,6 +23,7 @@ def _install_lf_stub(monkeypatch):
         depth_width=1.35,
         depth_calls=[],
         stage_calls=[],
+        command_calls=[],
         undo_available=True,
         redo_available=True,
         undo_calls=0,
@@ -46,6 +47,9 @@ def _install_lf_stub(monkeypatch):
         get_active_tool=lambda: state.active_tool,
         get_active_submode=lambda: state.active_submode,
         message_dialog=lambda *_args, **_kwargs: None,
+        select_all_gaussians=lambda: state.command_calls.append("select_all"),
+        invert_gaussian_selection=lambda: state.command_calls.append("invert"),
+        deselect_all_gaussians=lambda: state.command_calls.append("deselect_all"),
     )
     lf_stub.has_scene = lambda: state.has_scene
     lf_stub.get_scene = lambda: _SceneStub() if state.has_scene else None
@@ -73,11 +77,6 @@ def _install_lf_stub(monkeypatch):
     )
     lf_stub.pipeline = SimpleNamespace(
         edit=SimpleNamespace(delete_=lambda: _StageStub("edit.delete")),
-        select=SimpleNamespace(
-            all=lambda: _StageStub("select.all"),
-            invert=lambda: _StageStub("select.invert"),
-            none=lambda: _StageStub("select.none"),
-        ),
     )
     lf_stub.undo = SimpleNamespace(
         can_undo=lambda: state.undo_available,
@@ -258,6 +257,28 @@ def test_selection_depth_toggle_and_sliders_use_selection_api(selection_controls
     assert state.depth_calls[-1] == (True, 1.5, 2.0, 1.35)
 
 
+def test_selection_depth_user_edit_mark_expires(selection_controls_module, monkeypatch):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+
+    panel.bind_model(model)
+    panel.update(_DocumentStub())
+    panel._depth_echo_holdoff = 1
+    panel._mark_depth_user_edit("near")
+    marked_at = module.time.monotonic()
+    monkeypatch.setattr(
+        module.time,
+        "monotonic",
+        lambda: marked_at + module._DEPTH_USER_EDIT_MARK_TTL + 0.01,
+    )
+
+    model.bound_binds["selection_depth_near_value"][1]("1.5")
+
+    assert state.depth_calls == []
+    assert "near" not in panel._depth_user_edit_pending
+
+
 def test_selection_depth_text_fields_commit_like_panel_inputs(selection_controls_module):
     module, state = selection_controls_module
     panel = module.SelectionControlsController()
@@ -335,7 +356,8 @@ def test_selection_depth_text_invalid_commit_reverts(selection_controls_module):
     assert state.depth_calls == []
 
 
-def test_selection_actions_use_undoable_pipeline_and_history(selection_controls_module):
+# Catches toolbar buttons that bypass the Select menu commands, which honor group locks and filters.
+def test_selection_actions_use_the_select_menu_commands_and_history(selection_controls_module):
     module, state = selection_controls_module
     panel = module.SelectionControlsController()
     model = _DataModelStub()
@@ -349,7 +371,8 @@ def test_selection_actions_use_undoable_pipeline_and_history(selection_controls_
     model.bound_events["selection_action"](None, None, ["undo"])
     model.bound_events["selection_action"](None, None, ["redo"])
 
-    assert state.stage_calls == ["edit.delete", "select.all", "select.invert", "select.none"]
+    assert state.stage_calls == ["edit.delete"]
+    assert state.command_calls == ["select_all", "invert", "deselect_all"]
     assert state.undo_calls == 1
     assert state.redo_calls == 1
 

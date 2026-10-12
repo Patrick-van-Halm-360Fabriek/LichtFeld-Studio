@@ -21,8 +21,9 @@ namespace Rml {
 } // namespace Rml
 
 namespace lfs::vis {
+    class SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
     struct Theme;
-}
+} // namespace lfs::vis
 namespace lfs::vis::gui {
 
     struct TabSnapshot {
@@ -58,18 +59,23 @@ namespace lfs::vis::gui {
         void blurFocus();
 
         bool wantsInput() const { return wants_input_; }
+        bool isResizeInteractionActive() const { return resize_dragging_ || splitter_dragging_; }
         bool wantsKeyboard() const { return wants_keyboard_; }
         bool needsAnimationFrame() const;
+        [[nodiscard]] std::string animationDemandDescription() const;
         CursorRequest getCursorRequest() const;
+        [[nodiscard]] float tabStripScroll() const { return tab_scroll_left_; }
+        void setTabStripScroll(float value);
 
         std::function<void(const std::string&)> on_tab_changed;
         std::function<void(const std::string&)> on_tab_closed;
-        std::function<void(float)> on_splitter_delta;
+        std::function<void(float, float)> on_splitter_height;
         std::function<void()> on_splitter_end;
-        std::function<void(float)> on_resize_delta;
+        std::function<void(float)> on_resize_width;
         std::function<void()> on_resize_end;
 
     private:
+        friend class lfs::vis::SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
         bool updateTheme();
         bool syncTabData(const std::vector<TabSnapshot>& tabs, const std::string& active_tab);
         bool syncTabScrollState();
@@ -102,15 +108,22 @@ namespace lfs::vis::gui {
         bool wants_keyboard_ = false;
 
         bool splitter_dragging_ = false;
+        float splitter_start_mouse_y_ = 0.0f;
+        float splitter_start_scene_h_ = 0.0f;
 
         bool resize_dragging_ = false;
+        float resize_start_mouse_x_ = 0.0f;
+        float resize_start_width_ = 0.0f;
         bool last_over_resize_handle_ = false;
+        Rml::Element* last_blurred_focus_ = nullptr;
+        Rml::Element* last_hover_element_ = nullptr;
 
         CursorRequest cursor_request_{};
         float prev_mouse_x_ = 0;
         float prev_mouse_y_ = 0;
 
         bool render_needed_ = true;
+        float last_dp_ratio_ = 0.0f;
         int last_fbo_w_ = 0;
         int last_fbo_h_ = 0;
         float last_scene_h_ = -1.0f;

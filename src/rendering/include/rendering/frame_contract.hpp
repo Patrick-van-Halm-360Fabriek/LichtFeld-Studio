@@ -29,6 +29,9 @@ namespace lfs::rendering {
         glm::ivec2 size{0, 0};
         glm::ivec2 subregion_origin{0, 0};
         glm::ivec2 subregion_full_size{0, 0};
+        // Export pixels per source viewport pixel. Keep screen-space splat
+        // filtering and extent limits in the source viewport's pixel units.
+        float rasterization_scale = 1.0f;
         float focal_length_mm = DEFAULT_FOCAL_LENGTH_MM;
         std::optional<CameraIntrinsics> intrinsics_override;
         float near_plane = DEFAULT_NEAR_PLANE;
@@ -39,6 +42,48 @@ namespace lfs::rendering {
 
         [[nodiscard]] glm::mat4 getViewMatrix() const {
             return makeViewMatrix(rotation, translation);
+        }
+
+        // A clipped render target keeps the camera calibrated to the full
+        // viewport. The renderer uses the target size for its tile grid and
+        // this size for projection/camera intrinsics.
+        [[nodiscard]] glm::ivec2 cameraSize() const {
+            return subregion_full_size.x > 0 && subregion_full_size.y > 0
+                       ? subregion_full_size
+                       : size;
+        }
+
+        [[nodiscard]] CameraIntrinsics getCameraIntrinsics() const {
+            const auto camera_size = cameraSize();
+            if (!orthographic && intrinsics_override) {
+                return *intrinsics_override;
+            }
+            if (orthographic) {
+                const float scale = std::isfinite(ortho_scale) && ortho_scale > 1.0e-5f
+                                        ? ortho_scale
+                                        : DEFAULT_ORTHO_SCALE;
+                return {.focal_x = scale,
+                        .focal_y = scale,
+                        .center_x = static_cast<float>(camera_size.x) * 0.5f,
+                        .center_y = static_cast<float>(camera_size.y) * 0.5f};
+            }
+            const auto [fx, fy] = computePixelFocalLengths(camera_size, focal_length_mm);
+            return {.focal_x = fx,
+                    .focal_y = fy,
+                    .center_x = static_cast<float>(camera_size.x) * 0.5f,
+                    .center_y = static_cast<float>(camera_size.y) * 0.5f};
+        }
+
+        [[nodiscard]] glm::mat4 getProjectionMatrix(
+            const float near_plane_override = DEFAULT_NEAR_PLANE,
+            const float far_plane_override = DEFAULT_FAR_PLANE) const {
+            return createProjectionMatrix(
+                cameraSize(),
+                focalLengthToVFov(focal_length_mm),
+                orthographic,
+                ortho_scale,
+                near_plane_override,
+                far_plane_override);
         }
     };
 
@@ -54,11 +99,6 @@ namespace lfs::rendering {
 
     struct GpuFrame {
         TextureHandle color;
-        TextureHandle depth;
-        // Presentation orientation for the screen quad. Geometry/camera conventions live elsewhere.
-        bool flip_y = false;
-        bool depth_is_ndc = false;
-        bool color_has_alpha = false;
         float near_plane = DEFAULT_NEAR_PLANE;
         float far_plane = DEFAULT_FAR_PLANE;
         bool orthographic = false;

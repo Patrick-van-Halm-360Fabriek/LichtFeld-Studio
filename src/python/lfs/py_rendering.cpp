@@ -9,6 +9,7 @@
 #include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
 #include "core/property_registry.hpp"
+#include "core/provenance.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data.hpp"
 #include "core/splat_data_transform.hpp"
@@ -39,6 +40,7 @@
 #include <filesystem>
 #include <functional>
 #include <numbers>
+#include <optional>
 #include <variant>
 
 #include <glm/glm.hpp>
@@ -446,7 +448,8 @@ namespace lfs::python {
             const PreviewReadback readback,
             const std::optional<glm::vec3>& background_color_override,
             const std::optional<bool> orthographic_override = std::nullopt,
-            const std::optional<float> ortho_scale_override = std::nullopt) {
+            const std::optional<float> ortho_scale_override = std::nullopt,
+            const int reference_height = 0) {
             if (width <= 0 || height <= 0 || !std::isfinite(fov_degrees) || fov_degrees <= 0.0f) {
                 return std::nullopt;
             }
@@ -469,7 +472,8 @@ namespace lfs::python {
                     height,
                     background_color_override,
                     orthographic_override,
-                    ortho_scale_override);
+                    ortho_scale_override,
+                    reference_height);
             } else {
                 image = rendering_manager->renderPreviewImage(
                     scene_manager,
@@ -500,7 +504,8 @@ namespace lfs::python {
             const PreviewReadback readback,
             const std::optional<glm::vec3>& background_color_override,
             const std::optional<bool> orthographic_override = std::nullopt,
-            const std::optional<float> ortho_scale_override = std::nullopt) {
+            const std::optional<float> ortho_scale_override = std::nullopt,
+            const int reference_height = 0) {
             auto invoke_render = [&]() -> std::optional<core::Tensor> {
                 return renderViewOnViewerThread(
                     rotation,
@@ -511,7 +516,8 @@ namespace lfs::python {
                     readback,
                     background_color_override,
                     orthographic_override,
-                    ortho_scale_override);
+                    ortho_scale_override,
+                    reference_height);
             };
 
             auto* const viewer = get_visualizer();
@@ -622,7 +628,7 @@ namespace lfs::python {
             meta.name = name;
             meta.description = desc;
             meta.type = PropType::Color3;
-            meta.default_vec3 = default_val;
+            meta.default_value = default_val;
             meta.min_value = 0.0;
             meta.max_value = 1.0;
             meta.getter = [member](const PropertyObjectRef& ref) -> std::any {
@@ -642,7 +648,7 @@ namespace lfs::python {
             meta.name = name;
             meta.description = desc;
             meta.type = PropType::Bool;
-            meta.default_value = default_val ? 1.0 : 0.0;
+            meta.default_value = default_val;
             meta.getter = [member](const PropertyObjectRef& ref) -> std::any {
                 return static_cast<const Proxy*>(ref.ptr)->*member;
             };
@@ -679,7 +685,7 @@ namespace lfs::python {
             meta.description = desc;
             meta.type = PropType::Enum;
             meta.enum_items = items;
-            meta.default_enum = default_idx;
+            meta.default_value = static_cast<int64_t>(default_idx);
             meta.getter = [member, items](const PropertyObjectRef& ref) -> std::any {
                 int val = static_cast<const Proxy*>(ref.ptr)->*member;
                 for (const auto& item : items) {
@@ -713,7 +719,7 @@ namespace lfs::python {
             meta.name = name;
             meta.description = desc;
             meta.type = PropType::String;
-            meta.default_string = default_val;
+            meta.default_value = default_val;
             meta.getter = [member](const PropertyObjectRef& ref) -> std::any {
                 return static_cast<const Proxy*>(ref.ptr)->*member;
             };
@@ -722,6 +728,13 @@ namespace lfs::python {
             };
             group.properties.push_back(std::move(meta));
         };
+
+        add_float(&Proxy::color_exposure, "color_exposure", "Splat exposure", "Splat brightness multiplier", 1.0, 0.1, 8.0);
+        add_int_enum(&Proxy::color_tonemapping, "color_tonemapping", "Tone mapping", "Splat display tone mapping",
+                     {{"None", "none", 0}, {"Linear", "linear", 1}, {"Filmic", "filmic", 2}, {"Hejl", "hejl", 3}, {"ACES", "aces", 4}, {"ACES 2", "aces2", 5}, {"Neutral", "neutral", 6}}, 0);
+        add_int_enum(&Proxy::splat_render_profile, "splat_render_profile", "Splat rendering profile",
+                     "Preserve the source scene rendering when importing from the gallery",
+                     {{"Studio", "studio", 0}, {"Standard portal", "standard", 1}}, 0);
 
         // Background
         add_color3(&Proxy::background_color, "background_color", "Color", "Viewport background color", {0.0, 0.0, 0.0});
@@ -760,8 +773,6 @@ namespace lfs::python {
         add_float(&Proxy::voxel_size, "voxel_size", "Point Size", "Point size in point cloud mode", 0.01, 0.001, 0.1);
 
         // Selection Colors
-        add_color3(&Proxy::selection_color_committed, "selection_color_committed", "Committed",
-                   "Committed selection color", {0.859, 0.325, 0.325});
         add_color3(&Proxy::selection_color_preview, "selection_color_preview", "Preview", "Preview selection color",
                    {0.0, 0.871, 0.298});
         add_color3(&Proxy::selection_color_center_marker, "selection_color_center_marker", "Center Marker",
@@ -787,6 +798,16 @@ namespace lfs::python {
                      2);
         add_bool(&Proxy::mip_filter, "mip_filter", "Mip Filter", "Enable mip-map filtering", false);
         add_float(&Proxy::render_scale, "render_scale", "Render Scale", "Render resolution scale", 1.0, 0.25, 1.0);
+        add_string(&Proxy::scene_upscaler,
+                   "scene_upscaler",
+                   "Scene Reconstruction",
+                   "Stable scene reconstruction backend identifier",
+                   "native");
+        add_string(&Proxy::scene_upscaler_preset,
+                   "scene_upscaler_preset",
+                   "Scene Reconstruction Preset",
+                   "Backend-specific scene reconstruction quality preset",
+                   "native");
         add_float(&Proxy::depth_view_min, "depth_view_min", "Depth Near", "Depth-map visualization near range",
                   lfs::rendering::DEFAULT_DEPTH_VIEW_MIN, 0.0, lfs::rendering::MAX_DEPTH_VIEW_DISTANCE);
         add_float(&Proxy::depth_view_max, "depth_view_max", "Depth Far", "Depth-map visualization far range",
@@ -859,7 +880,7 @@ namespace lfs::python {
             meta.name = name;
             meta.description = desc;
             meta.type = PropType::Bool;
-            meta.default_value = def ? 1.0 : 0.0;
+            meta.default_value = def;
             meta.getter = [member](const PropertyObjectRef& ref) -> std::any {
                 return static_cast<const Proxy*>(ref.ptr)->ppisp.*member;
             };
@@ -923,7 +944,22 @@ namespace lfs::python {
             settings_.gut = rendering::isGutBackend(
                 static_cast<rendering::GaussianRasterBackend>(settings_.raster_backend));
         }
-        vis::update_render_settings(settings_);
+        try {
+            vis::update_render_settings(settings_);
+        } catch (...) {
+            if (const auto applied = vis::get_render_settings()) {
+                settings_ = *applied;
+            }
+            throw;
+        }
+        // update_render_settings may normalize dependent properties (for
+        // example the preset when switching scene reconstruction backends).
+        // Keep this Python proxy in lockstep with that applied state so the
+        // next property assignment cannot restore a stale, cross-backend
+        // preset.
+        if (const auto applied = vis::get_render_settings()) {
+            settings_ = *applied;
+        }
         request_redraw();
     }
 
@@ -947,9 +983,9 @@ namespace lfs::python {
             case core::prop::PropType::Float: {
                 nb::object cls = props_module.attr("FloatProperty");
                 prop_obj = cls(
-                    nb::arg("default") = static_cast<float>(meta.default_value),
-                    nb::arg("min") = static_cast<float>(meta.min_value),
-                    nb::arg("max") = static_cast<float>(meta.max_value),
+                    nb::arg("default") = static_cast<float>(std::get<double>(meta.default_value.value())),
+                    nb::arg("min") = static_cast<float>(meta.min_value.value()),
+                    nb::arg("max") = static_cast<float>(meta.max_value.value()),
                     nb::arg("step") = static_cast<float>(meta.step),
                     nb::arg("name") = meta.name,
                     nb::arg("description") = meta.description);
@@ -958,9 +994,9 @@ namespace lfs::python {
             case core::prop::PropType::Int: {
                 nb::object cls = props_module.attr("IntProperty");
                 prop_obj = cls(
-                    nb::arg("default") = static_cast<int>(meta.default_value),
-                    nb::arg("min") = static_cast<int>(meta.min_value),
-                    nb::arg("max") = static_cast<int>(meta.max_value),
+                    nb::arg("default") = static_cast<int>(std::get<int64_t>(meta.default_value.value())),
+                    nb::arg("min") = static_cast<int>(meta.min_value.value()),
+                    nb::arg("max") = static_cast<int>(meta.max_value.value()),
                     nb::arg("step") = static_cast<int>(meta.step),
                     nb::arg("name") = meta.name,
                     nb::arg("description") = meta.description);
@@ -969,7 +1005,7 @@ namespace lfs::python {
             case core::prop::PropType::Bool: {
                 nb::object cls = props_module.attr("BoolProperty");
                 prop_obj = cls(
-                    nb::arg("default") = meta.default_value != 0.0,
+                    nb::arg("default") = std::get<bool>(meta.default_value.value()),
                     nb::arg("name") = meta.name,
                     nb::arg("description") = meta.description);
                 break;
@@ -977,7 +1013,7 @@ namespace lfs::python {
             case core::prop::PropType::String: {
                 nb::object cls = props_module.attr("StringProperty");
                 prop_obj = cls(
-                    nb::arg("default") = meta.default_string,
+                    nb::arg("default") = std::get<std::string>(meta.default_value.value()),
                     nb::arg("name") = meta.name,
                     nb::arg("description") = meta.description);
                 break;
@@ -989,7 +1025,7 @@ namespace lfs::python {
                 for (size_t i = 0; i < meta.enum_items.size(); ++i) {
                     const auto& item = meta.enum_items[i];
                     items.append(nb::make_tuple(item.identifier, item.name, ""));
-                    if (static_cast<int>(i) == meta.default_enum) {
+                    if (static_cast<int>(i) == std::get<int64_t>(meta.default_value.value())) {
                         default_id = item.identifier;
                     }
                 }
@@ -1004,14 +1040,15 @@ namespace lfs::python {
             case core::prop::PropType::Color3: {
                 nb::object cls = props_module.attr("FloatVectorProperty");
                 std::string subtype = (meta.type == core::prop::PropType::Color3) ? "COLOR" : "";
+                const auto& default_value = std::get<std::array<double, 3>>(meta.default_value.value());
                 prop_obj = cls(
                     nb::arg("default") = nb::make_tuple(
-                        static_cast<float>(meta.default_vec3[0]),
-                        static_cast<float>(meta.default_vec3[1]),
-                        static_cast<float>(meta.default_vec3[2])),
+                        static_cast<float>(default_value[0]),
+                        static_cast<float>(default_value[1]),
+                        static_cast<float>(default_value[2])),
                     nb::arg("size") = 3,
-                    nb::arg("min") = static_cast<float>(meta.min_value),
-                    nb::arg("max") = static_cast<float>(meta.max_value),
+                    nb::arg("min") = static_cast<float>(meta.min_value.value()),
+                    nb::arg("max") = static_cast<float>(meta.max_value.value()),
                     nb::arg("subtype") = subtype,
                     nb::arg("name") = meta.name,
                     nb::arg("description") = meta.description);
@@ -1097,23 +1134,15 @@ namespace lfs::python {
             return rotation;
         }
 
-        [[nodiscard]] std::optional<float> scaledViewInfoOrthoScale(const vis::ViewInfo& view_info,
-                                                                    const int target_height) {
+        [[nodiscard]] std::optional<float> viewInfoOrthoScale(const vis::ViewInfo& view_info) {
             if (!view_info.orthographic) {
                 return std::nullopt;
             }
-            if (view_info.height <= 0 || target_height <= 0 ||
-                !std::isfinite(view_info.ortho_scale) || view_info.ortho_scale <= 0.0f) {
+            if (!std::isfinite(view_info.ortho_scale) || view_info.ortho_scale <= 0.0f) {
                 return std::nullopt;
             }
 
-            const double scale = static_cast<double>(view_info.ortho_scale) *
-                                 static_cast<double>(target_height) /
-                                 static_cast<double>(view_info.height);
-            if (!std::isfinite(scale) || scale <= 0.0) {
-                return std::nullopt;
-            }
-            return static_cast<float>(scale);
+            return view_info.ortho_scale;
         }
 
         [[nodiscard]] core::Tensor toU8Hwc(core::Tensor image) {
@@ -1148,7 +1177,8 @@ namespace lfs::python {
                 PreviewReadback::UInt8Rgb,
                 background_color_override,
                 view_info.orthographic,
-                scaledViewInfoOrthoScale(view_info, height));
+                viewInfoOrthoScale(view_info),
+                view_info.height);
             if (!image || !image->is_valid()) {
                 throw std::runtime_error("viewport export render failed");
             }
@@ -1195,8 +1225,9 @@ namespace lfs::python {
                     .focal_length_mm = lfs::rendering::vFovToFocalLength(view_info.fov),
                     .width = width,
                     .height = height,
+                    .reference_height = view_info.height,
                     .orthographic_override = view_info.orthographic,
-                    .ortho_scale_override = scaledViewInfoOrthoScale(view_info, height),
+                    .ortho_scale_override = viewInfoOrthoScale(view_info),
                     .mode = mode,
                 };
                 return rendering_manager->renderExportImage(scene_manager, request);
@@ -1556,7 +1587,8 @@ namespace lfs::python {
                                    int width,
                                    int height,
                                    const bool transparent,
-                                   const int jpeg_quality) {
+                                   const int jpeg_quality,
+                                   const bool include_provenance) {
         auto output_path = core::utf8_to_path(path);
         const auto normalized_format = normalizeExportImageFormat(format, output_path);
         if (transparent && normalized_format != "png") {
@@ -1574,8 +1606,13 @@ namespace lfs::python {
         int target_width = width;
         int target_height = height;
 
+        const auto render_settings = vis::get_render_settings();
+        const bool split_view =
+            render_settings && render_settings->split_view_mode != static_cast<int>(vis::SplitViewMode::Disabled);
+
         core::Tensor image;
-        if (!transparent && target_width <= 0 && target_height <= 0) {
+        // Only the live viewport composes split-view panels; every other export renders the scene.
+        if (!transparent && target_width <= 0 && target_height <= 0 && split_view) {
             auto captured = viewportRenderImageHwc(captureViewportRenderThreadSafe(), true);
             if (!captured || !captured->is_valid()) {
                 throw std::runtime_error("viewport capture failed");
@@ -1622,7 +1659,6 @@ namespace lfs::python {
                         vis::ExportPostProcessMode::Transparent);
                 }
             } else {
-                const auto render_settings = vis::get_render_settings();
                 const bool export_hdr_environment =
                     render_settings &&
                     render_settings->environment_mode ==
@@ -1637,7 +1673,10 @@ namespace lfs::python {
             }
         }
 
-        core::save_image_u8(output_path, image, jpeg_quality);
+        const auto comment = core::provenance_to_json(
+            include_provenance ? core::make_provenance_stamp()
+                               : core::make_minimal_provenance_stamp());
+        core::save_image_u8(output_path, image, jpeg_quality, comment);
 
         nb::dict result;
         result["path"] = core::path_to_utf8(output_path);
@@ -1742,6 +1781,7 @@ namespace lfs::python {
               nb::arg("height") = 0,
               nb::arg("transparent") = false,
               nb::arg("jpeg_quality") = 95,
+              nb::arg("include_provenance") = true,
               R"doc(
 Export the active viewport image to PNG or JPEG.
 
@@ -1752,6 +1792,7 @@ Args:
     height: Target height in pixels. If both dimensions are zero, captures the current viewport.
     transparent: For PNG only, export straight RGBA from the preview renderer.
     jpeg_quality: JPEG compression quality in [1, 100].
+    include_provenance: When true, writes a full Comment stamp on PNG and JPEG; when false, a minimal build stamp is still embedded.
 
 Returns:
     Dict with path, width, height, channels, format, and transparent.

@@ -14,11 +14,15 @@
 
 #include "core/cuda/sh_layout.cuh"
 #include "core/event_bridge/command_center_bridge.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/event_bridge/scoped_handler.hpp"
 #include "core/events.hpp"
 #include "core/json_utils.hpp"
 #include "core/logger.hpp"
+#include "core/parameters.hpp"
 #include "core/path_utils.hpp"
+#include "core/property_registry.hpp"
+#include "core/provenance.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data_transform.hpp"
 #include "core/tensor.hpp"
@@ -42,6 +46,7 @@
 #include "visualizer/operation/undo_history.hpp"
 #include "visualizer/operator/operator_properties.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
+#include "visualizer/rendering/scene_upscaler_registry.hpp"
 #include "visualizer/scene/scene_manager.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer/visualizer.hpp"
@@ -54,12 +59,15 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <format>
 #include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numbers>
 #include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -67,6 +75,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/euler_angles.hpp>
@@ -92,6 +101,23 @@ namespace lfs::app {
         constexpr size_t MAX_MCP_EVENT_QUEUE_BYTES = 4 * 1024 * 1024;
         constexpr size_t MAX_MCP_EVENT_TOTAL_QUEUE_BYTES = 16 * 1024 * 1024;
         constexpr auto MCP_EVENT_SUBSCRIPTION_TTL = std::chrono::minutes(15);
+
+        json number_array_schema(const size_t count, const std::string& description) {
+            return json{{"type", "array"}, {"minItems", count}, {"maxItems", count}, {"items", json{{"type", "number"}}}, {"description", description}};
+        }
+
+        json point_list_schema(const std::string& description) {
+            return json{{"type", "array"}, {"minItems", 3}, {"description", description}, {"items", json{{"type", "array"}, {"minItems", 2}, {"maxItems", 2}, {"items", json{{"type", "number"}}}}}};
+        }
+
+        json bounded_rotation_schema(const std::string& description) {
+            constexpr double full_turn = 2.0 * std::numbers::pi;
+            return json{{"type", "array"}, {"minItems", 3}, {"maxItems", 3}, {"items", json{{"type", "number"}, {"minimum", -full_turn}, {"maximum", full_turn}}}, {"description", description}};
+        }
+
+        json positive_scale_schema(const std::string& description) {
+            return json{{"type", "array"}, {"minItems", 3}, {"maxItems", 3}, {"items", json{{"type", "number"}, {"exclusiveMinimum", 0}}}, {"description", description}};
+        }
 
         constexpr size_t MAX_MCP_GAUSSIAN_ROWS = 1024;
         constexpr size_t MAX_MCP_GAUSSIAN_FIELDS = 6;
@@ -122,17 +148,186 @@ namespace lfs::app {
             return total;
         }
 
-        std::expected<std::string, std::string> render_scene_to_base64(
-            core::Scene& scene,
-            int camera_index = 0,
-            int width = 0,
-            int height = 0) {
-            (void)scene;
-            (void)camera_index;
-            (void)width;
-            (void)height;
-            return std::unexpected(
-                "Camera-index CUDA scene rendering has been removed; use live Vulkan viewport capture");
+        json project_info_json(
+            const vis::ProjectInfo& info) {
+            json payloads = json::array();
+            for (const auto& payload : info.payloads) {
+                payloads.push_back({
+                    {"chapter", payload.chapter},
+                    {"node_uuid", payload.node_uuid},
+                    {"hydration_state",
+                     payload.hydration_state},
+                });
+            }
+            json recent = json::array();
+            for (const auto& entry :
+                 info.recent_projects) {
+                recent.push_back({
+                    {"project_uuid",
+                     entry.project_uuid},
+                    {"last_known_path",
+                     core::path_to_utf8(
+                         entry.last_known_path)},
+                });
+            }
+            return json{
+                {"success", true},
+                {"path",
+                 info.path
+                     ? json(core::path_to_utf8(
+                           *info.path))
+                     : json(nullptr)},
+                {"project_uuid", info.project_uuid},
+                {"license_identifier", info.license_identifier},
+                {"generation", info.generation},
+                {"dirty", info.dirty},
+                {"session_dirty",
+                 info.session_dirty},
+                {"dirty_chapters",
+                 info.dirty_chapters},
+                {"hydration_state",
+                 info.hydration_state},
+                {"payloads", std::move(payloads)},
+                {"contains_embedded_secrets",
+                 info.contains_embedded_secrets},
+                {"reopen_last_project",
+                 info.reopen_last_project},
+                {"auto_save_on_close",
+                 info.auto_save_on_close},
+                {"dataset_external_available",
+                 info.dataset_external_available},
+                {"embedded_dataset_complete",
+                 info.embedded_dataset_complete},
+                {"embedded_dataset_entries",
+                 info.embedded_dataset_entries},
+                {"autosave_interval_seconds",
+                 info.autosave_interval_seconds},
+                {"autosave_dirty_epoch_threshold",
+                 info
+                     .autosave_dirty_epoch_threshold},
+                {"project_write_running",
+                 info.project_write_running},
+                {"project_write_stage",
+                 info.project_write_stage},
+                {"project_write_progress",
+                 info.project_write_progress},
+                {"project_write_error",
+                 info.project_write_error.empty()
+                     ? json(nullptr)
+                     : json(
+                           info
+                               .project_write_error)},
+                {"project_write_error_code",
+                 info.project_write_error_code
+                     ? json(lfs::to_string(
+                           *info.project_write_error_code))
+                     : json(nullptr)},
+                {"autosave_sequence",
+                 info.autosave_sequence},
+                {"recovery_session",
+                 info.recovery_session},
+                {"compaction_suggested",
+                 info.compaction_suggested},
+                {"physical_bytes",
+                 info.physical_bytes},
+                {"estimated_live_bytes",
+                 info.estimated_live_bytes},
+                {"dead_bytes",
+                 info.dead_bytes},
+                {"dead_ratio",
+                 info.dead_ratio},
+                {"hydration_error",
+                 info.hydration_error.empty()
+                     ? json(nullptr)
+                     : json(info.hydration_error)},
+                {"recent_projects",
+                 std::move(recent)},
+            };
+        }
+
+        json project_error_json(
+            const lfs::Error& error) {
+            return json{
+                {"error",
+                 {
+                     {"code",
+                      lfs::to_string(error.code())},
+                     {"user_message",
+                      std::string(
+                          error.user_message())},
+                     {"detail",
+                      std::string(error.detail())},
+                 }},
+            };
+        }
+
+        json project_error_json(
+            const lfs::ErrorCode code,
+            std::string user_message,
+            std::string detail) {
+            return project_error_json(
+                lfs::make_error(
+                    lfs::ErrorInit{
+                        .code = code,
+                        .domain =
+                            lfs::ErrorDomain::MCP,
+                        .severity =
+                            lfs::Severity::Error,
+                        .retryability =
+                            lfs::Retryability::
+                                NotRetryable,
+                        .operation_id = {},
+                        .user_message =
+                            std::move(user_message),
+                        .detail =
+                            std::move(detail),
+                        .detection =
+                            LFS_SOURCE_SITE_CURRENT(),
+                        .fields = {},
+                        .native = std::nullopt,
+                    }));
+        }
+
+        // The viewer is pinhole: lens cameras render with their pose and vertical field of view.
+        std::expected<std::string, std::string> render_dataset_camera_to_base64(
+            vis::Visualizer* viewer,
+            const int camera_uid,
+            const int width,
+            const int height) {
+            auto* const scene_manager = viewer->getSceneManager();
+            auto* const rendering_manager = viewer->getRenderingManager();
+            if (!scene_manager || !rendering_manager)
+                return std::unexpected("Viewport rendering is not initialized");
+
+            const auto& scene = scene_manager->getScene();
+            const auto camera = scene.getCameraByUid(camera_uid);
+            if (!camera)
+                return std::unexpected("Camera UID not found: " + std::to_string(camera_uid));
+
+            const auto R = camera->R().cpu().contiguous();
+            const auto T = camera->T().cpu().contiguous();
+            glm::mat4 scene_transform(1.0f);
+            if (const auto transform = scene.getCameraSceneTransformByUid(camera_uid))
+                scene_transform = lfs::rendering::dataWorldTransformToVisualizerWorld(*transform);
+            const auto pose = lfs::rendering::visualizerCameraPoseFromDataWorldToCamera(
+                lfs::rendering::mat3FromRowMajor3x3(R.ptr<float>()),
+                glm::vec3(T.ptr<float>()[0], T.ptr<float>()[1], T.ptr<float>()[2]),
+                scene_transform);
+
+            const int camera_width = camera->image_width();
+            const int camera_height = camera->image_height();
+            const float focal_y = std::get<1>(camera->get_intrinsics());
+            if (camera_width <= 0 || camera_height <= 0 || !(focal_y > 0.0f))
+                return std::unexpected("Camera UID " + std::to_string(camera_uid) + " has no image size");
+            const float fov_y_degrees =
+                glm::degrees(2.0f * std::atan(static_cast<float>(camera_height) / (2.0f * focal_y)));
+
+            const auto image = rendering_manager->renderPreviewImage(
+                scene_manager, pose.rotation, pose.translation,
+                lfs::rendering::vFovToFocalLength(fov_y_degrees), camera_width, camera_height);
+            if (!image || !image->is_valid())
+                return std::unexpected("Rendering camera UID " + std::to_string(camera_uid) + " failed");
+            return mcp::encode_render_tensor_to_base64(*image, width, height);
         }
 
         template <typename F>
@@ -166,6 +361,52 @@ namespace lfs::app {
             return post_render_and_wait(viewer_impl, std::forward<F>(fn));
         }
 
+        std::expected<std::string, std::string> capture_viewport_from_window(
+            vis::VisualizerImpl* viewer_impl,
+            const vis::RenderingManager& rendering_manager,
+            const int width,
+            const int height) {
+            const auto rect = rendering_manager.framebufferViewportRect();
+            if (!rect.valid())
+                return std::unexpected("No rendered viewport image is available yet");
+
+            auto* const window_manager = viewer_impl->getWindowManager();
+            auto* const vulkan_context = window_manager ? window_manager->getVulkanContext() : nullptr;
+            if (!vulkan_context)
+                return std::unexpected("Viewport capture requires a Vulkan window");
+
+            auto capture = vulkan_context->captureAndEndActiveFrameRgba();
+            if (!capture)
+                return std::unexpected(capture.error());
+
+            const int left = std::clamp(rect.top_left.x, 0, capture->width);
+            const int top = std::clamp(rect.top_left.y, 0, capture->height);
+            const int right = std::clamp(left + rect.size.x, left, capture->width);
+            const int bottom = std::clamp(top + rect.size.y, top, capture->height);
+            const int crop_width = right - left;
+            const int crop_height = bottom - top;
+            if (crop_width <= 0 || crop_height <= 0)
+                return std::unexpected("Viewport region lies outside the captured window");
+
+            constexpr int kChannels = 4;
+            std::vector<std::uint8_t> cropped(
+                static_cast<std::size_t>(crop_width) * crop_height * kChannels);
+            for (int row = 0; row < crop_height; ++row) {
+                const auto src = (static_cast<std::size_t>(top + row) * capture->width + left) * kChannels;
+                const auto dst = static_cast<std::size_t>(row) * crop_width * kChannels;
+                std::copy_n(capture->rgba.begin() + static_cast<std::ptrdiff_t>(src),
+                            static_cast<std::size_t>(crop_width) * kChannels,
+                            cropped.begin() + static_cast<std::ptrdiff_t>(dst));
+            }
+
+            return mcp::encode_pixels_to_base64(cropped.data(),
+                                                crop_width,
+                                                crop_height,
+                                                kChannels,
+                                                width,
+                                                height);
+        }
+
         std::expected<std::string, std::string> capture_live_viewport_to_base64(
             vis::Visualizer* viewer,
             int width = 0,
@@ -178,11 +419,14 @@ namespace lfs::app {
             if (!rendering_manager)
                 return std::unexpected("Viewport capture is not initialized");
 
-            auto image = rendering_manager->captureViewportImage();
-            if (!image || !image->is_valid())
-                return std::unexpected("No rendered viewport image is available yet");
+            if (auto image = rendering_manager->captureViewportImage(); image && image->is_valid())
+                return mcp::encode_render_tensor_to_base64(*image, width, height);
 
-            return mcp::encode_render_tensor_to_base64(*image, width, height);
+            // Mesh-only and environment-only scenes are drawn by GPU passes that composite
+            // straight into the window, so no render path publishes an offscreen image to
+            // read back. The viewport is on screen regardless, so crop it out of the
+            // composited window instead of reporting nothing to capture.
+            return capture_viewport_from_window(viewer_impl, *rendering_manager, width, height);
         }
 
         std::expected<std::string, std::string> capture_full_window_to_base64(
@@ -212,17 +456,16 @@ namespace lfs::app {
 
         json selection_state_json(core::Scene& scene, const int max_indices = 100000) {
             auto mask = scene.getSelectionMask();
-            if (!mask)
-                return json{{"selected_count", 0}, {"indices", json::array()}, {"truncated", false}};
+            const int64_t count = static_cast<int64_t>(scene.selectedCount());
+            if (!mask || max_indices == 0)
+                return json{{"selected_count", count}, {"indices", json::array()}, {"truncated", count > 0}};
 
             auto mask_vec = mask->to_vector_uint8();
 
-            int64_t count = 0;
             std::vector<int64_t> indices;
             for (size_t i = 0; i < mask_vec.size(); ++i) {
                 if (mask_vec[i] == 0)
                     continue;
-                ++count;
                 if (static_cast<int>(indices.size()) < max_indices)
                     indices.push_back(static_cast<int64_t>(i));
             }
@@ -284,24 +527,21 @@ namespace lfs::app {
             return vis::cap::decomposeTransform(matrix);
         }
 
-        glm::mat4 compose_transform(const TransformComponents& components) {
-            return vis::cap::composeTransform(components);
+        int64_t selected_gaussian_count(vis::SceneManager& scene_manager) {
+            scene_manager.completePendingSelectionCounts();
+            return static_cast<int64_t>(scene_manager.getScene().selectedCount());
         }
 
-        int64_t selected_gaussian_count(const core::Scene& scene) {
-            const auto mask = scene.getSelectionMask();
-            if (!mask || !mask->is_valid())
-                return 0;
-            return static_cast<int64_t>(mask->count_nonzero());
-        }
-
-        json node_summary_json(const core::Scene& scene, const core::SceneNode& node) {
+        json node_summary_json(const core::Scene& scene, const core::SceneNode& node,
+                               SceneNodeCounts* counts = nullptr) {
+            SceneNodeCounts local_counts(scene);
             json result{
                 {"name", node.name},
+                {"uuid", node.uuid.to_string()},
                 {"type", node_type_to_string(node.type)},
                 {"visible", static_cast<bool>(node.visible)},
                 {"locked", static_cast<bool>(node.locked)},
-                {"gaussian_count", node.gaussian_count.load(std::memory_order_acquire)},
+                {"gaussian_count", (counts ? *counts : local_counts).get(node)},
             };
 
             if (node.parent_id != core::NULL_NODE) {
@@ -318,14 +558,71 @@ namespace lfs::app {
             return result;
         }
 
+        enum class NodeReferenceErrorCode : uint8_t {
+            INVALID_UUID,
+            UUID_NOT_FOUND,
+            NAME_NOT_FOUND,
+            MISSING_REFERENCE,
+        };
+
+        struct NodeReferenceError {
+            NodeReferenceErrorCode code = NodeReferenceErrorCode::MISSING_REFERENCE;
+            std::string message;
+        };
+
+        std::expected<const core::SceneNode*, NodeReferenceError> resolve_node_reference(
+            const core::Scene& scene,
+            const json& args,
+            const std::string_view name_key = "name",
+            const std::string_view uuid_key = "uuid") {
+            const std::string uuid_key_string(uuid_key);
+            if (args.contains(uuid_key_string) && !args[uuid_key_string].is_null()) {
+                if (!args[uuid_key_string].is_string())
+                    return std::unexpected(NodeReferenceError{
+                        .code = NodeReferenceErrorCode::INVALID_UUID,
+                        .message = "Field '" + uuid_key_string + "' must be a UUID string",
+                    });
+                const std::string uuid_text = args[uuid_key_string].get<std::string>();
+                const auto uuid = core::Uuid::from_string(uuid_text);
+                if (!uuid)
+                    return std::unexpected(NodeReferenceError{
+                        .code = NodeReferenceErrorCode::INVALID_UUID,
+                        .message = "Invalid node UUID: " + uuid_text,
+                    });
+                const auto* node = scene.getNodeByUuid(*uuid);
+                if (!node)
+                    return std::unexpected(NodeReferenceError{
+                        .code = NodeReferenceErrorCode::UUID_NOT_FOUND,
+                        .message = "Node UUID does not resolve: " + uuid_text,
+                    });
+                return node;
+            }
+
+            const std::string name_key_string(name_key);
+            if (!args.contains(name_key_string) || !args[name_key_string].is_string())
+                return std::unexpected(NodeReferenceError{
+                    .code = NodeReferenceErrorCode::MISSING_REFERENCE,
+                    .message = "Either '" + uuid_key_string + "' or '" + name_key_string + "' is required",
+                });
+            const std::string name = args[name_key_string].get<std::string>();
+            const auto* node = scene.getNode(name);
+            if (!node)
+                return std::unexpected(NodeReferenceError{
+                    .code = NodeReferenceErrorCode::NAME_NOT_FOUND,
+                    .message = "Node not found: " + name,
+                });
+            return node;
+        }
+
         json transform_info_json(const core::Scene& scene, const core::SceneNode& node) {
-            const glm::mat4 local = scene.getNodeTransform(node.name);
+            const glm::mat4 local = scene.getNodeTransform(node.id);
             const glm::mat4 world = vis::scene_coords::nodeVisualizerWorldTransform(scene, node.id);
             const auto local_components = decompose_transform(local);
             const auto world_components = decompose_transform(world);
 
             return json{
                 {"name", node.name},
+                {"uuid", node.uuid.to_string()},
                 {"type", node_type_to_string(node.type)},
                 {"local", json{
                               {"translation", vec3_to_json(local_components.translation)},
@@ -342,14 +639,30 @@ namespace lfs::app {
             };
         }
 
-        json selection_result_json(const vis::SceneManager& scene_manager, const vis::SelectionResult& result) {
+        int64_t changed_selection_count(const std::shared_ptr<core::Tensor>& before,
+                                        const std::shared_ptr<core::Tensor>& after) {
+            const bool has_before = before && before->is_valid();
+            const bool has_after = after && after->is_valid();
+            if (has_before && has_after && before->numel() == after->numel()) {
+                const core::Tensor prior = before->device() == after->device() ? *before : before->to(after->device());
+                return static_cast<int64_t>(after->ne(prior).count_nonzero());
+            }
+            if (has_after)
+                return static_cast<int64_t>(after->count_nonzero());
+            return has_before ? static_cast<int64_t>(before->count_nonzero()) : 0;
+        }
+
+        template <typename Command>
+        json selection_result_json(vis::SceneManager& scene_manager, Command&& command) {
+            const auto before = scene_manager.getScene().getSelectionMask();
+            const vis::SelectionResult result = std::forward<Command>(command)();
             if (!result.success)
                 return json{{"error", result.error}};
 
             return json{
                 {"success", true},
-                {"affected_count", static_cast<int64_t>(result.affected_count)},
-                {"selected_count", selected_gaussian_count(scene_manager.getScene())},
+                {"affected_count", changed_selection_count(before, scene_manager.getScene().getSelectionMask())},
+                {"selected_count", selected_gaussian_count(scene_manager)},
             };
         }
 
@@ -364,10 +677,28 @@ namespace lfs::app {
                 return std::optional<glm::vec3>{};
 
             const auto& value = args[key];
-            if (!value.is_array() || value.size() != 3)
-                return std::unexpected(std::string("Field '") + key + "' must be a 3-element array");
+            if (!value.is_array() || value.size() != 3 ||
+                !std::ranges::all_of(value, [](const json& item) { return item.is_number(); }))
+                return std::unexpected(std::format("Field '{}' must be a 3-element number array (got {})", key, value.dump()));
+            const glm::vec3 result(value[0].get<float>(), value[1].get<float>(), value[2].get<float>());
+            if (!std::isfinite(result.x) || !std::isfinite(result.y) || !std::isfinite(result.z))
+                return std::unexpected(std::format("Field '{}' must contain finite float values (got {})", key, value.dump()));
+            return result;
+        }
 
-            return glm::vec3(value[0].get<float>(), value[1].get<float>(), value[2].get<float>());
+        std::optional<std::string> view_vectors_error(const glm::vec3& eye, const glm::vec3& target) {
+            constexpr float limit = 1.0e20f;
+            const auto coordinates_valid = [](const glm::vec3& value) {
+                constexpr float max_value = 1.0e20f;
+                return std::abs(value.x) <= max_value && std::abs(value.y) <= max_value &&
+                       std::abs(value.z) <= max_value;
+            };
+            if (!coordinates_valid(eye) || !coordinates_valid(target))
+                return std::format("Camera eye and target coordinates must be within +/-{}", limit);
+            const glm::vec3 direction = target - eye;
+            if (!std::isfinite(glm::length(direction)) || glm::length(direction) <= 1.0e-6f)
+                return "Camera eye and target must not coincide";
+            return std::nullopt;
         }
 
         void show_python_console() {
@@ -516,7 +847,6 @@ namespace lfs::app {
         }
 
         json crop_box_info_json(const vis::SceneManager& scene_manager,
-                                const vis::RenderingManager* rendering_manager,
                                 const core::NodeId cropbox_id) {
             const auto& scene = scene_manager.getScene();
             const auto* const node = scene.getNodeById(cropbox_id);
@@ -571,6 +901,140 @@ namespace lfs::app {
             return vis::cap::resetCropBox(scene_manager, rendering_manager, cropbox_id);
         }
 
+        const char* optimization_property_type(const core::prop::PropType type) {
+            using core::prop::PropType;
+            switch (type) {
+            case PropType::Bool: return "bool";
+            case PropType::Int: return "int";
+            case PropType::Float: return "float";
+            case PropType::String: return "string";
+            case PropType::SizeT: return "size";
+            case PropType::Enum: return "enum";
+            default: return "unsupported";
+            }
+        }
+
+        std::string_view enum_wire_value(const core::prop::EnumItem& item) {
+            return item.wire_value.empty() ? item.identifier : item.wire_value;
+        }
+
+        json optimization_value_json(const core::prop::PropertyMeta& meta, const std::any& value) {
+            using core::prop::PropType;
+            switch (meta.type) {
+            case PropType::Bool: return std::any_cast<bool>(value);
+            case PropType::Int: return std::any_cast<int>(value);
+            case PropType::Float: return std::any_cast<float>(value);
+            case PropType::String: return std::any_cast<std::string>(value);
+            case PropType::SizeT: return std::any_cast<size_t>(value);
+            case PropType::Enum: {
+                const int raw = std::any_cast<int>(value);
+                for (const auto& item : meta.enum_items)
+                    if (item.value == raw)
+                        return std::string(enum_wire_value(item));
+                return raw;
+            }
+            default: return nullptr;
+            }
+        }
+
+        lfs::Error optimization_value_error(const core::prop::PropertyMeta& meta, std::string message) {
+            lfs::SmallFields fields;
+            fields.add("property", meta.id);
+            return lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::InvalidArgument,
+                .domain = lfs::ErrorDomain::MCP,
+                .severity = lfs::Severity::Error,
+                .retryability = lfs::Retryability::NotRetryable,
+                .operation_id = {},
+                .user_message = message,
+                .detail = std::move(message),
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+                .fields = std::move(fields),
+                .native = std::nullopt,
+            });
+        }
+
+        lfs::Result<std::any> optimization_value_from_json(const core::prop::PropertyMeta& meta,
+                                                           const json& value) {
+            using core::prop::PropType;
+            const auto in_range = [&meta](const double v) -> lfs::Result<void> {
+                if ((meta.min_value && v < *meta.min_value) || (meta.max_value && v > *meta.max_value))
+                    return lfs::Result<void>::failure(optimization_value_error(
+                        meta, std::format("{} must be within [{}, {}]", meta.id, meta.min_value.value_or(-INFINITY),
+                                          meta.max_value.value_or(INFINITY))));
+                return {};
+            };
+            try {
+                switch (meta.type) {
+                case PropType::Bool:
+                    return std::any(value.get<bool>());
+                case PropType::Int:
+                case PropType::Float:
+                case PropType::SizeT: {
+                    if (!value.is_number())
+                        return optimization_value_error(meta, meta.id + " must be a number");
+                    if (auto checked = in_range(value.get<double>()); !checked)
+                        return checked.error();
+                    if (meta.type == PropType::Float)
+                        return std::any(value.get<float>());
+                    if (!value.is_number_integer())
+                        return optimization_value_error(meta, meta.id + " must be an integer");
+                    if (meta.type == PropType::Int)
+                        return std::any(value.get<int>());
+                    return std::any(value.get<size_t>());
+                }
+                case PropType::String:
+                    return std::any(value.get<std::string>());
+                case PropType::Enum: {
+                    const auto wire = value.get<std::string>();
+                    for (const auto& item : meta.enum_items)
+                        if (enum_wire_value(item) == wire)
+                            return std::any(item.value);
+                    return optimization_value_error(meta, meta.id + " must be one of the listed options");
+                }
+                default:
+                    return optimization_value_error(meta, meta.id + " cannot be set over MCP");
+                }
+            } catch (const json::exception&) {
+                return optimization_value_error(meta, meta.id + " has the wrong value type");
+            }
+        }
+
+        json optimization_params_json(core::param::OptimizationParameters params, const bool advanced_only) {
+            params.resolve_mrnf_capacity_defaults();
+            auto ref = core::prop::PropertyObjectRef::cpp(&params);
+            const auto group = core::prop::PropertyRegistry::instance().get_group_snapshot("optimization");
+            json properties = json::array();
+            if (group) {
+                for (const auto& meta : group->properties) {
+                    if ((advanced_only && !meta.is_advanced()) || !meta.getter)
+                        continue;
+                    json entry{{"id", meta.id},
+                               {"name", meta.name},
+                               {"description", meta.description},
+                               {"type", optimization_property_type(meta.type)},
+                               {"value", optimization_value_json(meta, meta.getter(ref))},
+                               {"advanced", meta.is_advanced()},
+                               {"live_update", meta.is_live_update()},
+                               {"readonly", meta.is_readonly()}};
+                    if (meta.min_value)
+                        entry["min"] = *meta.min_value;
+                    if (meta.max_value)
+                        entry["max"] = *meta.max_value;
+                    if (meta.type == core::prop::PropType::Enum) {
+                        json options = json::array();
+                        for (const auto& item : meta.enum_items)
+                            options.push_back(std::string(enum_wire_value(item)));
+                        entry["options"] = std::move(options);
+                    }
+                    if (!meta.strategies.empty())
+                        entry["strategies"] = meta.strategies;
+                    properties.push_back(std::move(entry));
+                }
+            }
+            return json{{"strategy", params.strategy}, {"properties", std::move(properties)}};
+        }
+
         json render_settings_json(const vis::RenderSettingsProxy& settings) {
             return json{
                 {"success", true},
@@ -581,6 +1045,8 @@ namespace lfs::app {
                                  {"mip_filter", settings.mip_filter},
                                  {"sh_degree", settings.sh_degree},
                                  {"render_scale", settings.render_scale},
+                                 {"scene_upscaler", settings.scene_upscaler},
+                                 {"scene_upscaler_preset", settings.scene_upscaler_preset},
                                  {"show_crop_box", settings.show_crop_box},
                                  {"use_crop_box", settings.use_crop_box},
                                  {"show_ellipsoid", settings.show_ellipsoid},
@@ -633,14 +1099,15 @@ namespace lfs::app {
                                  {"show_pivot", settings.show_pivot},
                                  {"split_view_mode", settings.split_view_mode},
                                  {"split_position", settings.split_position},
+                                 {"split_view_offset", settings.split_view_offset},
                                  {"raster_backend", std::string(lfs::rendering::gaussianRasterBackendId(static_cast<lfs::rendering::GaussianRasterBackend>(settings.raster_backend)))},
                                  {"equirectangular", settings.equirectangular},
                                  {"orthographic", settings.orthographic},
                                  {"ortho_scale", settings.ortho_scale},
+                                 {"depth_view", settings.depth_view},
                                  {"depth_view_min", settings.depth_view_min},
                                  {"depth_view_max", settings.depth_view_max},
                                  {"depth_visualization_mode", static_cast<int>(settings.depth_visualization_mode)},
-                                 {"selection_color_committed", json::array({settings.selection_color_committed[0], settings.selection_color_committed[1], settings.selection_color_committed[2]})},
                                  {"selection_color_preview", json::array({settings.selection_color_preview[0], settings.selection_color_preview[1], settings.selection_color_preview[2]})},
                                  {"selection_color_center_marker", json::array({settings.selection_color_center_marker[0], settings.selection_color_center_marker[1], settings.selection_color_center_marker[2]})},
                                  {"depth_clip_enabled", settings.depth_clip_enabled},
@@ -708,6 +1175,28 @@ namespace lfs::app {
                 touched = true;
                 return {};
             };
+            const auto set_scene_reconstruction = [&args, &touched](vis::RenderSettingsProxy& settings)
+                -> std::expected<void, std::string> {
+                const std::string backend_id = args.value("scene_upscaler", settings.scene_upscaler);
+                const auto backend = vis::sceneUpscalerBackendFromId(backend_id);
+                if (!backend) {
+                    return std::unexpected("Field 'scene_upscaler' must name a registered scene reconstruction backend");
+                }
+                std::string preset_id = args.value("scene_upscaler_preset", settings.scene_upscaler_preset);
+                if (!args.contains("scene_upscaler_preset") &&
+                    !vis::sceneUpscalerPreset(*backend, preset_id)) {
+                    preset_id = std::string(vis::defaultSceneUpscalerPreset(*backend).id);
+                }
+                if (!vis::sceneUpscalerPreset(*backend, preset_id)) {
+                    return std::unexpected("Field 'scene_upscaler_preset' is not valid for the selected scene reconstruction backend");
+                }
+                if (args.contains("scene_upscaler"))
+                    settings.scene_upscaler = backend_id;
+                if (args.contains("scene_upscaler_preset"))
+                    settings.scene_upscaler_preset = preset_id;
+                touched = touched || args.contains("scene_upscaler") || args.contains("scene_upscaler_preset");
+                return {};
+            };
 
             const auto set_vec3 = [&args, &touched](const char* key,
                                                     std::array<float, 3>& field) -> std::expected<void, std::string> {
@@ -740,7 +1229,23 @@ namespace lfs::app {
             set_bool("antialiasing", settings.antialiasing);
             set_bool("mip_filter", settings.mip_filter);
             set_int("sh_degree", settings.sh_degree);
-            set_float("render_scale", settings.render_scale);
+            if (args.contains("render_scale")) {
+                const auto& value = args["render_scale"];
+                if (!value.is_number()) {
+                    return std::unexpected(
+                        "Field 'render_scale' must be a number between 0.25 and 1.0");
+                }
+                const double render_scale = value.get<double>();
+                if (!std::isfinite(render_scale) || render_scale < 0.25 ||
+                    render_scale > 1.0) {
+                    return std::unexpected(
+                        "Field 'render_scale' must be between 0.25 and 1.0");
+                }
+                settings.render_scale = static_cast<float>(render_scale);
+                touched = true;
+            }
+            if (auto result = set_scene_reconstruction(settings); !result)
+                return result;
             set_bool("show_crop_box", settings.show_crop_box);
             set_bool("use_crop_box", settings.use_crop_box);
             set_bool("show_ellipsoid", settings.show_ellipsoid);
@@ -770,11 +1275,16 @@ namespace lfs::app {
             set_bool("show_pivot", settings.show_pivot);
             set_int("split_view_mode", settings.split_view_mode);
             set_float("split_position", settings.split_position);
+            if (args.contains("split_view_offset")) {
+                settings.split_view_offset = args["split_view_offset"].get<size_t>();
+                touched = true;
+            }
             if (auto result = set_raster_backend(settings); !result)
                 return std::unexpected(result.error());
             set_bool("equirectangular", settings.equirectangular);
             set_bool("orthographic", settings.orthographic);
             set_float("ortho_scale", settings.ortho_scale);
+            set_bool("depth_view", settings.depth_view);
             set_float("depth_view_min", settings.depth_view_min);
             set_float("depth_view_max", settings.depth_view_max);
             set_int("depth_visualization_mode", settings.depth_visualization_mode);
@@ -795,8 +1305,6 @@ namespace lfs::app {
             if (auto result = set_vec3("train_camera_color", settings.train_camera_color); !result)
                 return result;
             if (auto result = set_vec3("eval_camera_color", settings.eval_camera_color); !result)
-                return result;
-            if (auto result = set_vec3("selection_color_committed", settings.selection_color_committed); !result)
                 return result;
             if (auto result = set_vec3("selection_color_preview", settings.selection_color_preview); !result)
                 return result;
@@ -1013,179 +1521,6 @@ namespace lfs::app {
             return json{{"success", true}, {"count", nodes.size()}, {"nodes", nodes}};
         }
 
-        std::expected<void, std::string> prepare_scene_select_node_operator(
-            vis::Visualizer& viewer,
-            const json& /*args*/,
-            vis::op::OperatorProperties& props) {
-            auto* const scene_manager = viewer.getSceneManager();
-            if (!scene_manager)
-                return std::unexpected("Scene manager not initialized");
-
-            const auto name = props.get<std::string>("name");
-            if (!name || name->empty())
-                return std::unexpected("Field 'name' must be provided");
-            if (!scene_manager->getScene().getNode(*name))
-                return std::unexpected("Node not found: " + *name);
-
-            const auto mode = props.get_or<std::string>("mode", "replace");
-            if (mode != "replace" && mode != "add")
-                return std::unexpected("Unsupported node selection mode: " + mode);
-
-            return {};
-        }
-
-        json scene_select_node_result(vis::Visualizer& viewer,
-                                      const json& /*args*/,
-                                      const vis::op::OperatorProperties& /*props*/,
-                                      const vis::op::OperatorReturnValue& /*result*/) {
-            auto* const scene_manager = viewer.getSceneManager();
-            if (!scene_manager)
-                return json{{"error", "Scene manager not initialized"}};
-
-            const auto& scene = scene_manager->getScene();
-            json nodes = json::array();
-            for (const auto& selected_name : scene_manager->getSelectedNodeNames()) {
-                if (const auto* const node = scene.getNode(selected_name))
-                    nodes.push_back(node_summary_json(scene, *node));
-            }
-
-            return json{{"success", true}, {"count", nodes.size()}, {"nodes", nodes}};
-        }
-
-        std::expected<void, std::string> prepare_crop_box_add_operator(
-            vis::Visualizer& viewer,
-            const json& /*args*/,
-            vis::op::OperatorProperties& props) {
-            auto* const scene_manager = viewer.getSceneManager();
-            if (!scene_manager)
-                return std::unexpected("Scene manager not initialized");
-
-            auto parent_id = vis::cap::resolveCropBoxParentId(
-                *scene_manager, props.get<std::string>("node"));
-            if (!parent_id)
-                return std::unexpected(parent_id.error());
-            return {};
-        }
-
-        std::expected<void, std::string> prepare_crop_box_set_operator(
-            vis::Visualizer& viewer,
-            const json& /*args*/,
-            vis::op::OperatorProperties& props) {
-            auto* const scene_manager = viewer.getSceneManager();
-            if (!scene_manager)
-                return std::unexpected("Scene manager not initialized");
-
-            auto cropbox_id = vis::cap::resolveCropBoxId(*scene_manager, props.get<std::string>("node"));
-            if (!cropbox_id)
-                return std::unexpected(cropbox_id.error());
-
-            if (!props.has("min") && !props.has("max") &&
-                !props.has("translation") && !props.has("rotation") && !props.has("scale") &&
-                !props.has("inverse") && !props.has("enabled") && !props.has("show") && !props.has("use")) {
-                return std::unexpected("No crop box fields were provided");
-            }
-            return {};
-        }
-
-        std::expected<void, std::string> prepare_crop_box_target_operator(
-            vis::Visualizer& viewer,
-            const json& /*args*/,
-            vis::op::OperatorProperties& props) {
-            auto* const scene_manager = viewer.getSceneManager();
-            if (!scene_manager)
-                return std::unexpected("Scene manager not initialized");
-
-            auto cropbox_id = vis::cap::resolveCropBoxId(*scene_manager, props.get<std::string>("node"));
-            if (!cropbox_id)
-                return std::unexpected(cropbox_id.error());
-            return {};
-        }
-
-        json crop_box_operator_result(vis::Visualizer& viewer,
-                                      const json& /*args*/,
-                                      const vis::op::OperatorProperties& props,
-                                      const vis::op::OperatorReturnValue& /*result*/) {
-            auto* const scene_manager = viewer.getSceneManager();
-            auto* const rendering_manager = viewer.getRenderingManager();
-            if (!scene_manager)
-                return json{{"error", "Scene manager not initialized"}};
-
-            const auto cropbox_id = props.get<core::NodeId>("resolved_cropbox_id");
-            if (!cropbox_id)
-                return json{{"error", "Crop box result did not resolve a target"}};
-
-            return crop_box_info_json(*scene_manager, rendering_manager, *cropbox_id);
-        }
-
-        json ellipsoid_info_json(const vis::SceneManager& scene_manager,
-                                 const vis::RenderingManager* rendering_manager,
-                                 const core::NodeId ellipsoid_id);
-
-        std::expected<void, std::string> prepare_ellipsoid_add_operator(
-            vis::Visualizer& viewer,
-            const json& /*args*/,
-            vis::op::OperatorProperties& props) {
-            auto* const scene_manager = viewer.getSceneManager();
-            if (!scene_manager)
-                return std::unexpected("Scene manager not initialized");
-
-            auto parent_id = vis::cap::resolveEllipsoidParentId(
-                *scene_manager, props.get<std::string>("node"));
-            if (!parent_id)
-                return std::unexpected(parent_id.error());
-            return {};
-        }
-
-        std::expected<void, std::string> prepare_ellipsoid_set_operator(
-            vis::Visualizer& viewer,
-            const json& /*args*/,
-            vis::op::OperatorProperties& props) {
-            auto* const scene_manager = viewer.getSceneManager();
-            if (!scene_manager)
-                return std::unexpected("Scene manager not initialized");
-
-            auto ellipsoid_id = vis::cap::resolveEllipsoidId(*scene_manager, props.get<std::string>("node"));
-            if (!ellipsoid_id)
-                return std::unexpected(ellipsoid_id.error());
-
-            if (!props.has("radii") && !props.has("translation") && !props.has("rotation") &&
-                !props.has("scale") && !props.has("inverse") && !props.has("enabled") &&
-                !props.has("show") && !props.has("use")) {
-                return std::unexpected("No ellipsoid fields were provided");
-            }
-            return {};
-        }
-
-        std::expected<void, std::string> prepare_ellipsoid_target_operator(
-            vis::Visualizer& viewer,
-            const json& /*args*/,
-            vis::op::OperatorProperties& props) {
-            auto* const scene_manager = viewer.getSceneManager();
-            if (!scene_manager)
-                return std::unexpected("Scene manager not initialized");
-
-            auto ellipsoid_id = vis::cap::resolveEllipsoidId(*scene_manager, props.get<std::string>("node"));
-            if (!ellipsoid_id)
-                return std::unexpected(ellipsoid_id.error());
-            return {};
-        }
-
-        json ellipsoid_operator_result(vis::Visualizer& viewer,
-                                       const json& /*args*/,
-                                       const vis::op::OperatorProperties& props,
-                                       const vis::op::OperatorReturnValue& /*result*/) {
-            auto* const scene_manager = viewer.getSceneManager();
-            auto* const rendering_manager = viewer.getRenderingManager();
-            if (!scene_manager)
-                return json{{"error", "Scene manager not initialized"}};
-
-            const auto ellipsoid_id = props.get<core::NodeId>("resolved_ellipsoid_id");
-            if (!ellipsoid_id)
-                return json{{"error", "Ellipsoid result did not resolve a target"}};
-
-            return ellipsoid_info_json(*scene_manager, rendering_manager, *ellipsoid_id);
-        }
-
         json camera_node_json(const core::Scene& scene, const core::SceneNode& node) {
             assert(node.camera);
 
@@ -1197,6 +1532,7 @@ namespace lfs::app {
 
             json camera{
                 {"name", node.name},
+                {"uuid", node.uuid.to_string()},
                 {"uid", node.camera_uid},
                 {"camera_id", node.camera->camera_id()},
                 {"image_name", node.camera->image_name()},
@@ -1266,7 +1602,6 @@ namespace lfs::app {
         }
 
         json ellipsoid_info_json(const vis::SceneManager& scene_manager,
-                                 const vis::RenderingManager* rendering_manager,
                                  const core::NodeId ellipsoid_id) {
             const auto& scene = scene_manager.getScene();
             const auto* const node = scene.getNodeById(ellipsoid_id);
@@ -1379,7 +1714,42 @@ namespace lfs::app {
             const auto& scene = scene_manager.getScene();
 
             std::vector<std::string> requested;
-            if (args.contains("nodes")) {
+            if (args.contains("uuids")) {
+                const auto& uuids = args["uuids"];
+                if (!uuids.is_array())
+                    return std::unexpected("Field 'uuids' must be an array of UUID strings");
+                requested.reserve(uuids.size());
+                for (const auto& item : uuids) {
+                    if (!item.is_string())
+                        return std::unexpected("Field 'uuids' must contain only UUID strings");
+                    const std::string uuid_text = item.get<std::string>();
+                    const auto uuid = core::Uuid::from_string(uuid_text);
+                    if (!uuid)
+                        return std::unexpected("Invalid node UUID: " + uuid_text);
+                    const auto* node = scene.getNodeByUuid(*uuid);
+                    if (!node)
+                        return std::unexpected("Node UUID does not resolve: " + uuid_text);
+                    requested.push_back(node->name);
+                }
+            } else if (args.contains("uuid")) {
+                const auto node = resolve_node_reference(scene, args, "node", "uuid");
+                if (!node)
+                    return std::unexpected(node.error().message);
+                requested.push_back((*node)->name);
+            } else if (args.contains("node_ids")) {
+                const auto& ids = args["node_ids"];
+                if (!ids.is_array())
+                    return std::unexpected("Field 'node_ids' must be an array of node IDs");
+                for (const auto& id : ids) {
+                    if (!id.is_number_integer() || id.get<int64_t>() < 0 ||
+                        id.get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<core::NodeId>::max()))
+                        return std::unexpected("Field 'node_ids' must contain valid non-negative node IDs");
+                    const auto* node = scene.getNodeById(id.get<core::NodeId>());
+                    if (!node)
+                        return std::unexpected("Node ID does not resolve");
+                    requested.push_back(node->name);
+                }
+            } else if (args.contains("nodes")) {
                 const auto& nodes = args["nodes"];
                 if (!nodes.is_array())
                     return std::unexpected("Field 'nodes' must be an array of node names");
@@ -1391,9 +1761,8 @@ namespace lfs::app {
             } else {
                 requested = scene_manager.getSelectedNodeNames();
                 if (requested.empty()) {
-                    const auto& training_name = scene.getTrainingModelNodeName();
-                    if (!training_name.empty())
-                        requested.push_back(training_name);
+                    if (const auto* training_node = scene.getNodeByUuid(scene.getTrainingModelNodeUuid()))
+                        requested.push_back(training_node->name);
                 }
                 if (requested.empty()) {
                     const auto* node = find_first_visible_splat_node(scene);
@@ -1431,8 +1800,28 @@ namespace lfs::app {
             std::optional<std::shared_lock<std::shared_mutex>> model_lock;
         };
 
+        [[nodiscard]] core::ProvenanceStamp make_gui_export_stamp(const vis::SceneManager& scene_manager) {
+            auto stamp = core::make_provenance_stamp();
+            const auto* const trainer_manager = scene_manager.getTrainerManager();
+            if (trainer_manager) {
+                const int iteration = trainer_manager->getCurrentIteration();
+                // iteration 0 means an untrained scene, deliberately not stamped.
+                if (iteration > 0)
+                    stamp.iteration = iteration;
+            }
+            const auto* const trainer = trainer_manager ? trainer_manager->getTrainer() : nullptr;
+            if (trainer) {
+                const auto strategy = core::param::canonical_strategy_name(
+                    trainer->getParams().optimization.strategy);
+                if (!strategy.empty())
+                    stamp.strategy = std::string(strategy);
+            }
+            return stamp;
+        }
+
         BorrowExportPlan make_borrow_single_identity_export_plan(const vis::SceneManager& scene_manager,
-                                                                 const std::vector<std::string>& node_names) {
+                                                                 const std::vector<std::string>& node_names,
+                                                                 const core::ExportFormat format) {
             BorrowExportPlan plan;
             if (node_names.size() != 1)
                 return plan;
@@ -1445,7 +1834,11 @@ namespace lfs::app {
             if (node->model->has_deleted_mask())
                 return plan;
 
-            if (node->name == scene.getTrainingModelNodeName()) {
+            // Only RAD stores an LOD tree; other formats need the merge to flatten it to its leaves.
+            if (format != core::ExportFormat::RAD && node->model->lod_tree && node->model->lod_tree->has_tree())
+                return plan;
+
+            if (node->uuid == scene.getTrainingModelNodeUuid()) {
                 const auto* const trainer_manager = scene_manager.getTrainerManager();
                 const auto* const trainer = trainer_manager ? trainer_manager->getTrainer() : nullptr;
                 if (trainer && trainer->is_running() && !trainer->is_paused())
@@ -1462,13 +1855,20 @@ namespace lfs::app {
                                                             const std::vector<std::string>& node_names,
                                                             const core::ExportFormat format,
                                                             const std::filesystem::path& path,
-                                                            const int sh_degree) {
+                                                            const int sh_degree,
+                                                            const bool include_provenance = true,
+                                                            io::SsogSaveOptions ssog_options = {}) {
             const auto& scene = scene_manager.getScene();
             std::vector<std::pair<const core::SplatData*, glm::mat4>> splats;
             splats.reserve(node_names.size());
             for (const auto& name : node_names) {
                 const auto* const node = scene.getNode(name);
                 if (node && node->type == core::NodeType::SPLAT && node->model) {
+                    if (const auto& tree = node->model->lod_tree;
+                        tree && tree->has_tree() && node->model->size() < tree->total_nodes()) {
+                        return std::unexpected(std::format(
+                            "Cannot export '{}': the model is too large to fit in memory and streams from disk", name));
+                    }
                     splats.emplace_back(node->model.get(), vis::scene_coords::nodeDataWorldTransform(scene, node->id));
                 }
             }
@@ -1476,7 +1876,7 @@ namespace lfs::app {
             if (splats.empty())
                 return std::unexpected("The requested node set does not contain any splat nodes");
 
-            auto borrow_plan = make_borrow_single_identity_export_plan(scene_manager, node_names);
+            auto borrow_plan = make_borrow_single_identity_export_plan(scene_manager, node_names, format);
             auto merged = core::Scene::mergeSplatsWithTransforms(splats, borrow_plan.storage_mode);
             if (!merged)
                 return std::unexpected("Failed to merge scene nodes for export");
@@ -1492,46 +1892,61 @@ namespace lfs::app {
             truncate_sh_degree(*merged, sh_degree);
             borrow_plan.model_lock.reset();
 
+            const auto stamp = include_provenance ? make_gui_export_stamp(scene_manager)
+                                                  : core::make_minimal_provenance_stamp();
+
             switch (format) {
             case core::ExportFormat::PLY: {
                 if (auto result = io::save_ply(
-                        *merged, io::PlySaveOptions{.output_path = path, .binary = true, .async = false, .extra_attributes = {}});
+                        *merged, io::PlySaveOptions{.output_path = path, .binary = true, .async = false, .extra_attributes = {}, .provenance = stamp});
                     !result)
                     return std::unexpected(result.error().message);
                 break;
             }
             case core::ExportFormat::SOG: {
-                if (auto result = io::save_sog(*merged, io::SogSaveOptions{.output_path = path, .kmeans_iterations = 10}); !result)
+                if (auto result = io::save_sog(*merged, io::SogSaveOptions{.output_path = path, .kmeans_iterations = 10, .provenance = stamp}); !result)
+                    return std::unexpected(result.error().message);
+                break;
+            }
+            case core::ExportFormat::SSOG: {
+                ssog_options.output_path = path;
+                ssog_options.provenance = stamp;
+                if (auto result = io::save_ssog(*merged, ssog_options); !result)
                     return std::unexpected(result.error().message);
                 break;
             }
             case core::ExportFormat::SPZ: {
-                if (auto result = io::save_spz(*merged, io::SpzSaveOptions{.output_path = path}); !result)
+                if (auto result = io::save_spz(*merged, io::SpzSaveOptions{.output_path = path, .provenance = stamp}); !result)
                     return std::unexpected(result.error().message);
                 break;
             }
             case core::ExportFormat::HTML_VIEWER: {
-                if (auto result = vis::gui::export_html_viewer(*merged, vis::gui::HtmlViewerExportOptions{.output_path = path}); !result)
+                if (auto result = vis::gui::export_html_viewer(*merged, vis::gui::HtmlViewerExportOptions{.output_path = path, .provenance = stamp}); !result)
                     return std::unexpected(result.error());
                 break;
             }
             case core::ExportFormat::USD: {
-                if (auto result = io::save_usd(*merged, io::UsdSaveOptions{.output_path = path}); !result)
+                if (auto result = io::save_usd(*merged, io::UsdSaveOptions{.output_path = path, .provenance = stamp}); !result)
                     return std::unexpected(result.error().message);
                 break;
             }
             case core::ExportFormat::NUREC_USDZ: {
-                if (auto result = io::save_nurec_usdz(*merged, io::NurecUsdzSaveOptions{.output_path = path}); !result)
+                if (auto result = io::save_nurec_usdz(*merged, io::NurecUsdzSaveOptions{.output_path = path, .provenance = stamp}); !result)
                     return std::unexpected(result.error().message);
                 break;
             }
             case core::ExportFormat::RAD: {
-                if (auto result = io::save_rad(*merged, io::RadSaveOptions{.output_path = path}); !result)
+                if (auto result = io::save_rad(*merged, io::RadSaveOptions{.output_path = path, .provenance = stamp}); !result)
                     return std::unexpected(result.error().message);
                 break;
             }
             case core::ExportFormat::COLMAP:
                 return std::unexpected("COLMAP export uses scene_export_colmap");
+            case core::ExportFormat::GALLERY_SCENE:
+            case core::ExportFormat::GALLERY_SOG:
+            case core::ExportFormat::GALLERY_SSOG:
+            case core::ExportFormat::GALLERY_SPZ:
+                return std::unexpected("Use prepare_gallery_scene() to prepare a gallery upload.");
             }
 
             return {};
@@ -1620,11 +2035,9 @@ namespace lfs::app {
                     return selected_name;
             }
 
-            const auto& training_name = scene.getTrainingModelNodeName();
-            if (!training_name.empty()) {
-                const auto* const node = scene.getNode(training_name);
-                if (node && node->model)
-                    return training_name;
+            if (const auto* node = scene.getNodeByUuid(scene.getTrainingModelNodeUuid());
+                node && node->model) {
+                return node->name;
             }
 
             const auto* fallback = find_first_visible_splat_node(scene);
@@ -1648,10 +2061,6 @@ namespace lfs::app {
             if (field_name == "shN")
                 return &splat_data.shN_raw();
             return nullptr;
-        }
-
-        const core::Tensor* resolve_gaussian_field(const core::SplatData& splat_data, std::string_view field_name) {
-            return resolve_gaussian_field(const_cast<core::SplatData&>(splat_data), field_name);
         }
 
         json tensor_payload_json(const core::Tensor& tensor) {
@@ -1708,14 +2117,6 @@ namespace lfs::app {
                 result.push_back(static_cast<float>(parsed));
             }
             return result;
-        }
-
-        size_t product_of_tail_dims(const core::Tensor& tensor) {
-            size_t product = 1;
-            const auto& shape = tensor.shape();
-            for (size_t i = 1; i < shape.rank(); ++i)
-                product *= shape[i];
-            return product;
         }
 
         class EventSubscriptionRegistry {
@@ -1867,6 +2268,10 @@ namespace lfs::app {
                     });
             }
 
+            ~EventSubscriptionRegistry() {
+                handlers_ = event::ScopedHandler{};
+            }
+
             void prune_expired_locked(const Clock::time_point now) {
                 for (auto it = subscriptions_.begin(); it != subscriptions_.end();) {
                     if (now - it->second.last_access >= MCP_EVENT_SUBSCRIPTION_TTL) {
@@ -1961,11 +2366,11 @@ namespace lfs::app {
         registry.register_tool(
             McpTool{
                 .name = "scene.load_ply",
-                .description = "Load a PLY file for viewing",
+                .description = "Load a splat file for viewing, including SSOG (.ssog, lod-meta.json)",
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"path", json{{"type", "string"}, {"description", "Path to PLY file"}}}},
+                        {"path", json{{"type", "string"}, {"description", "Path to a splat file or SSOG directory"}}}},
                     .required = {"path"}}},
             [viewer](const json& args) -> json {
                 std::filesystem::path path = args["path"].get<std::string>();
@@ -1980,15 +2385,271 @@ namespace lfs::app {
                 return json{{"success", true}, {"path", core::path_to_utf8(path)}};
             });
 
+        registry.register_tool(
+            McpTool{
+                .name = "project_save",
+                .description = "Append one explicit generation to the active .licht project",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json::object(),
+                    .required = {}},
+                .metadata = {
+                    .category = "project",
+                    .kind = "mutation",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                    .long_running = true,
+                    .user_visible = true,
+                }},
+            [viewer, viewer_impl](const json&) -> json {
+                auto before = post_and_wait(
+                    viewer, [viewer] {
+                        return viewer->projectGetInfo();
+                    });
+                if (!before) {
+                    return project_error_json(
+                        before.error());
+                }
+                if (!before->path) {
+                    return project_error_json(
+                        lfs::ErrorCode::
+                            FailedPrecondition,
+                        "The active project has no path.",
+                        "Use project_save_as with a .licht destination.");
+                }
+                const auto expected_path =
+                    before->path->lexically_normal();
+                auto result = post_render_and_wait(
+                    viewer_impl, [viewer] {
+                        return viewer->projectSave(
+                            true);
+                    });
+                if (!result) {
+                    return project_error_json(
+                        result.error());
+                }
+                auto info =
+                    wait_for_project_generation(
+                        viewer,
+                        before->generation,
+                        expected_path, true);
+                return info
+                           ? project_info_json(*info)
+                           : project_error_json(
+                                 info.error());
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "project_save_as",
+                .description = "Save the active project to a new .licht path and bind that path as the master",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{
+                        {"path", json{
+                                     {"type", "string"},
+                                     {"description", "Destination .licht path"}}}},
+                    .required = {"path"}},
+                .metadata = {
+                    .category = "project",
+                    .kind = "mutation",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                    .long_running = true,
+                    .user_visible = true,
+                }},
+            [viewer, viewer_impl](const json& args) -> json {
+                const bool explicit_destination =
+                    !args.at("path").get<std::string>().empty();
+                const auto path =
+                    core::utf8_to_path(
+                        args.at("path")
+                            .get<std::string>());
+                auto before = post_and_wait(
+                    viewer, [viewer] {
+                        return viewer->projectGetInfo();
+                    });
+                if (!before) {
+                    return project_error_json(
+                        before.error());
+                }
+                std::error_code path_error;
+                const auto expected_path =
+                    std::filesystem::absolute(
+                        path, path_error)
+                        .lexically_normal();
+                if (path_error) {
+                    return project_error_json(
+                        lfs::ErrorCode::
+                            InvalidArgument,
+                        "The destination path could not be resolved.",
+                        path_error.message());
+                }
+                auto result = post_render_and_wait(
+                    viewer_impl, [viewer, viewer_impl, path,
+                                  explicit_destination] {
+                        return explicit_destination
+                                   ? viewer_impl->projectSaveAsExplicit(path, true)
+                                   : viewer->projectSaveAs(path, true);
+                    });
+                if (!result) {
+                    return project_error_json(
+                        result.error());
+                }
+                auto info =
+                    wait_for_project_generation(
+                        viewer,
+                        before->generation,
+                        expected_path,
+                        before->path &&
+                            before->path
+                                    ->lexically_normal() ==
+                                expected_path);
+                return info
+                           ? project_info_json(*info)
+                           : project_error_json(
+                                 info.error());
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "project_open",
+                .description = "Transactionally open a .licht project and return once its interactive shell is ready",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{
+                        {"path", json{
+                                     {"type", "string"},
+                                     {"description", "Existing .licht project path"}}},
+                        {"discard_changes", json{{"type", "boolean"}, {"default", false}, {"description", "Explicitly authorize discarding unsaved changes only after the candidate passes Phase A"}}}},
+                    .required = {"path"}},
+                .metadata = {
+                    .category = "project",
+                    .kind = "mutation",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                    .long_running = true,
+                    .user_visible = true,
+                }},
+            [viewer](const json& args) -> json {
+                const auto path =
+                    core::utf8_to_path(
+                        args.at("path")
+                            .get<std::string>());
+                const auto disposition =
+                    args.value(
+                        "discard_changes", false)
+                        ? vis::
+                              ProjectSwitchDisposition::
+                                  DiscardChanges
+                        : vis::
+                              ProjectSwitchDisposition::
+                                  RequireClean;
+                auto result = post_and_wait(
+                    viewer,
+                    [viewer, path, disposition] {
+                        return viewer->projectOpen(
+                            path, disposition);
+                    });
+                if (!result) {
+                    return project_error_json(
+                        result.error());
+                }
+                if (*result ==
+                    vis::ProjectOpenOutcome::
+                        RecoveryPromptPending) {
+                    return json{
+                        {"status",
+                         "recovery_decision_pending"},
+                        {"recovery_decision_pending",
+                         true},
+                    };
+                }
+                auto info = post_and_wait(
+                    viewer, [viewer] {
+                        return viewer->projectGetInfo();
+                    });
+                return info
+                           ? project_info_json(*info)
+                           : project_error_json(
+                                 info.error());
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "project_compact",
+                .description = "Verify, compact, and atomically replace the active .licht master",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json::object(),
+                    .required = {}},
+                .metadata = {
+                    .category = "project",
+                    .kind = "mutation",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                    .long_running = true,
+                    .user_visible = true,
+                }},
+            [viewer](const json&) -> json {
+                auto started = post_and_wait(
+                    viewer, [viewer] {
+                        return viewer
+                            ->projectCompact();
+                    });
+                if (!started) {
+                    return project_error_json(
+                        started.error());
+                }
+                auto info =
+                    wait_for_project_write(
+                        viewer,
+                        "Project compaction");
+                return info
+                           ? project_info_json(*info)
+                           : project_error_json(
+                                 info.error());
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "project_get_info",
+                .description = "Read the active project path, identity, generation, dirty chapters, and hydration state",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json::object(),
+                    .required = {}},
+                .metadata = {
+                    .category = "project",
+                    .kind = "query",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                }},
+            [viewer](const json&) -> json {
+                auto info = post_and_wait(
+                    viewer, [viewer] {
+                        return viewer->projectGetInfo();
+                    });
+                return info
+                           ? project_info_json(*info)
+                           : project_error_json(
+                                 info.error());
+            });
+
         mcp::register_shared_scene_tools(mcp::SharedSceneToolBackend{
             .runtime = "gui",
             .thread_affinity = "gui_thread",
             .load_dataset =
-                [viewer](const std::filesystem::path& path,
-                         const core::param::TrainingParameters& params) {
+                [viewer, viewer_impl](const std::filesystem::path& path,
+                                      const core::param::TrainingParameters& params) {
                     auto immediate_params = params;
                     immediate_params.dataset.data_path.clear();
-                    return post_and_wait(viewer, [viewer, params = std::move(immediate_params), path]() {
+                    return post_and_wait(viewer, [viewer, viewer_impl, params = std::move(immediate_params), path]() -> mcp::SharedSceneToolBackend::LoadDatasetHandler::result_type {
+                        // Admission must precede parameter changes and trainer teardown.
+                        if (const auto* trainer = viewer_impl->getTrainerManager();
+                            trainer && (trainer->isTrainingActive() || trainer->isCompletionPending())) {
+                            return std::unexpected("Cannot load a dataset while training is active or stopping. Stop training and wait for completion first.");
+                        }
                         viewer->setParameters(params);
                         return viewer->loadDataset(path);
                     });
@@ -1999,22 +2660,21 @@ namespace lfs::app {
                         return viewer->loadCheckpointForTraining(path);
                     });
                 },
-            .save_checkpoint =
-                [viewer](const std::optional<std::filesystem::path>& path)
-                -> std::expected<std::filesystem::path, std::string> {
-                return post_and_wait(viewer, [viewer, path]() {
-                    return viewer->saveCheckpoint(path);
-                });
-            },
             .save_ply =
-                [viewer](const std::filesystem::path& path) {
-                    return post_and_wait(viewer, [viewer, path]() -> std::expected<void, std::string> {
+                [viewer](const std::filesystem::path& path, const bool include_provenance) {
+                    return post_and_wait(viewer, [viewer, path, include_provenance]() -> std::expected<void, std::string> {
                         auto& scene = viewer->getScene();
                         auto* model = scene.getTrainingModel();
                         if (!model)
                             return std::unexpected("No model to save");
 
-                        io::PlySaveOptions options{.output_path = path, .binary = true};
+                        const auto stamp = include_provenance
+                                               ? (viewer->getSceneManager()
+                                                      ? make_gui_export_stamp(*viewer->getSceneManager())
+                                                      : core::make_provenance_stamp())
+                                               : core::make_minimal_provenance_stamp();
+
+                        io::PlySaveOptions options{.output_path = path, .binary = true, .provenance = stamp};
                         auto result = io::save_ply(*model, options);
                         if (!result)
                             return std::unexpected(result.error().message);
@@ -2022,16 +2682,28 @@ namespace lfs::app {
                     });
                 },
             .start_training =
-                [viewer]() {
-                    return post_and_wait(viewer, [viewer]() {
+                [viewer, viewer_impl]() {
+                    // The GUI hop only acknowledges Starting. MCP keeps its
+                    // historical start contract by waiting for worker-side
+                    // initialization before returning to the caller.
+                    auto result = post_and_wait(viewer, [viewer]() {
                         return viewer->startTraining();
                     });
+                    if (result) {
+                        if (auto initialized = viewer_impl->getTrainerManager()->waitForInitialization();
+                            !initialized) {
+                            result = std::unexpected(lfs::format_for_developer(initialized.error()));
+                        }
+                    }
+                    return result;
                 },
             .render_capture =
                 [viewer](std::optional<int> camera_index, int width, int height) {
-                    return post_and_wait(viewer, [viewer, camera_index, width, height]() {
+                    // Runs as render work, not plain posted work: the window-crop fallback
+                    // inside capture_live_viewport_to_base64 needs an active GUI frame.
+                    return capture_after_gui_render(viewer, [viewer, camera_index, width, height]() {
                         if (camera_index)
-                            return render_scene_to_base64(viewer->getScene(), *camera_index, width, height);
+                            return render_dataset_camera_to_base64(viewer, *camera_index, width, height);
                         return capture_live_viewport_to_base64(viewer, width, height);
                     });
                 },
@@ -2047,6 +2719,92 @@ namespace lfs::app {
                 return trainer_manager ? trainer_manager->lastTrainingError() : std::nullopt;
             }});
 
+        // CommandCenter's generated session.pause/stop only set trainer flags. A
+        // checkpoint-installed trainer has no worker yet, so route GUI MCP pause
+        // and stop through TrainerManager. session.resume keeps the canResume()
+        // guard (resume-only; training.start starts a fresh run) then goes through
+        // VisualizerImpl::startTraining so a paused ungranted trainer shares the
+        // training.start save-grant gate.
+        registry.register_tool(
+            McpTool{
+                .name = "session.pause",
+                .description = "Pause training in the current runtime",
+                .input_schema = {.type = "object", .properties = json::object(), .required = {}},
+                .metadata = mcp::McpToolMetadata{
+                    .category = "training",
+                    .kind = "command",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                }},
+            [viewer_impl](const json&) -> json {
+                auto result = post_and_wait(viewer_impl, [viewer_impl]() -> std::expected<void, std::string> {
+                    auto* const trainer_manager = viewer_impl->getTrainerManager();
+                    if (!trainer_manager)
+                        return std::unexpected("Trainer manager is not initialized");
+                    if (!trainer_manager->canPause())
+                        return std::unexpected(std::string(trainer_manager->getActionBlockedReason(
+                            vis::TrainingAction::Pause)));
+                    trainer_manager->pauseTraining();
+                    return {};
+                });
+                if (!result)
+                    return json{{"error", result.error()}};
+                return json{{"success", true}, {"operation", "session.pause"}};
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "session.resume",
+                .description = "Resume training in the current runtime",
+                .input_schema = {.type = "object", .properties = json::object(), .required = {}},
+                .metadata = mcp::McpToolMetadata{
+                    .category = "training",
+                    .kind = "command",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                }},
+            [viewer_impl](const json&) -> json {
+                auto result = post_and_wait(viewer_impl, [viewer_impl]() -> std::expected<void, std::string> {
+                    auto* const trainer_manager = viewer_impl->getTrainerManager();
+                    if (!trainer_manager)
+                        return std::unexpected("Trainer manager is not initialized");
+                    if (!trainer_manager->canResume())
+                        return std::unexpected(std::string(trainer_manager->getActionBlockedReason(
+                            vis::TrainingAction::Resume)));
+                    return viewer_impl->startTraining();
+                });
+                if (!result)
+                    return json{{"error", result.error()}};
+                return json{{"success", true}, {"operation", "session.resume"}};
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "session.request_stop",
+                .description = "Stop training in the current runtime",
+                .input_schema = {.type = "object", .properties = json::object(), .required = {}},
+                .metadata = mcp::McpToolMetadata{
+                    .category = "training",
+                    .kind = "command",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                }},
+            [viewer_impl](const json&) -> json {
+                auto result = post_and_wait(viewer_impl, [viewer_impl]() -> std::expected<void, std::string> {
+                    auto* const trainer_manager = viewer_impl->getTrainerManager();
+                    if (!trainer_manager)
+                        return std::unexpected("Trainer manager is not initialized");
+                    if (!trainer_manager->canStop())
+                        return std::unexpected(std::string(trainer_manager->getActionBlockedReason(
+                            vis::TrainingAction::Stop)));
+                    trainer_manager->stopTraining();
+                    return {};
+                });
+                if (!result)
+                    return json{{"error", result.error()}};
+                return json{{"success", true}, {"operation", "session.request_stop"}};
+            });
+
         registry.register_tool(
             McpTool{
                 .name = "render.capture_window",
@@ -2054,8 +2812,8 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"width", json{{"type", "integer"}, {"description", "Optional output width; preserves aspect ratio when height is omitted"}}},
-                        {"height", json{{"type", "integer"}, {"description", "Optional output height; preserves aspect ratio when width is omitted"}}}},
+                        {"width", json{{"type", "integer"}, {"minimum", 1}, {"maximum", mcp::MAX_CAPTURE_DIMENSION}, {"description", "Optional output width; preserves aspect ratio when height is omitted"}}},
+                        {"height", json{{"type", "integer"}, {"minimum", 1}, {"maximum", mcp::MAX_CAPTURE_DIMENSION}, {"description", "Optional output height; preserves aspect ratio when width is omitted"}}}},
                     .required = {}},
                 .metadata = mcp::McpToolMetadata{
                     .category = "render",
@@ -2086,7 +2844,7 @@ namespace lfs::app {
                 .description = "Get the current interactive viewport camera state",
                 .input_schema = {.type = "object", .properties = json::object(), .required = {}}},
             [viewer_impl](const json&) -> json {
-                return post_and_wait(viewer_impl, []() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl]() -> json {
                     const auto info = vis::get_current_view_info();
                     if (!info)
                         return json{{"error", "Viewport camera bridge is not available"}};
@@ -2101,23 +2859,25 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"eye", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Camera eye position [x,y,z]"}}},
-                        {"target", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Camera target/pivot position [x,y,z]"}}},
-                        {"up", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional up vector [x,y,z], defaults to [0,1,0]"}}},
+                        {"eye", number_array_schema(3, "Camera eye position [x,y,z]")},
+                        {"target", number_array_schema(3, "Camera target/pivot position [x,y,z]")},
+                        {"up", number_array_schema(3, "Optional up vector [x,y,z], defaults to [0,1,0]")},
                         {"fov_degrees", json{{"type", "number"}, {"description", "Optional vertical field of view in degrees"}}}},
                     .required = {"eye", "target"}}},
             [viewer_impl](const json& args) -> json {
                 auto eye = optional_vec3_arg(args, "eye");
                 if (!eye)
-                    return json{{"error", eye.error()}};
+                    return mcp::invalid_argument_result(eye.error(), "eye");
                 auto target = optional_vec3_arg(args, "target");
                 if (!target)
-                    return json{{"error", target.error()}};
+                    return mcp::invalid_argument_result(target.error(), "target");
                 auto up = optional_vec3_arg(args, "up");
                 if (!up)
-                    return json{{"error", up.error()}};
+                    return mcp::invalid_argument_result(up.error(), "up");
                 if (!eye->has_value() || !target->has_value())
-                    return json{{"error", "Fields 'eye' and 'target' must be provided"}};
+                    return mcp::invalid_argument_result("Fields 'eye' and 'target' must be provided", "eye");
+                if (auto error = view_vectors_error(**eye, **target))
+                    return mcp::invalid_argument_result(*error, "eye");
 
                 const glm::vec3 up_value = up->value_or(glm::vec3(0.0f, 1.0f, 0.0f));
                 const std::optional<float> fov = args.contains("fov_degrees")
@@ -2146,7 +2906,7 @@ namespace lfs::app {
                 .description = "Reset the interactive viewport camera to its saved home position",
                 .input_schema = {.type = "object", .properties = json::object(), .required = {}}},
             [viewer_impl](const json&) -> json {
-                return post_and_wait(viewer_impl, []() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl]() -> json {
                     core::events::cmd::ResetCamera{}.emit();
                     const auto info = vis::get_current_view_info();
                     if (!info)
@@ -2229,7 +2989,7 @@ namespace lfs::app {
                 .description = "Inspect the shared undo/redo history state",
                 .input_schema = {.type = "object", .properties = json::object(), .required = {}}},
             [viewer_impl](const json&) -> json {
-                return post_and_wait(viewer_impl, []() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl]() -> json {
                     return history_json();
                 });
             });
@@ -2240,7 +3000,7 @@ namespace lfs::app {
                 .description = "List the full undo and redo stacks for the shared history service",
                 .input_schema = {.type = "object", .properties = json::object(), .required = {}}},
             [viewer_impl](const json&) -> json {
-                return post_and_wait(viewer_impl, []() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl]() -> json {
                     auto payload = history_json();
                     payload["performed"] = "list";
                     return payload;
@@ -2307,7 +3067,9 @@ namespace lfs::app {
                 .input_schema = {.type = "object", .properties = json::object(), .required = {}},
                 .metadata = {.category = "history", .kind = "mutation", .runtime = "gui", .thread_affinity = "gui_thread"}},
             [viewer_impl](const json&) -> json {
-                return post_and_wait(viewer_impl, []() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl]() -> json {
+                    if (auto* const scene_manager = viewer_impl->getSceneManager())
+                        scene_manager->completePendingSelectionCounts();
                     const auto result = vis::op::undoHistory().undo();
                     auto payload = history_json();
                     append_history_result(payload, result);
@@ -2323,7 +3085,9 @@ namespace lfs::app {
                 .input_schema = {.type = "object", .properties = json::object(), .required = {}},
                 .metadata = {.category = "history", .kind = "mutation", .runtime = "gui", .thread_affinity = "gui_thread"}},
             [viewer_impl](const json&) -> json {
-                return post_and_wait(viewer_impl, []() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl]() -> json {
+                    if (auto* const scene_manager = viewer_impl->getSceneManager())
+                        scene_manager->completePendingSelectionCounts();
                     const auto result = vis::op::undoHistory().redo();
                     auto payload = history_json();
                     append_history_result(payload, result);
@@ -2346,7 +3110,9 @@ namespace lfs::app {
             [viewer_impl](const json& args) -> json {
                 const auto stack = args.value("stack", std::string{});
                 const auto count = static_cast<size_t>(std::max<int64_t>(1, args.value("count", 1)));
-                return post_and_wait(viewer_impl, [stack, count]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, stack, count]() -> json {
+                    if (auto* const scene_manager = viewer_impl->getSceneManager())
+                        scene_manager->completePendingSelectionCounts();
                     vis::op::HistoryResult result;
                     if (stack == "undo") {
                         result = vis::op::undoHistory().undoMultiple(count);
@@ -2400,6 +3166,20 @@ namespace lfs::app {
                 });
             });
 
+        json scene_upscaler_backend_enum = json::array();
+        json scene_upscaler_preset_enum = json::array();
+        for (const auto& descriptor : vis::sceneUpscalerDescriptors()) {
+            scene_upscaler_backend_enum.push_back(std::string(descriptor.id));
+            for (const auto& preset : descriptor.presets) {
+                const std::string preset_id(preset.id);
+                if (std::find(scene_upscaler_preset_enum.begin(),
+                              scene_upscaler_preset_enum.end(),
+                              preset_id) == scene_upscaler_preset_enum.end()) {
+                    scene_upscaler_preset_enum.push_back(preset_id);
+                }
+            }
+        }
+
         registry.register_tool(
             McpTool{
                 .name = "render.settings.set",
@@ -2409,6 +3189,8 @@ namespace lfs::app {
                     .properties = json{
                         {"focal_length_mm", json{{"type", "number"}}},
                         {"render_scale", json{{"type", "number"}}},
+                        {"scene_upscaler", json{{"type", "string"}, {"enum", scene_upscaler_backend_enum}}},
+                        {"scene_upscaler_preset", json{{"type", "string"}, {"enum", scene_upscaler_preset_enum}}},
                         {"background_color", json{{"type", "array"}, {"items", json{{"type", "number"}}}}},
                         {"environment_mode", json{{"type", "integer"}}},
                         {"environment_map_path", json{{"type", "string"}}},
@@ -2435,7 +3217,11 @@ namespace lfs::app {
                     if (auto result = apply_render_settings_patch(args, *settings); !result)
                         return json{{"error", result.error()}};
 
-                    vis::update_render_settings(*settings);
+                    try {
+                        vis::update_render_settings(*settings);
+                    } catch (const std::invalid_argument& error) {
+                        return mcp::invalid_argument_result(error.what(), "environment_map_path");
+                    }
 
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     auto* const rendering_manager = viewer_impl->getRenderingManager();
@@ -2483,6 +3269,110 @@ namespace lfs::app {
 
         registry.register_tool(
             McpTool{
+                .name = "training.params.get",
+                .description = "Read the training parameters for the next run, with type, range, options and whether each is advanced or applies live",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{{"advanced_only", json{{"type", "boolean"}}}},
+                    .required = {}}},
+            [viewer_impl](const json& args) -> json {
+                const bool advanced_only = args.value("advanced_only", false);
+                return post_and_wait(viewer_impl, [viewer_impl, advanced_only]() -> json {
+                    auto* const params = viewer_impl->getParameterManager();
+                    if (!params)
+                        return json{{"error", "Training parameters are not available"}};
+                    return optimization_params_json(params->copyActiveParams(), advanced_only);
+                });
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "training.params.set",
+                .description = "Set training parameters by id, e.g. {\"values\": {\"thin_structure_weight\": 1.0}}. Options are passed by name. Live-update parameters also change a running training",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{{"values", json{{"type", "object"}}}},
+                    .required = {"values"}}},
+            [viewer_impl](const json& args) -> json {
+                if (!args.contains("values") || !args["values"].is_object() || args["values"].empty())
+                    return json{{"error", "values must be a non-empty object of parameter ids"}};
+                const json values = args["values"];
+                return post_and_wait(viewer_impl, [viewer_impl, values]() -> json {
+                    auto* const params = viewer_impl->getParameterManager();
+                    if (!params)
+                        return json{{"error", "Training parameters are not available"}};
+                    auto& registry = core::prop::PropertyRegistry::instance();
+
+                    struct Change {
+                        core::prop::PropertyMeta meta;
+                        std::any value;
+                    };
+                    std::vector<Change> changes;
+                    std::optional<std::string> strategy;
+                    for (const auto& [id, value] : values.items()) {
+                        auto meta = registry.get_property("optimization", id);
+                        if (!meta || !meta->setter)
+                            return json{{"error", "Unknown training parameter: " + id}};
+                        if (meta->is_readonly())
+                            return json{{"error", "Training parameter is read-only: " + id}};
+                        if (id == "strategy") {
+                            if (!value.is_string() || core::param::canonical_strategy_name(value.get<std::string>()).empty())
+                                return json{{"error", "strategy must be 'mcmc', 'mrnf', or 'igs+'"}};
+                            strategy = std::string(core::param::canonical_strategy_name(value.get<std::string>()));
+                            continue;
+                        }
+                        auto converted = optimization_value_from_json(*meta, value);
+                        if (!converted)
+                            return json{{"error", converted.error().user_message()}};
+                        changes.push_back({std::move(*meta), std::move(*converted)});
+                    }
+
+                    if (strategy) {
+                        const auto* trainer = viewer_impl->getTrainerManager();
+                        if (trainer && !trainer->canChangeStrategy(*strategy))
+                            return json{{"error", LOC("training.reset_before_strategy_change")}};
+                    }
+                    const auto before = params->copyActiveParams();
+                    if (strategy) {
+                        params->modifyActiveParams([&](auto&) {
+                            params->setActiveStrategy(*strategy);
+                            // Presets keep independent values; a GUT value left in the IGS+ slot would be invalid.
+                            if (*strategy == core::param::kStrategyIGSPlus)
+                                params->getActiveParams().gut = false;
+                        });
+                    }
+                    std::vector<std::any> previous;
+                    previous.reserve(changes.size());
+                    params->modifyActiveParams([&](auto& p) {
+                        auto ref = core::prop::PropertyObjectRef::cpp(&p);
+                        for (const auto& change : changes) {
+                            previous.push_back(change.meta.getter(ref));
+                            change.meta.setter(ref, change.value);
+                        }
+                    });
+                    if (const auto error = params->copyActiveParams().validate(); !error.empty()) {
+                        params->modifyActiveParams([&](auto& p) {
+                            auto ref = core::prop::PropertyObjectRef::cpp(&p);
+                            for (size_t i = changes.size(); i-- > 0;)
+                                changes[i].meta.setter(ref, previous[i]);
+                        });
+                        if (strategy)
+                            params->modifyActiveParams([&](auto&) { params->setActiveStrategy(before.strategy); });
+                        return json{{"error", error}};
+                    }
+                    if (strategy)
+                        registry.notify("optimization", "strategy", before.strategy, *strategy);
+                    for (size_t i = 0; i < changes.size(); ++i)
+                        registry.notify("optimization", changes[i].meta.id, previous[i], changes[i].value);
+
+                    auto result = optimization_params_json(params->copyActiveParams(), false);
+                    result["success"] = true;
+                    return result;
+                });
+            });
+
+        registry.register_tool(
+            McpTool{
                 .name = "dataset.get_info",
                 .description = "Inspect the current dataset/training scene metadata",
                 .input_schema = {.type = "object", .properties = json::object(), .required = {}}},
@@ -2503,20 +3393,21 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"name", json{{"type", "string"}, {"description", "Node name"}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Durable node UUID; wins over name"}}},
                         {"visible", json{{"type", "boolean"}, {"description", "Whether the node should be visible"}}}},
-                    .required = {"name", "visible"}}},
+                    .required = {"visible"}}},
             [viewer_impl](const json& args) -> json {
-                const std::string name = args["name"].get<std::string>();
                 const bool visible = args["visible"].get<bool>();
 
-                return post_and_wait(viewer_impl, [viewer_impl, name, visible]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, visible]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    const auto* const node = scene.getNode(name);
-                    if (!node)
-                        return json{{"error", "Node not found: " + name}};
+                    const auto resolved = resolve_node_reference(scene, args);
+                    if (!resolved)
+                        return json{{"error", resolved.error().message}};
+                    const auto* const node = *resolved;
 
                     core::events::cmd::SetNodeVisibilityById{
                         .node_id = node->id,
@@ -2524,7 +3415,7 @@ namespace lfs::app {
                         .emit();
                     if (const auto* const updated = scene.getNodeById(node->id))
                         return json{{"success", true}, {"node", node_summary_json(scene, *updated)}};
-                    return json{{"success", true}, {"name", name}, {"visible", visible}};
+                    return json{{"success", true}, {"name", node->name}, {"visible", visible}};
                 });
             });
 
@@ -2536,19 +3427,21 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"name", json{{"type", "string"}, {"description", "Node name"}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Durable node UUID; wins over name"}}},
                         {"locked", json{{"type", "boolean"}, {"description", "Whether the node should be locked"}}}},
-                    .required = {"name", "locked"}}},
+                    .required = {"locked"}}},
             [viewer_impl](const json& args) -> json {
-                const std::string name = args["name"].get<std::string>();
                 const bool locked = args["locked"].get<bool>();
 
-                return post_and_wait(viewer_impl, [viewer_impl, name, locked]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, locked]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    if (!scene.getNode(name))
-                        return json{{"error", "Node not found: " + name}};
+                    const auto resolved = resolve_node_reference(scene, args);
+                    if (!resolved)
+                        return json{{"error", resolved.error().message}};
+                    const std::string name = (*resolved)->name;
 
                     core::events::cmd::SetNodeLocked{.name = name, .locked = locked}.emit();
                     if (const auto* const node = scene.getNode(name))
@@ -2565,20 +3458,21 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"old_name", json{{"type", "string"}, {"description", "Current node name"}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Durable node UUID; wins over old_name"}}},
                         {"new_name", json{{"type", "string"}, {"description", "New node name"}}}},
-                    .required = {"old_name", "new_name"}}},
+                    .required = {"new_name"}}},
             [viewer_impl](const json& args) -> json {
-                const std::string old_name = args["old_name"].get<std::string>();
                 const std::string new_name = args["new_name"].get<std::string>();
 
-                return post_and_wait(viewer_impl, [viewer_impl, old_name, new_name]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, new_name]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    const auto* const node = scene.getNode(old_name);
-                    if (!node)
-                        return json{{"error", "Node not found: " + old_name}};
+                    const auto resolved = resolve_node_reference(scene, args, "old_name", "uuid");
+                    if (!resolved)
+                        return json{{"error", resolved.error().message}};
+                    const auto* const node = *resolved;
 
                     core::events::cmd::RenameNodeById{.node_id = node->id, .new_name = new_name}.emit();
                     if (const auto* const updated = scene.getNodeById(node->id);
@@ -2596,26 +3490,28 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"name", json{{"type", "string"}, {"description", "Node to move"}}},
-                        {"parent", json{{"type", "string"}, {"description", "New parent node; omit or null for root"}}}},
-                    .required = {"name"}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Durable node UUID; wins over name"}}},
+                        {"parent", json{{"type", "string"}, {"description", "New parent node; omit or null for root"}}},
+                        {"parent_uuid", json{{"type", "string"}, {"description", "Durable parent UUID; wins over parent"}}}},
+                    .required = {}}},
             [viewer_impl](const json& args) -> json {
-                const std::string name = args["name"].get<std::string>();
-                const auto parent = optional_string_arg(args, "parent");
-
-                return post_and_wait(viewer_impl, [viewer_impl, name, parent]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    const auto* const node = scene.getNode(name);
-                    if (!node)
-                        return json{{"error", "Node not found: " + name}};
+                    const auto resolved = resolve_node_reference(scene, args);
+                    if (!resolved)
+                        return json{{"error", resolved.error().message}};
+                    const auto* const node = *resolved;
+                    const std::string name = node->name;
                     core::NodeId parent_id = core::NULL_NODE;
-                    if (parent) {
-                        const auto* const parent_node = scene.getNode(*parent);
-                        if (!parent_node)
-                            return json{{"error", "Parent node not found: " + *parent}};
-                        parent_id = parent_node->id;
+                    if ((args.contains("parent_uuid") && !args["parent_uuid"].is_null()) ||
+                        (args.contains("parent") && !args["parent"].is_null())) {
+                        const auto parent = resolve_node_reference(scene, args, "parent", "parent_uuid");
+                        if (!parent)
+                            return json{{"error", parent.error().message}};
+                        parent_id = (*parent)->id;
                     }
 
                     core::events::cmd::ReparentNodeById{
@@ -2639,23 +3535,24 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"name", json{{"type", "string"}, {"description", "Requested group name"}}},
-                        {"parent", json{{"type", "string"}, {"description", "Optional parent node name"}}}},
+                        {"parent", json{{"type", "string"}, {"description", "Optional parent node name"}}},
+                        {"parent_uuid", json{{"type", "string"}, {"description", "Optional durable parent UUID; wins over parent"}}}},
                     .required = {"name"}}},
             [viewer_impl](const json& args) -> json {
                 const std::string name = args["name"].get<std::string>();
-                const auto parent = optional_string_arg(args, "parent");
 
-                return post_and_wait(viewer_impl, [viewer_impl, name, parent]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, name]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
                     core::NodeId parent_id = core::NULL_NODE;
-                    if (parent) {
-                        const auto* const parent_node = scene.getNode(*parent);
-                        if (!parent_node)
-                            return json{{"error", "Parent node not found: " + *parent}};
-                        parent_id = parent_node->id;
+                    if ((args.contains("parent_uuid") && !args["parent_uuid"].is_null()) ||
+                        (args.contains("parent") && !args["parent"].is_null())) {
+                        const auto parent = resolve_node_reference(scene, args, "parent", "parent_uuid");
+                        if (!parent)
+                            return json{{"error", parent.error().message}};
+                        parent_id = (*parent)->id;
                     }
 
                     std::unordered_set<std::string> before;
@@ -2682,19 +3579,19 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"name", json{{"type", "string"}, {"description", "Node to duplicate"}}}},
-                    .required = {"name"}}},
+                        {"name", json{{"type", "string"}, {"description", "Node to duplicate"}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Durable node UUID; wins over name"}}}},
+                    .required = {}}},
             [viewer_impl](const json& args) -> json {
-                const std::string name = args["name"].get<std::string>();
-
-                return post_and_wait(viewer_impl, [viewer_impl, name]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    const auto* const node = scene.getNode(name);
-                    if (!node)
-                        return json{{"error", "Node not found: " + name}};
+                    const auto resolved = resolve_node_reference(scene, args);
+                    if (!resolved)
+                        return json{{"error", resolved.error().message}};
+                    const auto* const node = *resolved;
 
                     std::unordered_set<std::string> before;
                     for (const auto* const node : scene.getNodes()) {
@@ -2704,10 +3601,11 @@ namespace lfs::app {
 
                     core::events::cmd::DuplicateNodeById{.node_id = node->id}.emit();
 
+                    SceneNodeCounts counts(scene);
                     json nodes = json::array();
                     for (const auto* const node : scene.getNodes()) {
                         if (node && !before.contains(node->name))
-                            nodes.push_back(node_summary_json(scene, *node));
+                            nodes.push_back(node_summary_json(scene, *node, &counts));
                     }
 
                     if (nodes.empty())
@@ -2723,19 +3621,20 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"name", json{{"type", "string"}, {"description", "Group node to merge"}}}},
-                    .required = {"name"}}},
+                        {"name", json{{"type", "string"}, {"description", "Group node to merge"}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Durable group UUID; wins over name"}}}},
+                    .required = {}}},
             [viewer_impl](const json& args) -> json {
-                const std::string name = args["name"].get<std::string>();
-
-                return post_and_wait(viewer_impl, [viewer_impl, name]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    const auto* const group = scene.getNode(name);
-                    if (!group)
-                        return json{{"error", "Node not found: " + name}};
+                    const auto resolved = resolve_node_reference(scene, args);
+                    if (!resolved)
+                        return json{{"error", resolved.error().message}};
+                    const auto* const group = *resolved;
+                    const std::string name = group->name;
                     if (group->type != core::NodeType::GROUP)
                         return json{{"error", "Node is not a group: " + name}};
 
@@ -2771,13 +3670,17 @@ namespace lfs::app {
                         {"path", json{{"type", "string"}, {"description", "Destination file path"}}},
                         {"node", json{{"type", "string"}, {"description", "Optional node name"}}},
                         {"nodes", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional list of node names"}}},
-                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Optional durable node UUID; wins over node"}}},
+                        {"uuids", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional durable node UUIDs; win over nodes"}}},
+                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}},
+                        {"include_provenance", json{{"type", "boolean"}, {"description", "When true (default), write a full provenance stamp; when false, write a minimal build stamp (app version + build commit)"}}}},
                     .required = {"path"}}},
             [viewer_impl](const json& args) -> json {
                 const std::filesystem::path path = args["path"].get<std::string>();
                 const int sh_degree = args.value("sh_degree", 3);
+                const bool include_provenance = args.value("include_provenance", true);
 
-                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree, include_provenance]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
@@ -2786,7 +3689,7 @@ namespace lfs::app {
                     if (!node_names)
                         return json{{"error", node_names.error()}};
 
-                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::PLY, path, sh_degree); !result)
+                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::PLY, path, sh_degree, include_provenance); !result)
                         return json{{"error", result.error()}};
 
                     return json{
@@ -2810,13 +3713,17 @@ namespace lfs::app {
                         {"path", json{{"type", "string"}, {"description", "Destination file path"}}},
                         {"node", json{{"type", "string"}, {"description", "Optional node name"}}},
                         {"nodes", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional list of node names"}}},
-                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Optional durable node UUID; wins over node"}}},
+                        {"uuids", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional durable node UUIDs; win over nodes"}}},
+                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}},
+                        {"include_provenance", json{{"type", "boolean"}, {"description", "When true (default), write a full provenance stamp; when false, write a minimal build stamp (app version + build commit)"}}}},
                     .required = {"path"}}},
             [viewer_impl](const json& args) -> json {
                 const std::filesystem::path path = args["path"].get<std::string>();
                 const int sh_degree = args.value("sh_degree", 3);
+                const bool include_provenance = args.value("include_provenance", true);
 
-                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree, include_provenance]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
@@ -2825,7 +3732,7 @@ namespace lfs::app {
                     if (!node_names)
                         return json{{"error", node_names.error()}};
 
-                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::SOG, path, sh_degree); !result)
+                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::SOG, path, sh_degree, include_provenance); !result)
                         return json{{"error", result.error()}};
 
                     return json{
@@ -2833,6 +3740,66 @@ namespace lfs::app {
                         {"started", false},
                         {"completed", true},
                         {"format", "sog"},
+                        {"path", core::path_to_utf8(path)},
+                        {"nodes", *node_names},
+                    };
+                });
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "scene.export_ssog",
+                .description = "Export scene nodes synchronously to a PlayCanvas multi-LOD SSOG bundle or directory",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{
+                        {"path", json{{"type", "string"}, {"description", "Destination .ssog file or directory (contains lod-meta.json)"}}},
+                        {"node", json{{"type", "string"}, {"description", "Optional node name"}}},
+                        {"nodes", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional list of node names"}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Optional durable node UUID; wins over node"}}},
+                        {"uuids", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional durable node UUIDs; win over nodes"}}},
+                        {"node_ids", json{{"type", "array"}, {"items", json{{"type", "integer"}}}, {"description", "Optional session-local node IDs"}}},
+                        {"lod_levels", json{{"type", "integer"}, {"default", 4}, {"minimum", 1}, {"maximum", 8}}},
+                        {"lod_ratio", json{{"type", "number"}, {"default", 0.5}, {"exclusiveMinimum", 0}, {"exclusiveMaximum", 1}}},
+                        {"chunk_count_k", json{{"type", "integer"}, {"default", 512}, {"minimum", 1}}},
+                        {"chunk_extent", json{{"type", "number"}, {"default", 16.0}, {"minimum", 0.01}}},
+                        {"chunk_min_k", json{{"type", "integer"}, {"default", 8}, {"minimum", 0}}},
+                        {"kmeans_iterations", json{{"type", "integer"}, {"default", 10}, {"minimum", 1}}},
+                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}},
+                        {"include_provenance", json{{"type", "boolean"}, {"description", "When true (default), write a full provenance stamp; when false, write a minimal build stamp (app version + build commit)"}}}},
+                    .required = {"path"}}},
+            [viewer_impl](const json& args) -> json {
+                const std::filesystem::path path = args["path"].get<std::string>();
+                const int sh_degree = args.value("sh_degree", 3);
+                const bool include_provenance = args.value("include_provenance", true);
+
+                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree, include_provenance]() -> json {
+                    auto* const scene_manager = viewer_impl->getSceneManager();
+                    if (!scene_manager)
+                        return json{{"error", "Scene manager not initialized"}};
+
+                    auto node_names = resolve_export_nodes(*scene_manager, args);
+                    if (!node_names)
+                        return json{{"error", node_names.error()}};
+
+                    io::SsogSaveOptions options;
+                    options.lod_levels = args.value("lod_levels", 4);
+                    options.lod_ratio = args.value("lod_ratio", 0.5f);
+                    options.chunk_count_k = args.value("chunk_count_k", 512);
+                    options.chunk_extent = args.value("chunk_extent", 16.0f);
+                    options.chunk_min_k = args.value("chunk_min_k", 8);
+                    options.kmeans_iterations = args.value("kmeans_iterations", 10);
+                    if (!options.validate())
+                        return json{{"error", "Invalid SSOG export options"}};
+
+                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::SSOG, path, sh_degree, include_provenance, options); !result)
+                        return json{{"error", result.error()}};
+
+                    return json{
+                        {"success", true},
+                        {"started", false},
+                        {"completed", true},
+                        {"format", "ssog"},
                         {"path", core::path_to_utf8(path)},
                         {"nodes", *node_names},
                     };
@@ -2849,13 +3816,17 @@ namespace lfs::app {
                         {"path", json{{"type", "string"}, {"description", "Destination file path"}}},
                         {"node", json{{"type", "string"}, {"description", "Optional node name"}}},
                         {"nodes", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional list of node names"}}},
-                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Optional durable node UUID; wins over node"}}},
+                        {"uuids", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional durable node UUIDs; win over nodes"}}},
+                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}},
+                        {"include_provenance", json{{"type", "boolean"}, {"description", "When true (default), write a full provenance stamp; when false, write a minimal build stamp (app version + build commit)"}}}},
                     .required = {"path"}}},
             [viewer_impl](const json& args) -> json {
                 const std::filesystem::path path = args["path"].get<std::string>();
                 const int sh_degree = args.value("sh_degree", 3);
+                const bool include_provenance = args.value("include_provenance", true);
 
-                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree, include_provenance]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
@@ -2864,7 +3835,7 @@ namespace lfs::app {
                     if (!node_names)
                         return json{{"error", node_names.error()}};
 
-                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::SPZ, path, sh_degree); !result)
+                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::SPZ, path, sh_degree, include_provenance); !result)
                         return json{{"error", result.error()}};
 
                     return json{
@@ -2888,13 +3859,17 @@ namespace lfs::app {
                         {"path", json{{"type", "string"}, {"description", "Destination file path"}}},
                         {"node", json{{"type", "string"}, {"description", "Optional node name"}}},
                         {"nodes", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional list of node names"}}},
-                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Optional durable node UUID; wins over node"}}},
+                        {"uuids", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional durable node UUIDs; win over nodes"}}},
+                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}},
+                        {"include_provenance", json{{"type", "boolean"}, {"description", "When true (default), write a full provenance stamp; when false, write a minimal build stamp (app version + build commit)"}}}},
                     .required = {"path"}}},
             [viewer_impl](const json& args) -> json {
                 const std::filesystem::path path = args["path"].get<std::string>();
                 const int sh_degree = args.value("sh_degree", 3);
+                const bool include_provenance = args.value("include_provenance", true);
 
-                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree, include_provenance]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
@@ -2903,7 +3878,7 @@ namespace lfs::app {
                     if (!node_names)
                         return json{{"error", node_names.error()}};
 
-                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::USD, path, sh_degree); !result)
+                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::USD, path, sh_degree, include_provenance); !result)
                         return json{{"error", result.error()}};
 
                     return json{
@@ -2927,13 +3902,17 @@ namespace lfs::app {
                         {"path", json{{"type", "string"}, {"description", "Destination .usdz file path"}}},
                         {"node", json{{"type", "string"}, {"description", "Optional node name"}}},
                         {"nodes", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional list of node names"}}},
-                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Optional durable node UUID; wins over node"}}},
+                        {"uuids", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional durable node UUIDs; win over nodes"}}},
+                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}},
+                        {"include_provenance", json{{"type", "boolean"}, {"description", "When true (default), write a full provenance stamp; when false, write a minimal build stamp (app version + build commit)"}}}},
                     .required = {"path"}}},
             [viewer_impl](const json& args) -> json {
                 const std::filesystem::path path = args["path"].get<std::string>();
                 const int sh_degree = args.value("sh_degree", 3);
+                const bool include_provenance = args.value("include_provenance", true);
 
-                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree, include_provenance]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
@@ -2942,7 +3921,7 @@ namespace lfs::app {
                     if (!node_names)
                         return json{{"error", node_names.error()}};
 
-                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::NUREC_USDZ, path, sh_degree); !result)
+                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::NUREC_USDZ, path, sh_degree, include_provenance); !result)
                         return json{{"error", result.error()}};
 
                     return json{
@@ -2966,13 +3945,17 @@ namespace lfs::app {
                         {"path", json{{"type", "string"}, {"description", "Destination file path"}}},
                         {"node", json{{"type", "string"}, {"description", "Optional node name"}}},
                         {"nodes", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional list of node names"}}},
-                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Optional durable node UUID; wins over node"}}},
+                        {"uuids", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional durable node UUIDs; win over nodes"}}},
+                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}},
+                        {"include_provenance", json{{"type", "boolean"}, {"description", "When true (default), write a full provenance stamp; when false, write a minimal build stamp (app version + build commit)"}}}},
                     .required = {"path"}}},
             [viewer_impl](const json& args) -> json {
                 const std::filesystem::path path = args["path"].get<std::string>();
                 const int sh_degree = args.value("sh_degree", 3);
+                const bool include_provenance = args.value("include_provenance", true);
 
-                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree, include_provenance]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
@@ -2981,7 +3964,7 @@ namespace lfs::app {
                     if (!node_names)
                         return json{{"error", node_names.error()}};
 
-                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::HTML_VIEWER, path, sh_degree); !result)
+                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::HTML_VIEWER, path, sh_degree, include_provenance); !result)
                         return json{{"error", result.error()}};
 
                     return json{
@@ -3005,13 +3988,17 @@ namespace lfs::app {
                         {"path", json{{"type", "string"}, {"description", "Destination file path"}}},
                         {"node", json{{"type", "string"}, {"description", "Optional node name"}}},
                         {"nodes", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional list of node names"}}},
-                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Optional durable node UUID; wins over node"}}},
+                        {"uuids", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Optional durable node UUIDs; win over nodes"}}},
+                        {"sh_degree", json{{"type", "integer"}, {"description", "Optional SH degree to keep in the export"}}},
+                        {"include_provenance", json{{"type", "boolean"}, {"description", "When true (default), write a full provenance stamp; when false, write a minimal build stamp (app version + build commit)"}}}},
                     .required = {"path"}}},
             [viewer_impl](const json& args) -> json {
                 const std::filesystem::path path = args["path"].get<std::string>();
                 const int sh_degree = args.value("sh_degree", 3);
+                const bool include_provenance = args.value("include_provenance", true);
 
-                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, path, sh_degree, include_provenance]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
@@ -3020,7 +4007,7 @@ namespace lfs::app {
                     if (!node_names)
                         return json{{"error", node_names.error()}};
 
-                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::RAD, path, sh_degree); !result)
+                    if (auto result = export_scene_nodes(*scene_manager, *node_names, core::ExportFormat::RAD, path, sh_degree, include_provenance); !result)
                         return json{{"error", result.error()}};
 
                     return json{
@@ -3122,7 +4109,7 @@ namespace lfs::app {
                         {"y0", json{{"type", "number"}, {"description", "Top edge Y coordinate"}}},
                         {"x1", json{{"type", "number"}, {"description", "Right edge X coordinate"}}},
                         {"y1", json{{"type", "number"}, {"description", "Bottom edge Y coordinate"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"minimum", -1}, {"description", "Camera index (default: 0)"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x0", "y0", "x1", "y1"}}},
             [viewer_impl](const json& args) -> json {
@@ -3137,8 +4124,9 @@ namespace lfs::app {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
-                    return selection_result_json(*scene_manager,
-                                                 scene_manager->selectRect(x0, y0, x1, y1, mode, camera_index));
+                    return selection_result_json(*scene_manager, [&] {
+                        return scene_manager->selectRect(x0, y0, x1, y1, mode, camera_index);
+                    });
                 });
             });
 
@@ -3149,8 +4137,8 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"points", json{{"type", "array"}, {"items", json{{"type", "array"}, {"items", json{{"type", "number"}}}}}, {"description", "Polygon vertices [[x0,y0], [x1,y1], ...]"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"points", point_list_schema("Polygon vertices [[x0,y0], [x1,y1], ...]")},
+                        {"camera_index", json{{"type", "integer"}, {"minimum", -1}, {"description", "Camera index (default: 0)"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"points"}}},
             [viewer_impl](const json& args) -> json {
@@ -3172,8 +4160,9 @@ namespace lfs::app {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
-                    return selection_result_json(*scene_manager,
-                                                 scene_manager->selectPolygon(vertex_data, mode, camera_index));
+                    return selection_result_json(*scene_manager, [&] {
+                        return scene_manager->selectPolygon(vertex_data, mode, camera_index);
+                    });
                 });
             });
 
@@ -3184,8 +4173,8 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"points", json{{"type", "array"}, {"items", json{{"type", "array"}, {"items", json{{"type", "number"}}}}}, {"description", "Lasso points [[x0,y0], [x1,y1], ...]"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"points", point_list_schema("Lasso points [[x0,y0], [x1,y1], ...]")},
+                        {"camera_index", json{{"type", "integer"}, {"minimum", -1}, {"description", "Camera index (default: 0)"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"points"}}},
             [viewer_impl](const json& args) -> json {
@@ -3207,8 +4196,9 @@ namespace lfs::app {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
-                    return selection_result_json(*scene_manager,
-                                                 scene_manager->selectLasso(vertex_data, mode, camera_index));
+                    return selection_result_json(*scene_manager, [&] {
+                        return scene_manager->selectLasso(vertex_data, mode, camera_index);
+                    });
                 });
             });
 
@@ -3221,7 +4211,7 @@ namespace lfs::app {
                     .properties = json{
                         {"x", json{{"type", "number"}, {"description", "X coordinate"}}},
                         {"y", json{{"type", "number"}, {"description", "Y coordinate"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"minimum", -1}, {"description", "Camera index (default: 0)"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x", "y"}}},
             [viewer_impl](const json& args) -> json {
@@ -3234,8 +4224,9 @@ namespace lfs::app {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
-                    return selection_result_json(*scene_manager,
-                                                 scene_manager->selectRing(x, y, mode, camera_index));
+                    return selection_result_json(*scene_manager, [&] {
+                        return scene_manager->selectRing(x, y, mode, camera_index);
+                    });
                 });
             });
 
@@ -3249,7 +4240,7 @@ namespace lfs::app {
                         {"x", json{{"type", "number"}, {"description", "X coordinate"}}},
                         {"y", json{{"type", "number"}, {"description", "Y coordinate"}}},
                         {"radius", json{{"type", "number"}, {"description", "Selection radius in pixels (default: 20)"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"minimum", -1}, {"description", "Camera index (default: 0)"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x", "y"}}},
             [viewer_impl](const json& args) -> json {
@@ -3263,8 +4254,9 @@ namespace lfs::app {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
-                    return selection_result_json(*scene_manager,
-                                                 scene_manager->selectBrush(x, y, radius, mode, camera_index));
+                    return selection_result_json(*scene_manager, [&] {
+                        return scene_manager->selectBrush(x, y, radius, mode, camera_index);
+                    });
                 });
             });
 
@@ -3278,7 +4270,7 @@ namespace lfs::app {
                         {"x", json{{"type", "number"}, {"description", "X coordinate"}}},
                         {"y", json{{"type", "number"}, {"description", "Y coordinate"}}},
                         {"radius", json{{"type", "number"}, {"description", "Selection radius in pixels (default: 20)"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"minimum", -1}, {"description", "Camera index (default: 0)"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x", "y"}}},
             [viewer_impl](const json& args) -> json {
@@ -3292,8 +4284,9 @@ namespace lfs::app {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
-                    return selection_result_json(*scene_manager,
-                                                 scene_manager->selectBrush(x, y, radius, mode, camera_index));
+                    return selection_result_json(*scene_manager, [&] {
+                        return scene_manager->selectBrush(x, y, radius, mode, camera_index);
+                    });
                 });
             });
 
@@ -3310,6 +4303,8 @@ namespace lfs::app {
                 const int max_indices = args.value("max_indices", 100000);
 
                 return post_and_wait(viewer, [viewer, max_indices]() -> json {
+                    if (auto* const scene_manager = viewer->getSceneManager())
+                        scene_manager->completePendingSelectionCounts();
                     const auto selection = vis::cap::getSelectionSnapshot(viewer->getScene(), max_indices);
                     return json{
                         {"success", true},
@@ -3356,6 +4351,7 @@ namespace lfs::app {
                         return json{{"error", "Scene manager not initialized"}};
 
                     const auto& scene = scene_manager->getScene();
+                    SceneNodeCounts counts(scene);
                     json nodes = json::array();
                     for (const auto* const node : scene.getNodes()) {
                         if (!node)
@@ -3377,7 +4373,7 @@ namespace lfs::app {
                                 break;
                             }
                         }
-                        nodes.push_back(node_summary_json(scene, *node));
+                        nodes.push_back(node_summary_json(scene, *node, &counts));
                     }
 
                     return json{{"success", true}, {"count", nodes.size()}, {"nodes", nodes}};
@@ -3396,10 +4392,11 @@ namespace lfs::app {
                         return json{{"error", "Scene manager not initialized"}};
 
                     const auto& scene = scene_manager->getScene();
+                    SceneNodeCounts counts(scene);
                     json nodes = json::array();
                     for (const auto& name : scene_manager->getSelectedNodeNames()) {
                         if (const auto* const node = scene.getNode(name))
-                            nodes.push_back(node_summary_json(scene, *node));
+                            nodes.push_back(node_summary_json(scene, *node, &counts));
                     }
 
                     return json{{"success", true}, {"count", nodes.size()}, {"nodes", nodes}};
@@ -3414,24 +4411,30 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"name", json{{"type", "string"}, {"description", "Node name to select"}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Durable node UUID; wins over name"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add"})}, {"description", "Selection update mode (default: replace)"}}}},
-                    .required = {"name"}}},
+                    .required = {}}},
             [viewer_impl](const json& args) -> json {
-                const std::string name = args["name"].get<std::string>();
                 const std::string mode = args.value("mode", "replace");
 
-                return post_and_wait(viewer_impl, [viewer_impl, name, mode]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args, mode]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
 
+                    const auto resolved = resolve_node_reference(scene_manager->getScene(), args);
+                    if (!resolved)
+                        return json{{"error", resolved.error().message}};
+                    const std::string name = (*resolved)->name;
+
                     if (auto result = vis::cap::selectNode(*scene_manager, name, mode); !result)
                         return json{{"error", result.error()}};
 
+                    SceneNodeCounts counts(scene_manager->getScene());
                     json nodes = json::array();
                     for (const auto& selected_name : scene_manager->getSelectedNodeNames()) {
                         if (const auto* const node = scene_manager->getScene().getNode(selected_name))
-                            nodes.push_back(node_summary_json(scene_manager->getScene(), *node));
+                            nodes.push_back(node_summary_json(scene_manager->getScene(), *node, &counts));
                     }
 
                     return json{{"success", true}, {"count", nodes.size()}, {"nodes", nodes}};
@@ -3445,16 +4448,24 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"node", json{{"type", "string"}, {"description", "Optional node name; defaults to the current selected node(s)"}}}},
+                        {"node", json{{"type", "string"}, {"description", "Optional node name; defaults to the current selected node(s)"}}},
+                        {"uuid", json{{"type", "string"}, {"description", "Optional durable node UUID; wins over node"}}}},
                     .required = {}}},
             [viewer_impl](const json& args) -> json {
-                const auto requested_node = optional_string_arg(args, "node");
-
-                return post_and_wait(viewer_impl, [viewer_impl, requested_node]() -> json {
+                return post_and_wait(viewer_impl, [viewer_impl, args]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
 
+                    std::optional<std::string> requested_node;
+                    if (args.contains("uuid")) {
+                        const auto resolved = resolve_node_reference(scene_manager->getScene(), args, "node", "uuid");
+                        if (!resolved)
+                            return json{{"error", resolved.error().message}};
+                        requested_node = (*resolved)->name;
+                    } else {
+                        requested_node = optional_string_arg(args, "node");
+                    }
                     auto targets = resolve_transform_targets(*scene_manager, requested_node);
                     if (!targets)
                         return json{{"error", targets.error()}};
@@ -3476,6 +4487,9 @@ namespace lfs::app {
                 .operator_id = vis::op::BuiltinOp::TransformSet,
                 .category = "transform",
                 .description = "Set absolute visualizer-world transform components for a node or the current shared node selection",
+                .property_overrides = json{{"rotation", bounded_rotation_schema("XYZ Euler rotation in radians")},
+                                           {"translation", number_array_schema(3, "XYZ translation")},
+                                           {"scale", positive_scale_schema("XYZ scale")}},
                 .prepare = prepare_transform_set_operator,
                 .on_success = transform_operator_result,
             });
@@ -3488,6 +4502,7 @@ namespace lfs::app {
                 .category = "transform",
                 .description = "Translate a node or the current shared node selection in visualizer-world coordinates",
                 .required = {"value"},
+                .property_overrides = json{{"value", number_array_schema(3, "XYZ translation")}},
                 .prepare = prepare_transform_operator,
                 .on_success = transform_operator_result,
             });
@@ -3500,6 +4515,7 @@ namespace lfs::app {
                 .category = "transform",
                 .description = "Rotate a node or the current shared node selection by visualizer-world XYZ Euler deltas in radians",
                 .required = {"value"},
+                .property_overrides = json{{"value", bounded_rotation_schema("XYZ Euler delta in radians")}},
                 .prepare = prepare_transform_operator,
                 .on_success = transform_operator_result,
             });
@@ -3512,6 +4528,7 @@ namespace lfs::app {
                 .category = "transform",
                 .description = "Scale a node or the current shared node selection by visualizer-world XYZ factors",
                 .required = {"value"},
+                .property_overrides = json{{"value", positive_scale_schema("XYZ scale factors")}},
                 .prepare = prepare_transform_operator,
                 .on_success = transform_operator_result,
             });
@@ -3542,7 +4559,9 @@ namespace lfs::app {
                     if (!cropbox_id)
                         return json{{"error", cropbox_id.error()}};
 
-                    return crop_box_info_json(*scene_manager, rendering_manager, *cropbox_id);
+                    scene_manager->selectNode(*cropbox_id);
+
+                    return crop_box_info_json(*scene_manager, *cropbox_id);
                 });
             });
 
@@ -3560,7 +4579,6 @@ namespace lfs::app {
 
                 return post_and_wait(viewer_impl, [viewer_impl, requested_node]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
-                    auto* const rendering_manager = viewer_impl->getRenderingManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
 
@@ -3568,7 +4586,7 @@ namespace lfs::app {
                     if (!cropbox_id)
                         return json{{"error", cropbox_id.error()}};
 
-                    return crop_box_info_json(*scene_manager, rendering_manager, *cropbox_id);
+                    return crop_box_info_json(*scene_manager, *cropbox_id);
                 });
             });
 
@@ -3580,11 +4598,11 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"node", json{{"type", "string"}, {"description", "Optional crop box node or parent node name; defaults to the current selected crop box"}}},
-                        {"min", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional local minimum bounds"}}},
-                        {"max", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional local maximum bounds"}}},
-                        {"translation", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional local XYZ translation"}}},
-                        {"rotation", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional local XYZ Euler rotation in radians"}}},
-                        {"scale", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional local XYZ scale"}}},
+                        {"min", number_array_schema(3, "Optional local minimum bounds")},
+                        {"max", number_array_schema(3, "Optional local maximum bounds")},
+                        {"translation", number_array_schema(3, "Optional local XYZ translation")},
+                        {"rotation", number_array_schema(3, "Optional local XYZ Euler rotation in radians")},
+                        {"scale", number_array_schema(3, "Optional local XYZ scale")},
                         {"inverse", json{{"type", "boolean"}, {"description", "Invert the crop volume"}}},
                         {"enabled", json{{"type", "boolean"}, {"description", "Enable crop filtering for this crop box"}}},
                         {"show", json{{"type", "boolean"}, {"description", "Show crop boxes in the viewport"}}},
@@ -3655,7 +4673,7 @@ namespace lfs::app {
                         return json{{"error", result.error()}};
                     }
 
-                    return crop_box_info_json(*scene_manager, rendering_manager, *cropbox_id);
+                    return crop_box_info_json(*scene_manager, *cropbox_id);
                 });
             });
 
@@ -3687,7 +4705,7 @@ namespace lfs::app {
                     if (!result)
                         return json{{"error", result.error()}};
 
-                    return crop_box_info_json(*scene_manager, rendering_manager, *cropbox_id);
+                    return crop_box_info_json(*scene_manager, *cropbox_id);
                 });
             });
 
@@ -3717,7 +4735,7 @@ namespace lfs::app {
                     if (!result)
                         return json{{"error", result.error()}};
 
-                    return crop_box_info_json(*scene_manager, rendering_manager, *cropbox_id);
+                    return crop_box_info_json(*scene_manager, *cropbox_id);
                 });
             });
 
@@ -3747,7 +4765,9 @@ namespace lfs::app {
                     if (!ellipsoid_id)
                         return json{{"error", ellipsoid_id.error()}};
 
-                    return ellipsoid_info_json(*scene_manager, rendering_manager, *ellipsoid_id);
+                    scene_manager->selectNode(*ellipsoid_id);
+
+                    return ellipsoid_info_json(*scene_manager, *ellipsoid_id);
                 });
             });
 
@@ -3765,7 +4785,6 @@ namespace lfs::app {
 
                 return post_and_wait(viewer_impl, [viewer_impl, requested_node]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
-                    auto* const rendering_manager = viewer_impl->getRenderingManager();
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
 
@@ -3773,7 +4792,7 @@ namespace lfs::app {
                     if (!ellipsoid_id)
                         return json{{"error", ellipsoid_id.error()}};
 
-                    return ellipsoid_info_json(*scene_manager, rendering_manager, *ellipsoid_id);
+                    return ellipsoid_info_json(*scene_manager, *ellipsoid_id);
                 });
             });
 
@@ -3785,10 +4804,10 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"node", json{{"type", "string"}, {"description", "Optional ellipsoid node or parent node name; defaults to the current selected ellipsoid"}}},
-                        {"radii", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional ellipsoid radii"}}},
-                        {"translation", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional local XYZ translation"}}},
-                        {"rotation", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional local XYZ Euler rotation in radians"}}},
-                        {"scale", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional local XYZ scale"}}},
+                        {"radii", number_array_schema(3, "Optional ellipsoid radii")},
+                        {"translation", number_array_schema(3, "Optional local XYZ translation")},
+                        {"rotation", number_array_schema(3, "Optional local XYZ Euler rotation in radians")},
+                        {"scale", number_array_schema(3, "Optional local XYZ scale")},
                         {"inverse", json{{"type", "boolean"}, {"description", "Invert the ellipsoid selection volume"}}},
                         {"enabled", json{{"type", "boolean"}, {"description", "Enable ellipsoid filtering for this helper"}}},
                         {"show", json{{"type", "boolean"}, {"description", "Show ellipsoids in the viewport"}}},
@@ -3854,7 +4873,7 @@ namespace lfs::app {
                         return json{{"error", result.error()}};
                     }
 
-                    return ellipsoid_info_json(*scene_manager, rendering_manager, *ellipsoid_id);
+                    return ellipsoid_info_json(*scene_manager, *ellipsoid_id);
                 });
             });
 
@@ -3885,7 +4904,7 @@ namespace lfs::app {
                     if (auto result = fit_ellipsoid_to_parent(*scene_manager, rendering_manager, *ellipsoid_id, use_percentile); !result)
                         return json{{"error", result.error()}};
 
-                    return ellipsoid_info_json(*scene_manager, rendering_manager, *ellipsoid_id);
+                    return ellipsoid_info_json(*scene_manager, *ellipsoid_id);
                 });
             });
 
@@ -3914,7 +4933,7 @@ namespace lfs::app {
                     if (auto result = reset_ellipsoid(*scene_manager, rendering_manager, *ellipsoid_id); !result)
                         return json{{"error", result.error()}};
 
-                    return ellipsoid_info_json(*scene_manager, rendering_manager, *ellipsoid_id);
+                    return ellipsoid_info_json(*scene_manager, *ellipsoid_id);
                 });
             });
 
@@ -4056,7 +5075,7 @@ namespace lfs::app {
                     result["total_chars"] = static_cast<int64_t>(code.size());
                     result["modified"] = console.isModified();
                     if (!console.getScriptPath().empty())
-                        result["path"] = console.getScriptPath().string();
+                        result["path"] = core::path_to_utf8(console.getScriptPath());
                     return result;
                 });
             });
@@ -4343,15 +5362,29 @@ namespace lfs::app {
                             }
                             const auto rest_coefficients =
                                 static_cast<uint32_t>(node->model->max_sh_coeffs_rest());
-                            auto selected_sh = core::Tensor::empty(
-                                {resolved_indices.size(), static_cast<size_t>(rest_coefficients), size_t{3}},
-                                node->model->shN_raw().device());
-                            core::shN_swizzled_gather_to_linear(
-                                node->model->shN_raw().ptr<float>(),
-                                index_tensor.ptr<int>(),
-                                selected_sh.ptr<float>(),
-                                resolved_indices.size(),
-                                rest_coefficients);
+                            core::Tensor selected_sh;
+                            // q16 / IEEE-f16: dequant to [N,K,3] then index_select (no ptr<float> on codes).
+                            if (node->model->shN_raw().dtype() != core::DataType::Float32) {
+                                core::Tensor canon = node->model->shN_canonical();
+                                auto indices_for_select = index_tensor;
+                                if (indices_for_select.device() != canon.device())
+                                    indices_for_select = indices_for_select.to(canon.device());
+                                if (indices_for_select.dtype() != core::DataType::Int32 &&
+                                    indices_for_select.dtype() != core::DataType::Int64) {
+                                    indices_for_select = indices_for_select.to(core::DataType::Int32);
+                                }
+                                selected_sh = canon.index_select(0, indices_for_select).contiguous();
+                            } else {
+                                selected_sh = core::Tensor::empty(
+                                    {resolved_indices.size(), static_cast<size_t>(rest_coefficients), size_t{3}},
+                                    node->model->shN_raw().device());
+                                core::shN_swizzled_gather_to_linear(
+                                    node->model->shN_raw().ptr<float>(),
+                                    index_tensor.ptr<int>(),
+                                    selected_sh.ptr<float>(),
+                                    resolved_indices.size(),
+                                    rest_coefficients);
+                            }
                             field_payloads[field_name] = tensor_payload_json(selected_sh);
                             continue;
                         }
@@ -4452,7 +5485,7 @@ namespace lfs::app {
                 .is_visible = []() { return python::is_sequencer_visible(); },
                 .set_visible = [](const bool visible) { python::set_sequencer_visible(visible); },
                 .ui_state = []() { return python::get_sequencer_ui_state(); },
-                .add_keyframe = []() { core::events::cmd::SequencerAddKeyframe{}.emit(); },
+                .add_keyframe = [](const std::optional<float> time) { core::events::cmd::SequencerAddKeyframe{.time = time}.emit(); },
                 .update_selected_keyframe = []() { core::events::cmd::SequencerUpdateKeyframe{}.emit(); },
                 .select_keyframe = [](const size_t index) { core::events::cmd::SequencerSelectKeyframe{.keyframe_index = index}.emit(); },
                 .go_to_keyframe = [](const size_t index) { core::events::cmd::SequencerGoToKeyframe{.keyframe_index = index}.emit(); },
@@ -4467,14 +5500,21 @@ namespace lfs::app {
                 .load_path = [](const std::string& path) { return python::load_camera_path(path); },
                 .set_playback_speed = [](const float speed) { python::set_playback_speed(speed); },
                 .load_ply_sequence =
-                    [](const std::string& directory, const float fps) {
-                        core::events::cmd::SequencerLoadPlySequence{.directory = directory, .fps = fps}.emit();
-                    },
+                    [viewer_impl](const std::string& directory, const float fps) -> lfs::Result<void> {
+                    auto* const gui_manager = viewer_impl ? viewer_impl->getGuiManager() : nullptr;
+                    if (!gui_manager)
+                        return lfs::Result<void>::failure(lfs::make_error(lfs::ErrorInit{
+                            .code = lfs::ErrorCode::Unavailable,
+                            .domain = lfs::ErrorDomain::MCP,
+                            .user_message = "Sequencer unavailable",
+                            .detection = LFS_SOURCE_SITE_CURRENT()}));
+                    return gui_manager->sequencerUI().loadPlySequenceFromDirectory(core::utf8_to_path(directory), fps);
+                },
                 .scrub_to_time =
-                    [viewer_impl](const float time) {
+                    [viewer_impl](const float time, const bool update_camera) {
                         auto* const gui_manager = viewer_impl ? viewer_impl->getGuiManager() : nullptr;
-                        if (gui_manager)
-                            gui_manager->sequencer().seek(time);
+                        return gui_manager &&
+                               gui_manager->sequencerUI().scrubToTime(time, update_camera);
                     },
                 .ply_sequence_status =
                     [viewer_impl]() -> std::string {
@@ -4511,7 +5551,7 @@ namespace lfs::app {
                         return json{{"success", false}, {"error", result.error}};
 
                     if (auto* const rendering_manager = viewer->getRenderingManager())
-                        rendering_manager->markDirty(vis::DirtyFlag::ALL);
+                        rendering_manager->markDirty(vis::DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
 
                     try {
                         return json::parse(result.result_json);
@@ -4568,7 +5608,7 @@ namespace lfs::app {
                 if (include_render) {
                     int camera_index = args.value("camera_index", 0);
                     auto render_result = post_and_wait(viewer, [viewer, camera_index]() {
-                        return render_scene_to_base64(viewer->getScene(), camera_index);
+                        return render_dataset_camera_to_base64(viewer, camera_index, 0, 0);
                     });
                     if (render_result)
                         base64_render = *render_result;
@@ -4617,7 +5657,7 @@ namespace lfs::app {
                 const std::string description = args["description"].get<std::string>();
 
                 auto render_result = post_and_wait(viewer_impl, [viewer_impl, camera_index]() {
-                    return render_scene_to_base64(viewer_impl->getScene(), camera_index);
+                    return render_dataset_camera_to_base64(viewer_impl, camera_index, 0, 0);
                 });
                 if (!render_result)
                     return json{{"error", render_result.error()}};
@@ -4670,8 +5710,9 @@ namespace lfs::app {
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
 
-                    auto result = selection_result_json(*scene_manager,
-                                                        scene_manager->selectRect(x0, y0, x1, y1, "replace", camera_index));
+                    auto result = selection_result_json(*scene_manager, [&] {
+                        return scene_manager->selectRect(x0, y0, x1, y1, "replace", camera_index);
+                    });
                     if (!result.value("success", false))
                         return result;
                     result["bounding_box"] = bbox;
@@ -4679,8 +5720,6 @@ namespace lfs::app {
                     return result;
                 });
             });
-
-        LOG_INFO("Registered GUI-native MCP scene tools");
     }
 
     void register_gui_scene_resources(vis::Visualizer* viewer) {
@@ -4754,7 +5793,7 @@ namespace lfs::app {
                         {"output_total_chars", static_cast<int64_t>(console.getOutputText().size())},
                     };
                     if (!console.getScriptPath().empty())
-                        payload["path"] = console.getScriptPath().string();
+                        payload["path"] = core::path_to_utf8(console.getScriptPath());
 
                     return single_json_resource(uri, std::move(payload));
                 });
@@ -4767,7 +5806,7 @@ namespace lfs::app {
                 .description = "Base64-encoded PNG capture of the live viewport region only; excludes panels, toolbars, and other window UI",
                 .mime_type = "image/png"},
             [viewer](const std::string& uri) -> std::expected<std::vector<McpResourceContent>, std::string> {
-                auto result = post_and_wait(viewer, [viewer]() {
+                auto result = capture_after_gui_render(viewer, [viewer]() {
                     return capture_live_viewport_to_base64(viewer);
                 });
                 if (!result)
@@ -4797,7 +5836,7 @@ namespace lfs::app {
             [viewer](const std::string& uri) -> std::expected<std::vector<McpResourceContent>, std::string> {
                 std::expected<std::string, std::string> result = std::unexpected("Unknown resource URI: " + uri);
                 if (uri == "lichtfeld://render/current") {
-                    result = post_and_wait(viewer, [viewer]() {
+                    result = capture_after_gui_render(viewer, [viewer]() {
                         return capture_live_viewport_to_base64(viewer);
                     });
                 } else if (uri == "lichtfeld://render/window") {
@@ -4824,7 +5863,7 @@ namespace lfs::app {
                 }
 
                 auto result = post_and_wait(viewer, [viewer, camera_index]() {
-                    return render_scene_to_base64(viewer->getScene(), camera_index);
+                    return render_dataset_camera_to_base64(viewer, camera_index, 0, 0);
                 });
                 if (!result)
                     return std::unexpected(result.error());
@@ -4841,6 +5880,8 @@ namespace lfs::app {
             [viewer](const std::string& uri) -> std::expected<std::vector<McpResourceContent>, std::string> {
                 return post_and_wait(viewer, [viewer, uri]() -> std::expected<std::vector<McpResourceContent>, std::string> {
                     json payload;
+                    if (auto* const scene_manager = viewer->getSceneManager())
+                        scene_manager->completePendingSelectionCounts();
                     auto& scene = viewer->getScene();
                     payload["count"] = scene.getTotalGaussianCount();
 
@@ -4864,6 +5905,8 @@ namespace lfs::app {
                 .mime_type = "application/json"},
             [viewer](const std::string& uri) -> std::expected<std::vector<McpResourceContent>, std::string> {
                 return post_and_wait(viewer, [viewer, uri]() -> std::expected<std::vector<McpResourceContent>, std::string> {
+                    if (auto* const scene_manager = viewer->getSceneManager())
+                        scene_manager->completePendingSelectionCounts();
                     auto payload = selection_state_json(viewer->getScene());
                     payload["success"] = true;
                     return single_json_resource(uri, std::move(payload));
@@ -4909,11 +5952,12 @@ namespace lfs::app {
                         return std::unexpected("Scene manager not initialized");
 
                     const auto& scene = scene_manager->getScene();
+                    SceneNodeCounts counts(scene);
                     json nodes = json::array();
                     for (const auto* const node : scene.getNodes()) {
                         if (!node)
                             continue;
-                        nodes.push_back(node_summary_json(scene, *node));
+                        nodes.push_back(node_summary_json(scene, *node, &counts));
                     }
 
                     return single_json_resource(uri, json{{"count", nodes.size()}, {"nodes", std::move(nodes)}});
@@ -4933,10 +5977,11 @@ namespace lfs::app {
                         return std::unexpected("Scene manager not initialized");
 
                     const auto& scene = scene_manager->getScene();
+                    SceneNodeCounts counts(scene);
                     json nodes = json::array();
                     for (const auto& name : scene_manager->getSelectedNodeNames()) {
                         if (const auto* const node = scene.getNode(name))
-                            nodes.push_back(node_summary_json(scene, *node));
+                            nodes.push_back(node_summary_json(scene, *node, &counts));
                     }
 
                     return single_json_resource(uri, json{{"count", nodes.size()}, {"nodes", std::move(nodes)}});

@@ -25,12 +25,29 @@
         <span class="slider-value">{{render_scale | format_float(2)}}</span>
       </div>
     </div>
+    <div class="setting-row setting-row--aligned" data-tooltip="tooltip.color_tonemapping">
+      <span class="setting-row__label-col">{{label_color_tonemapping}}</span>
+      <div class="setting-row__control-col setting-row__control-col--fill">
+        <select data-value="color_tonemapping">
+          <option value="none">@tr:export.none</option><option value="linear">@tr:scene.keyframe_easing.linear</option>
+          <option value="filmic">@tr:rendering.tonemapping.filmic</option><option value="hejl">Hejl</option>
+          <option value="aces">ACES</option><option value="aces2">ACES 2</option><option value="neutral">@tr:rendering.tonemapping.neutral</option>
+        </select>
+      </div>
+    </div>
+    <div class="setting-row setting-row--aligned" data-tooltip="tooltip.color_exposure">
+      <span class="setting-row__label-col">{{label_color_exposure}}</span>
+      <div class="setting-row__control-col setting-row__control-col--slider">
+        <input type="range" class="setting-slider" data-value="color_exposure" min="0.1" max="8" step="0.01" data-attrif-disabled="color_tonemapping == 'none'"/>
+        <span class="slider-value">{{color_exposure | format_float(2)}}×</span>
+      </div>
+    </div>
     <div class="setting-row setting-row--aligned" data-tooltip="tooltip.environment_mode">
       <span class="setting-row__label-col">{{label_environment_mode}}</span>
       <div class="setting-row__control-col setting-row__control-col--fill">
         <select data-value="environment_mode">
-          <option value="SOLID_COLOR" data-tooltip="tooltip.opt.environment_mode.solid_color">Solid Color</option>
-          <option value="EQUIRECTANGULAR" data-tooltip="tooltip.opt.environment_mode.equirect">Equirectangular HDRI</option>
+          <option value="SOLID_COLOR" data-tooltip="tooltip.opt.environment_mode.solid_color">@tr:ui.solid_color</option>
+          <option value="EQUIRECTANGULAR" data-tooltip="tooltip.opt.environment_mode.equirect">@tr:ui.equirectangular_hdri</option>
         </select>
       </div>
     </div>
@@ -90,7 +107,17 @@
         <input type="checkbox" data-checked="show_pivot" />
       </label>
     </div>
-    <div class="setting-row setting-row--aligned" data-tooltip="tooltip.grid">
+    <div class="setting-row setting-row--aligned" data-tooltip="preferences.navigation_up_help">
+      <span class="setting-row__label-col">@tr:preferences.navigation_up_axis</span>
+      <div class="setting-row__control-col setting-row__control-col--fill">
+        <select data-value="navigation_up_idx">
+          <option value="0">@tr:preferences.navigation_up_legacy_y</option>
+          <option value="1">@tr:preferences.navigation_up_data_z</option>
+        </select>
+      </div>
+    </div>
+    <div class="text-muted">@tr:preferences.navigation_project_hint</div>
+    <div class="setting-row setting-row--aligned" data-tooltip="tooltip.grid" data-keymap-action="toggle_grid">
       <span class="setting-row__label-col">{{label_show_grid}}</span>
       <label class="setting-row__control-col setting-row__control-col--checkbox">
         <input type="checkbox" data-checked="show_grid" />
@@ -99,12 +126,13 @@
     <div data-if="show_grid">
       <div class="setting-row setting-row--aligned" data-tooltip="tooltip.grid_plane">
         <span class="setting-row__label-col">{{label_grid_plane}}</span>
-        <div class="setting-row__control-col setting-row__control-col--fill">
+        <div class="setting-row__control-col setting-row__control-col--fill rendering-grid-plane">
           <select data-value="grid_plane">
-            <option value="0" data-tooltip="tooltip.opt.grid_plane.yz">YZ (Right)</option>
-            <option value="1" data-tooltip="tooltip.opt.grid_plane.xz">XZ (Top)</option>
-            <option value="2" data-tooltip="tooltip.opt.grid_plane.xy">XY (Front)</option>
+            <option value="0" data-tooltip="tooltip.opt.grid_plane.yz">@tr:ui.grid_plane_yz</option>
+            <option value="1" data-tooltip="tooltip.opt.grid_plane.xz">@tr:ui.grid_plane_xz</option>
+            <option value="2" data-tooltip="tooltip.opt.grid_plane.xy">@tr:ui.grid_plane_xy</option>
           </select>
+          <button class="btn btn--secondary" data-event-click="align_navigation_grid" data-tooltip="preferences.align_navigation_grid">@tr:preferences.align_grid_short</button>
         </div>
       </div>
       <div class="setting-row setting-row--aligned" data-tooltip="tooltip.grid_opacity">
@@ -115,7 +143,7 @@
         </div>
       </div>
     </div>
-    <div class="setting-row setting-row--aligned" data-tooltip="tooltip.camera_frustums">
+    <div class="setting-row setting-row--aligned" data-tooltip="tooltip.camera_frustums" data-keymap-action="toggle_camera_frustums">
       <span class="setting-row__label-col">{{label_show_camera_frustums}}</span>
       <label class="setting-row__control-col setting-row__control-col--checkbox">
         <input type="checkbox" data-checked="show_camera_frustums" />
@@ -146,7 +174,7 @@
       </div>
     </div>
     <div class="setting-row setting-row--aligned">
-      <span class="setting-row__label-col">FOV:</span>
+      <span class="setting-row__label-col">@tr:main_panel.fov</span>
       <div class="setting-row__control-col setting-row__control-col--fill">
         <span class="text-disabled">{{fov_display}}</span>
       </div>
@@ -187,9 +215,9 @@
       <span class="setting-row__label-col">{{label_camera_metrics_mode}}</span>
       <div class="setting-row__control-col setting-row__control-col--fill">
         <select data-value="camera_metrics_mode">
-          <option value="OFF" data-tooltip="tooltip.opt.camera_metrics.off">Off</option>
-          <option value="PSNR" data-tooltip="tooltip.opt.camera_metrics.psnr">PSNR</option>
-          <option value="PSNR_SSIM" data-tooltip="tooltip.opt.camera_metrics.psnr_ssim">PSNR + SSIM</option>
+          <option value="OFF" data-tooltip="tooltip.opt.camera_metrics.off">@tr:ui.off</option>
+          <option value="PSNR" data-tooltip="tooltip.opt.camera_metrics.psnr">@tr:ui.psnr</option>
+          <option value="PSNR_SSIM" data-tooltip="tooltip.opt.camera_metrics.psnr_ssim">@tr:ui.psnr_ssim</option>
         </select>
       </div>
     </div>
@@ -365,16 +393,6 @@
       </label>
     </div>
 
-    <div class="setting-row setting-row--aligned" data-tooltip="tooltip.selection_color_committed">
-      <span class="setting-row__label-col">{{label_selection_color_committed}}</span>
-      <div class="setting-row__control-col setting-row__control-col--color">
-        <span class="color-comp">{{selection_color_committed_r}}</span>
-        <span class="color-comp">{{selection_color_committed_g}}</span>
-        <span class="color-comp">{{selection_color_committed_b}}</span>
-        <div class="color-swatch" id="swatch-selection_color_committed" data-event-click="color_click('selection_color_committed')"></div>
-        <input type="text" class="color-hex" data-value="selection_color_committed_hex" />
-      </div>
-    </div>
     <div class="setting-row setting-row--aligned" data-tooltip="tooltip.selection_color_preview">
       <span class="setting-row__label-col">{{label_selection_color_preview}}</span>
       <div class="setting-row__control-col setting-row__control-col--color">
@@ -394,6 +412,34 @@
         <div class="color-swatch" id="swatch-selection_color_center_marker" data-event-click="color_click('selection_color_center_marker')"></div>
         <input type="text" class="color-hex" data-value="selection_color_center_marker_hex" />
       </div>
+    </div>
+
+    <div class="selection-groups">
+      <div class="selection-groups__title">{{label_selection_groups}}</div>
+      <button type="button" class="btn btn--secondary btn--full" data-event-click="selection_group_add">{{label_add_selection_group}}</button>
+      <div id="selection-groups-list">
+        <div class="group-row"
+             data-for="group : selection_groups"
+             data-class-active="group.active"
+             data-attr-data-gid="group.gid">
+          <button type="button"
+                  class="icon-btn lock-btn"
+                  data-action="lock"
+                  data-attr-data-gid="group.gid">
+            <img data-attr-sprite="group.lock_sprite" />
+          </button>
+          <button type="button"
+                  class="color-swatch"
+                  data-action="color"
+                  data-attr-data-gid="group.gid"
+                  data-style-background-color="group.color_css"></button>
+          <button type="button"
+                  class="group-name"
+                  data-action="select"
+                  data-attr-data-gid="group.gid">{{ group.label }}</button>
+        </div>
+      </div>
+      <span class="empty-message" data-if="show_no_selection_groups">{{label_no_selection_groups}}</span>
     </div>
   </div>
 
@@ -515,8 +561,8 @@
         <span class="setting-row__label-col">{{label_ppisp_mode}}</span>
         <div class="setting-row__control-col setting-row__control-col--fill">
           <select data-value="ppisp_mode">
-            <option value="MANUAL" data-tooltip="tooltip.opt.ppisp_mode.manual">Manual</option>
-            <option value="AUTO" data-tooltip="tooltip.opt.ppisp_mode.auto">Auto (Controller)</option>
+            <option value="MANUAL" data-tooltip="tooltip.opt.ppisp_mode.manual">@tr:ui.manual</option>
+            <option value="AUTO" data-tooltip="tooltip.opt.ppisp_mode.auto">@tr:ui.auto_controller</option>
           </select>
         </div>
       </div>

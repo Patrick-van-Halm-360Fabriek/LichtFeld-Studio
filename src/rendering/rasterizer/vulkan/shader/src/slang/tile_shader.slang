@@ -25,13 +25,6 @@ import utils;
 #define ENTRY 0
 #endif
 
-// LFS_VISIBLE_BOUNDED=1 (HiGS chain): the primitive domain is the compact
-// visible set, bounded by a GPU-resident count instead of uniforms.num_splats,
-// and the cumsum tail lives at [visible_count - 1].
-#ifndef LFS_VISIBLE_BOUNDED
-#define LFS_VISIBLE_BOUNDED 0
-#endif
-
 static const uint32_t FLOAT32_FRACTION_BITS = 23;
 
 
@@ -61,11 +54,7 @@ layout(binding=4) StructuredBuffer<int32_t> primitive_sort_indices;
 
 layout(binding=5) RWStructuredBuffer<sortingKey_t> out_unsorted_keys;
 layout(binding=6) RWStructuredBuffer<int32_t> out_unsorted_gauss_idx;
-#if LFS_VISIBLE_BOUNDED
-layout(binding=7) StructuredBuffer<uint32_t> visible_count;
-#else
 layout(binding=7) StructuredBuffer<uint32_t> depth_wave_dispatch;
-#endif
 
 #define BLOCK_SIZE 64
 #define NUM_SUBGROUPS (BLOCK_SIZE / SUBGROUP_SIZE)
@@ -83,9 +72,6 @@ void main(
     const uint grid_width = uniforms.grid_width;
     const bool wrap_x = base_camera_model(uniforms.camera_model) == uint(CameraModel::EQUIRECTANGULAR);
 
-#if LFS_VISIBLE_BOUNDED
-    int32_t depth_rank = dispatchThreadID.x;
-#else
     const uint record = (1u + uniforms.depth_wave) * LFS_VK_DEPTH_WAVE_RECORD_STRIDE_WORDS;
     const uint local_rank = dispatchThreadID.x;
     const uint rank_count = depth_wave_dispatch[record + LFS_VK_DEPTH_WAVE_RANK_COUNT_WORD];
@@ -93,26 +79,14 @@ void main(
         return;
     int32_t depth_rank = int32_t(
         depth_wave_dispatch[record + LFS_VK_DEPTH_WAVE_RANK_BASE_WORD] + local_rank);
-#endif
 
-#if LFS_VISIBLE_BOUNDED
-    // The cumsum only covers [0, visible_count) entries; offsets past it are
-    // uninitialized, so this bound is a correctness gate, not an optimization.
-    if (uint32_t(depth_rank) >= min(visible_count[0], uint32_t(uniforms.num_splats)))
-        return;
-#else
     if (depth_rank >= uniforms.num_splats)
         return;
-#endif
 
     // index_buffer_offset is cumsum'd over the depth-ordered tiles_touched
     // array, so the offset interval for this depth_rank is contiguous.
-#if LFS_VISIBLE_BOUNDED
-    const int instance_base = 0;
-#else
     const int instance_base =
         int(depth_wave_dispatch[record + LFS_VK_DEPTH_WAVE_INSTANCE_BASE_WORD]);
-#endif
     int offset = (depth_rank == 0 ? 0 : index_buffer_offset[depth_rank-1]) - instance_base;
     int offset_max = index_buffer_offset[depth_rank] - instance_base;
     const int sort_capacity = int(uniforms.sort_capacity);
@@ -125,6 +99,16 @@ void main(
 #if TILE_CULLING_MODE > 0
     float2 xy = read_t2_float2(primitive_idx, xy_vs);
     float4 inv_cov_opac = read_t4_float4(primitive_idx, inv_cov_vs_opacity);
+
+    if (uniforms.splat_render_profile == 1u &&
+        is_gut_projection_mode(uniforms.camera_model) && (uniforms.lod_enabled & 4u) == 0u) {
+        // The vertex pass counts tiles using an ellipse enclosing the capped
+        // portal quad. Emit that same ellipse; the stored inverse covariance
+        // remains uncapped for the fragment shader's ray and quad evaluation.
+        const uint camera_height = uniforms.camera_height == 0 ? image_height : uniforms.camera_height;
+        const uint camera_width = uniforms.camera_width == 0 ? image_width : uniforms.camera_width;
+        inv_cov_opac.xyz = portal_gut_bin_inverse(inv_cov_opac.xyz, camera_width, camera_height);
+    }
 
     float extend = extend_from_opacity(inv_cov_opac.w);
     float3 inv_cov = inv_cov_opac.xyz / (extend*extend);
@@ -140,6 +124,15 @@ void main(
     rectangle rect = reinterpret<rectangle>(rect_tile_space[primitive_idx]);
   #endif
 
+    // Preserve the full image's ellipse scan direction. Clipping the rectangle
+    // first can switch axes and change which boundary tiles survive rounding.
+    const bool scan_rows = rect.max_y - rect.min_y <= rect.max_x - rect.min_x;
+    const uint2 tile_origin = full_frame_binning(uniforms)
+        ? uint2(uniforms.render_origin_x / TILE_WIDTH, uniforms.render_origin_y / TILE_HEIGHT)
+        : uint2(0u);
+    if (full_frame_binning(uniforms))
+        rect = clip_to_render_grid(rect, uniforms);
+
 #if TILE_CULLING_MODE == 0 || TILE_CULLING_MODE == 1
 
     for (uint16_t y = rect.min_y; y < rect.max_y; y++) {
@@ -147,7 +140,7 @@ void main(
             if (offset >= offset_max)
                 return;
             uint32_t key_x = wrap_x ? uint32_t(x) % grid_width : uint32_t(x);
-            uint32_t key = uint32_t(y) * grid_width + key_x;
+            uint32_t key = (uint32_t(y) - tile_origin.y) * grid_width + key_x - tile_origin.x;
             out_unsorted_keys[offset] = sortingKey_t(key);
             out_unsorted_gauss_idx[offset] = primitive_idx;
             offset++;
@@ -161,7 +154,8 @@ void main(
     if (wrap_x) {
         for (uint16_t y = rect.min_y; y < rect.max_y; y++) {
             for (uint16_t x = rect.min_x; x < rect.max_x && offset < offset_max; x++) {
-                uint32_t key = uint32_t(y) * grid_width + (uint32_t(x) % grid_width);
+                uint32_t key = (uint32_t(y) - tile_origin.y) * grid_width +
+                    (uint32_t(x) % grid_width) - tile_origin.x;
                 out_unsorted_keys[offset] = sortingKey_t(key);
                 out_unsorted_gauss_idx[offset] = primitive_idx;
                 offset++;
@@ -170,7 +164,7 @@ void main(
         return;
     }
 
-    if (rect.max_y-rect.min_y <= rect.max_x-rect.min_x) {
+    if (scan_rows) {
         for (uint16_t y = rect.min_y; y < rect.max_y; y++) {
             float y0 = y * TILE_HEIGHT - xy.y;
             float y1 = y0 + TILE_HEIGHT;
@@ -185,7 +179,7 @@ void main(
                 rect.min_x, rect.max_x
             ));
             for (uint16_t x = min_x; x < max_x && offset < offset_max; x++) {
-                uint32_t key = uint32_t(y) * grid_width + uint32_t(x);
+                uint32_t key = (uint32_t(y) - tile_origin.y) * grid_width + uint32_t(x) - tile_origin.x;
                 out_unsorted_keys[offset] = sortingKey_t(key);
                 out_unsorted_gauss_idx[offset] = primitive_idx;
                 offset++;
@@ -207,7 +201,7 @@ void main(
                 rect.min_y, rect.max_y
             ));
             for (uint16_t y = min_y; y < max_y && offset < offset_max; y++) {
-                uint32_t key = uint32_t(y) * grid_width + uint32_t(x);
+                uint32_t key = (uint32_t(y) - tile_origin.y) * grid_width + uint32_t(x) - tile_origin.x;
                 out_unsorted_keys[offset] = sortingKey_t(key);
                 out_unsorted_gauss_idx[offset] = primitive_idx;
                 offset++;

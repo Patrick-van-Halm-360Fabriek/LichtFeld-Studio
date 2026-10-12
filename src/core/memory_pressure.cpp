@@ -3,6 +3,7 @@
 
 #include "core/memory_pressure.hpp"
 
+#include "core/alloc_counter.hpp"
 #include "core/checked_arithmetic.hpp"
 #include "core/cuda_error.hpp"
 #include "core/environment.hpp"
@@ -23,23 +24,6 @@
 #include <vector>
 
 namespace lfs::core {
-
-    const char* to_string(MemoryDomain domain) noexcept {
-        switch (domain) {
-        case MemoryDomain::CudaDevice: return "cuda-device";
-        case MemoryDomain::CudaVmm: return "cuda-vmm";
-        case MemoryDomain::VulkanDevice: return "vulkan-device";
-        case MemoryDomain::PinnedHost: return "pinned-host";
-        case MemoryDomain::PageableHost: return "pageable-host";
-        }
-        return "unknown";
-    }
-
-    bool is_device_heap(MemoryDomain domain) noexcept {
-        return domain == MemoryDomain::CudaDevice ||
-               domain == MemoryDomain::CudaVmm ||
-               domain == MemoryDomain::VulkanDevice;
-    }
 
     namespace {
 
@@ -99,6 +83,7 @@ namespace lfs::core {
             const auto pre_call_state = sample_cuda_pre_call_state();
             const cudaError_t status = cudaMalloc(&ptr, bytes);
             if (status == cudaSuccess) {
+                alloc_counter::record_site(alloc_counter::Site::ZerosDirect);
                 return ptr;
             }
             if (failure_status) {
@@ -297,6 +282,10 @@ namespace lfs::core {
             if (mode == CudaStorageMode::Direct) {
                 return try_allocate_direct_cuda_storage(bytes, failure_status);
             }
+            if (mode == CudaStorageMode::ExactAsync) {
+                return CudaMemoryPool::instance().try_allocate_exact_async(
+                    bytes, stream, failure_status);
+            }
             return CudaMemoryPool::instance().try_allocate(bytes, stream, failure_status);
         };
 
@@ -327,6 +316,9 @@ namespace lfs::core {
         if (coordinator.relieve_and_should_retry(failure)) {
             ptr = try_allocate(&failure_status);
         }
+        // A handled OOM and pressure-client reclaim can leave CUDA's last-error
+        // state sticky. Consume it before returning control to later CUDA work.
+        (void)cudaGetLastError();
         if (ptr == nullptr) {
             if (cuda_is_unavailable()) {
                 throw_cuda_unavailable_allocation(bytes, stream, label, operation);
@@ -394,8 +386,15 @@ namespace lfs::core {
         }
 
         const uint64_t episode_id = impl_->episode_counter.fetch_add(1) + 1;
-        impl_->pressure_active.store(true);
-        impl_->last_target_free.store(target);
+        // Preview degradation belongs to failures that reached the frame boundary.
+        // Training allocations share the device heap, but their retry episodes must
+        // neither lower viewer quality nor replace its recovery target.
+        const bool viewer_failure = context == PressureContext::RenderThread &&
+                                    is_device_heap(failure.domain);
+        if (viewer_failure) {
+            impl_->pressure_active.store(true);
+            impl_->last_target_free.store(target);
+        }
 
         PressureRequest request{
             .domain = failure.domain,
@@ -432,6 +431,11 @@ namespace lfs::core {
 
         const size_t free_after = impl_->query_free(failure.domain);
         const bool satisfied = !is_device_heap(failure.domain) || free_after >= target;
+        if (viewer_failure && satisfied) {
+            // Reclaim already freed enough for the failed viewer allocation and its
+            // reserve. Retry at full quality instead of waiting for extra headroom.
+            impl_->pressure_active.store(false);
+        }
         const size_t observed_released = free_after > free_before ? free_after - free_before : 0;
 
         record_cuda_breadcrumb("memory-pressure.episode", __FILE__, __LINE__);
@@ -535,6 +539,11 @@ namespace lfs::core {
         if (!impl_->pressure_active.load()) {
             return;
         }
+        // Do not clear a lease while another thread is recording a new failure.
+        std::unique_lock episode_lock(impl_->episode_mutex, std::try_to_lock);
+        if (!episode_lock.owns_lock()) {
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now - impl_->last_recover_check < std::chrono::milliseconds(250)) {
             return;
@@ -595,6 +604,7 @@ namespace lfs::core {
         impl_->episode_counter.store(0);
         impl_->pressure_active.store(false);
         impl_->last_target_free.store(0);
+        impl_->last_recover_check = {};
         {
             std::lock_guard<std::mutex> lock(impl_->status_mutex);
             impl_->last_status.clear();

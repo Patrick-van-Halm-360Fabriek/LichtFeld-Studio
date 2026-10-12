@@ -22,6 +22,10 @@ layout(push_constant) uniform FrustumPush {
     vec4 viewport_rect;
     // x: depth available, y: flip-y depth UV, z: line thickness, w: projection mode.
     vec4 params;
+    // Valid-region UV for padded splat depth (consumed by shape_overlay.frag).
+    vec4 uv_region;
+    // Zero for linear depth; otherwise clip-z/clip-w projection coefficients.
+    vec4 ndc_to_view_coeffs;
     mat4 view;
     vec4 viewport_panel;
     vec4 projection;

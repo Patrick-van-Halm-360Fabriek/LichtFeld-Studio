@@ -618,6 +618,7 @@ namespace lfs::rendering {
             }
         }
 
+        template <bool Scoped>
         __global__ void filterSelectionByCropKernel(
             bool* __restrict__ selection,
             const float3* __restrict__ means,
@@ -631,10 +632,16 @@ namespace lfs::rendering {
             const float* __restrict__ model_transforms,
             const int* __restrict__ transform_indices,
             const int num_model_transforms,
+            const int parent_node_index,
             const int n) {
             const int idx = blockIdx.x * blockDim.x + threadIdx.x;
             if (idx >= n || !selection[idx]) {
                 return;
+            }
+            if constexpr (Scoped) {
+                if ((transform_indices ? transform_indices[idx] : 0) != parent_node_index) {
+                    return;
+                }
             }
 
             float3 pos = means[idx];
@@ -890,10 +897,10 @@ namespace lfs::rendering {
             visibility_ptr,
             visibility_count);
         LFS_CUDA_LAUNCH_CHECK(stream, "render.selection.project_screen");
-        if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-            throw std::runtime_error(std::string("projectScreenPositionsKernel: ") + cudaGetErrorString(status));
-        }
-
+        // Selection consumers enqueue their test on the same stream. The
+        // previous fence made projection a synchronous 3.3M-row round trip;
+        // stream ordering is sufficient here and lets commit/readback remain
+        // independently asynchronous.
         return output;
     }
 
@@ -1133,6 +1140,41 @@ namespace lfs::rendering {
         LFS_CUDA_LAUNCH_CHECK(stream, "render.selection.apply_group_indexed_mask");
     }
 
+    void count_selection_groups_async(const Tensor& selection_mask,
+                                      Tensor& counts_scratch) {
+        if (!selection_mask.is_valid() || selection_mask.numel() == 0) {
+            return;
+        }
+        if (selection_mask.device() != lfs::core::Device::CUDA) {
+            throw std::runtime_error("count_selection_groups_async requires a CUDA mask");
+        }
+
+        prepareSelectionGroupCountsScratch(counts_scratch);
+
+        const int n = checkedToInt(selection_mask.numel(), "selection mask size exceeds int range");
+        const int grid_size = std::min((n + kBlockSize - 1) / kBlockSize, kCountMaxBlocks);
+        countSelectionGroupsKernel<<<grid_size, kBlockSize, 0, currentSelectionStream(&counts_scratch)>>>(
+            selection_mask.ptr<uint8_t>(),
+            n,
+            counts_scratch.ptr<int>());
+        LFS_CUDA_LAUNCH_CHECK(currentSelectionStream(&counts_scratch), "render.selection.count_groups");
+    }
+
+    void enqueue_selection_group_count_read(const Tensor& counts_scratch,
+                                            int* const pinned_host_counts,
+                                            const cudaEvent_t ready_event) {
+        if (!counts_scratch.is_valid() || pinned_host_counts == nullptr || ready_event == nullptr) {
+            throw std::runtime_error("invalid asynchronous selection-count destination");
+        }
+        const cudaStream_t stream = currentSelectionStream(&counts_scratch);
+        LFS_CUDA_CHECK(cudaMemcpyAsync(pinned_host_counts,
+                                       counts_scratch.ptr<int>(),
+                                       (kSelectionGroupScratchWords) * sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       stream));
+        LFS_CUDA_CHECK(cudaEventRecord(ready_event, stream));
+    }
+
     std::array<size_t, 256> count_selection_groups(
         const Tensor& selection_mask,
         Tensor& counts_scratch) {
@@ -1153,15 +1195,7 @@ namespace lfs::rendering {
             return result;
         }
 
-        prepareSelectionGroupCountsScratch(counts_scratch);
-
-        const int n = checkedToInt(selection_mask.numel(), "selection mask size exceeds int range");
-        const int grid_size = std::min((n + kBlockSize - 1) / kBlockSize, kCountMaxBlocks);
-        countSelectionGroupsKernel<<<grid_size, kBlockSize, 0, currentSelectionStream(&counts_scratch)>>>(
-            selection_mask.ptr<uint8_t>(),
-            n,
-            counts_scratch.ptr<int>());
-        LFS_CUDA_LAUNCH_CHECK(currentSelectionStream(&counts_scratch), "render.selection.count_groups");
+        count_selection_groups_async(selection_mask, counts_scratch);
 
         return read_selection_group_counts(counts_scratch);
     }
@@ -1266,7 +1300,8 @@ namespace lfs::rendering {
         const Tensor* const ellipsoid_radii,
         const bool ellipsoid_inverse,
         const Tensor* const model_transforms,
-        const Tensor* const transform_indices) {
+        const Tensor* const transform_indices,
+        const int parent_node_index) {
         if (!selection.is_valid() || !means.is_valid()) {
             return;
         }
@@ -1311,21 +1346,29 @@ namespace lfs::rendering {
         }
 
         const int grid_size = (n + kBlockSize - 1) / kBlockSize;
-        filterSelectionByCropKernel<<<grid_size, kBlockSize, 0, currentSelectionStream(&selection)>>>(
-            selection.ptr<bool>(),
-            reinterpret_cast<const float3*>(means.ptr<float>()),
-            crop_t_ptr,
-            crop_min_ptr,
-            crop_max_ptr,
-            crop_inverse,
-            ellip_t_ptr,
-            ellip_radii_ptr,
-            ellipsoid_inverse,
-            prepared_transforms.ptr,
-            transform_indices_ptr,
-            prepared_transforms.count,
-            n);
-        LFS_CUDA_LAUNCH_CHECK(currentSelectionStream(&selection), "render.selection.filter_crop");
+        const auto launch = [&]<bool Scoped>() {
+            filterSelectionByCropKernel<Scoped><<<grid_size, kBlockSize, 0, currentSelectionStream(&selection)>>>(
+                selection.ptr<bool>(),
+                reinterpret_cast<const float3*>(means.ptr<float>()),
+                crop_t_ptr,
+                crop_min_ptr,
+                crop_max_ptr,
+                crop_inverse,
+                ellip_t_ptr,
+                ellip_radii_ptr,
+                ellipsoid_inverse,
+                prepared_transforms.ptr,
+                transform_indices_ptr,
+                prepared_transforms.count,
+                parent_node_index,
+                n);
+            LFS_CUDA_LAUNCH_CHECK(currentSelectionStream(&selection), "render.selection.filter_crop");
+        };
+        if (parent_node_index >= 0) {
+            launch.template operator()<true>();
+        } else {
+            launch.template operator()<false>();
+        }
     }
 
     namespace config {

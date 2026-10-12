@@ -68,8 +68,10 @@ namespace lfs::vis {
             const int camera_uid,
             const PPISPOverrides& overrides,
             const lfs::training::PPISPRegion& region = {},
-            const lfs::core::Tensor& controller_params = {}) {
-            const bool was_hwc = (rgb.ndim() == 3 && rgb.shape()[2] == 3);
+            const lfs::core::Tensor& controller_params = {},
+            const bool training_viewport = false) {
+            const bool was_hwc = rgb.ndim() == 3 &&
+                                 (training_viewport ? rgb.shape()[0] != 3 : rgb.shape()[2] == 3);
             const auto input = was_hwc ? rgb.permute({2, 0, 1}).contiguous() : rgb;
             const bool is_training_camera = ppisp.is_known_frame(camera_uid);
             const int camera_idx = is_training_camera ? ppisp.camera_index(ppisp.camera_for_frame(camera_uid)) : 0;
@@ -92,15 +94,22 @@ namespace lfs::vis {
                              ? ppisp.apply(input, camera_id, camera_uid, region)
                              : ppisp.apply_with_overrides(
                                    input, camera_id, camera_uid, toRenderOverrides(overrides), region);
-            } else {
-                // Keep manual overrides active on novel views by anchoring them to any valid learned PPISP
-                // frame/camera pair when no controller is available.
+            } else if (training_viewport) {
                 const int fallback_camera = ppisp.any_camera_id();
                 const int fallback_frame = ppisp.any_frame_uid();
                 result = overrides.isIdentity()
                              ? ppisp.apply(input, fallback_camera, fallback_frame, region)
-                             : ppisp.apply_with_overrides(
-                                   input, fallback_camera, fallback_frame, toRenderOverrides(overrides), region);
+                             : ppisp.apply_with_overrides(input, fallback_camera, fallback_frame,
+                                                          toRenderOverrides(overrides), region);
+            } else {
+                // Eval convention: identity colour, 0 EV, camera-level vignetting/CRF
+                // (physical camera with the most registered frames). Manual overrides
+                // still apply on top.
+                const int fallback_camera = ppisp.majority_camera_id();
+                result = overrides.isIdentity()
+                             ? ppisp.apply_with_exposure(input, fallback_camera, 0.0f, region)
+                             : ppisp.apply_with_exposure_and_overrides(
+                                   input, fallback_camera, 0.0f, toRenderOverrides(overrides), region);
             }
 
             return (was_hwc && result.is_valid()) ? result.permute({1, 2, 0}).contiguous() : result;
@@ -119,6 +128,23 @@ namespace lfs::vis {
             auto* const pool = use_controller && scene_mgr.hasAppearanceController()
                                    ? scene_mgr.getAppearanceControllerPool()
                                    : nullptr;
+            if (scene_mgr.appearanceUsesTrainingViewport()) {
+                // Match the live trainer's viewport controls and novel-view fallback.
+                std::unique_lock<std::mutex> controller_lock;
+                if (pool) {
+                    controller_lock = std::unique_lock(pool->predict_mutex());
+                    const bool hwc = rgb.shape()[0] != 3;
+                    pool->allocate_buffers(rgb.shape()[hwc ? 0 : 1], rgb.shape()[hwc ? 1 : 2]);
+                }
+                PPISPOverrides training_overrides;
+                training_overrides.exposure_offset = overrides.exposure_offset;
+                training_overrides.vignette_enabled = overrides.vignette_enabled;
+                training_overrides.vignette_strength = overrides.vignette_strength;
+                training_overrides.wb_temperature = overrides.wb_temperature;
+                training_overrides.wb_tint = overrides.wb_tint;
+                training_overrides.gamma_multiplier = overrides.gamma_multiplier;
+                return applyPpispAppearance(*ppisp, pool, rgb, camera_uid, training_overrides, {}, {}, true);
+            }
             return applyPpispAppearance(*ppisp, pool, rgb, camera_uid, overrides);
         }
     } // namespace

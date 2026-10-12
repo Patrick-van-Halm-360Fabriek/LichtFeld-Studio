@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <glm/glm.hpp>
 #include <memory>
 #include <vulkan/vulkan.h>
 
@@ -18,13 +19,18 @@ namespace lfs::vis {
     struct VulkanDepthBlitParams {
         std::shared_ptr<const lfs::core::Tensor> depth; // [1, H, W] CUDA float
         bool depth_is_ndc = false;
+        // Clip-z/clip-w coefficients for converting NDC depth to positive view depth.
+        glm::vec4 ndc_to_view_coeffs{0.0f};
         bool flip_y = false;
         float near_plane = 0.1f;
         float far_plane = 1000.0f;
-        // When set, the pass binds this VkImageView (a CUDA/Vulkan interop slot owned
-        // by gui_manager) and skips the staging upload path.
+        // When set, the pass binds this VkImageView (a CUDA/Vulkan interop depth view
+        // published by the viewport interop path) and skips the staging upload path.
         VkImageView external_image_view = VK_NULL_HANDLE;
         std::uint64_t external_image_generation = 0;
+        // Valid-region UV for padded depth images (default identity).
+        glm::vec2 uv_scale{1.0f, 1.0f};
+        glm::vec2 uv_clamp_max{1.0f, 1.0f};
     };
 
     // Writes a sampled depth value into the framebuffer's depth attachment via
@@ -51,6 +57,7 @@ namespace lfs::vis {
         // Bound after prepare(). Lets other passes sample the splat depth
         // surface without re-uploading it.
         [[nodiscard]] VkImageView depthView(std::size_t frame_slot) const;
+        [[nodiscard]] std::uint64_t depthBindingRevision(std::size_t frame_slot) const;
 
     private:
         struct Impl;

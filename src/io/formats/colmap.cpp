@@ -9,6 +9,8 @@
 #include "core/path_utils.hpp"
 #include "io/atomic_output.hpp"
 #include "io/filesystem_utils.hpp"
+#include "io/loaders/loader_utils.hpp"
+#include "io/loaders/missing_dataset_images.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -33,14 +35,25 @@
 #include <string_view>
 #include <system_error>
 #include <tbb/parallel_for.h>
+#include <tbb/task_group.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#ifdef __linux__
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__unix__) || defined(__APPLE__)
 #include <cerrno>
 #include <fcntl.h>
+#endif
+
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
+#if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
 #endif
 
@@ -391,7 +404,7 @@ namespace lfs::io {
     // -----------------------------------------------------------------------------
     //  Quaternion to rotation matrix (torch-free)
     // -----------------------------------------------------------------------------
-    inline Tensor qvec2rotmat(const std::vector<float>& q_raw) {
+    inline std::array<float, 9> qvec2rotmat_values(const std::vector<float>& q_raw) {
         LFS_ASSERT_MSG(q_raw.size() == 4,
                        std::format("quaternion must have four elements "
                                    "(component_count={})",
@@ -417,47 +430,16 @@ namespace lfs::io {
         float z = q_raw[3] / len;
 
         // Build rotation matrix [3, 3]
-        std::vector<float> R_data = {
+        return {
             1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - z * w), 2.0f * (x * z + y * w),
             2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w),
             2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y)};
-
-        return Tensor::from_vector(R_data, {3, 3}, Device::CPU);
     }
 
-    // -----------------------------------------------------------------------------
-    //  Image data structure
-    // -----------------------------------------------------------------------------
-    constexpr uint64_t INVALID_POINT3D_ID = std::numeric_limits<uint64_t>::max();
-
-    struct ImagePoint2D {
-        double x = 0.0;
-        double y = 0.0;
-        uint64_t point3D_id = INVALID_POINT3D_ID;
-    };
-
-    struct ImageData {
-        uint32_t image_id = 0;
-        uint32_t camera_id = 0;
-        std::string name;
-        std::vector<float> qvec = {1.0f, 0.0f, 0.0f, 0.0f}; // [w, x, y, z]
-        std::vector<float> tvec = {0.0f, 0.0f, 0.0f};
-        std::vector<ImagePoint2D> points2D;
-    };
-
-    struct Point3DTrackElement {
-        uint32_t image_id = 0;
-        uint32_t point2D_idx = 0;
-    };
-
-    struct Point3DData {
-        uint64_t point3D_id = 0;
-        double xyz[3] = {0.0, 0.0, 0.0};
-        uint8_t color[3] = {255, 255, 255};
-        double error = 0.0;
-        size_t track_count = 0;
-        std::vector<Point3DTrackElement> track;
-    };
+    inline Tensor qvec2rotmat(const std::vector<float>& q_raw) {
+        const auto values = qvec2rotmat_values(q_raw);
+        return Tensor::from_vector(std::vector<float>(values.begin(), values.end()), {3, 3}, Device::CPU);
+    }
 
     namespace {
         struct Point3DTextPointCloudData {
@@ -465,6 +447,7 @@ namespace lfs::io {
             std::vector<std::uint8_t> colors;
             std::vector<std::uint64_t> point_ids;
             std::size_t point_count = 0;
+            std::size_t track_elements = 0;
             std::size_t file_lines = 0;
             std::uintmax_t byte_size = 0;
         };
@@ -491,7 +474,7 @@ namespace lfs::io {
 
             if (!std::ranges::all_of(point.xyz, [](const double value) { return std::isfinite(value); }) ||
                 red < 0 || red > 255 || green < 0 || green > 255 || blue < 0 || blue > 255 ||
-                !std::isfinite(point.error) || point.error < 0.0) {
+                !std::isfinite(point.error)) {
                 return false;
             }
 
@@ -503,8 +486,7 @@ namespace lfs::io {
 
         bool parse_point3D_record_line(const std::string_view line,
                                        const TrackParseMode track_mode,
-                                       Point3DData& point,
-                                       size_t& total_track_elements) {
+                                       Point3DData& point) {
             const char* cur = nullptr;
             const char* end = nullptr;
             if (!parse_point3D_header(line, point, cur, end)) {
@@ -517,7 +499,6 @@ namespace lfs::io {
                     return false;
                 }
                 point.track_count = *count;
-                total_track_elements += point.track_count;
             } else if (track_mode == TrackParseMode::Full) {
                 const size_t estimated_pairs = static_cast<size_t>(std::max<std::ptrdiff_t>((end - cur) / 12, 0));
                 point.track.reserve(estimated_pairs);
@@ -534,7 +515,6 @@ namespace lfs::io {
                     point.track.push_back(track);
                 }
                 point.track_count = point.track.size();
-                total_track_elements += point.track_count;
             }
             return true;
         }
@@ -543,7 +523,8 @@ namespace lfs::io {
                                             std::vector<float>& positions,
                                             std::vector<uint8_t>& colors,
                                             std::vector<uint64_t>& point_ids,
-                                            size_t& point_count) {
+                                            size_t& point_count,
+                                            size_t& total_track_elements) {
             const char* cur = line.data();
             const char* end = cur + line.size();
             uint64_t point_id = 0;
@@ -566,13 +547,14 @@ namespace lfs::io {
             }
             if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
                 red < 0 || red > 255 || green < 0 || green > 255 || blue < 0 || blue > 255 ||
-                !std::isfinite(error) || error < 0.0) {
+                !std::isfinite(error)) {
                 return false;
             }
 
             // Even the point-cloud-only fast path must validate the complete record;
             // otherwise malformed tracks silently survive when filtering is disabled.
-            if (!count_remaining_track_pairs(cur, end)) {
+            const auto track_count = count_remaining_track_pairs(cur, end);
+            if (!track_count) {
                 return false;
             }
 
@@ -584,6 +566,7 @@ namespace lfs::io {
             colors.push_back(static_cast<uint8_t>(blue));
             point_ids.push_back(point_id);
             ++point_count;
+            total_track_elements += *track_count;
             return true;
         }
     } // namespace
@@ -596,6 +579,10 @@ namespace lfs::io {
         int model_id = 0;
         int width = 0;
         int height = 0;
+        // Keep the dimensions recorded by COLMAP so sidecars can be validated
+        // before the requested image-folder scale is applied.
+        int original_width = 0;
+        int original_height = 0;
         std::vector<float> params;
     };
 
@@ -788,51 +775,6 @@ namespace lfs::io {
         return formatted;
     }
 
-    static std::unordered_map<std::string, BasenameLayoutInfo>
-    scan_image_basename_layout(const fs::path& images_path,
-                               const LoadOptions& options = {}) {
-        std::unordered_map<std::string, BasenameLayoutInfo> layout;
-
-        if (!safe_is_directory(images_path)) {
-            return layout;
-        }
-
-        std::error_code ec;
-        size_t scanned_entries = 0;
-        for (fs::recursive_directory_iterator it(
-                 images_path,
-                 fs::directory_options::skip_permission_denied,
-                 ec),
-             end;
-             !ec && it != end;
-             it.increment(ec)) {
-            if (should_poll_cancel(scanned_entries)) {
-                throw_if_load_cancel_requested(options, "COLMAP image layout scan cancelled");
-            }
-            ++scanned_entries;
-
-            const auto& entry = *it;
-            std::error_code file_ec;
-            if (!entry.is_regular_file(file_ec) || file_ec || !is_image_file(entry.path())) {
-                continue;
-            }
-
-            const fs::path relative_path = entry.path().lexically_relative(images_path);
-            if (relative_path.empty()) {
-                continue;
-            }
-
-            const std::string basename_key = detail::normalize_lookup_key(entry.path().filename());
-            auto& info = layout[basename_key];
-            ++info.file_count;
-            if (info.sample_relative_paths.size() < 2) {
-                info.sample_relative_paths.push_back(relative_path);
-            }
-        }
-
-        return layout;
-    }
-
     static std::unexpected<Error> make_nested_image_contract_error(
         const fs::path& images_path,
         const std::string& image_name,
@@ -869,7 +811,70 @@ namespace lfs::io {
         return make_error(ErrorCode::INVALID_DATASET, std::move(message), images_path);
     }
 
-    static Result<void> validate_colmap_dataset_layout_impl(
+    static bool has_any_sidecar_directory(const fs::path& base,
+                                          const std::span<const char* const> folders) {
+        for (const char* folder : folders) {
+            if (safe_is_directory(base / folder)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void log_unused_sidecars(const fs::path& base, const LoadOptions& options) {
+        if (!options.load_depths && has_any_sidecar_directory(base, DEPTH_SEARCH_FOLDERS)) {
+            LOG_INFO("depth maps present but unused (depth loss disabled)");
+        }
+        if (!options.load_normals && has_any_sidecar_directory(base, NORMAL_SEARCH_FOLDERS)) {
+            LOG_INFO("normal maps present but unused (normal loss disabled)");
+        }
+        if (!options.load_masks && has_any_sidecar_directory(base, MASK_SEARCH_FOLDERS)) {
+            LOG_INFO("mask maps present but unused (mask usage disabled)");
+        }
+    }
+
+    struct ColmapDatasetCaches {
+        std::unique_ptr<RecursiveFileCache> images;
+        std::unique_ptr<MaskDirCache> masks;
+        std::unique_ptr<DepthDirCache> depths;
+        std::unique_ptr<NormalDirCache> normals;
+    };
+
+    static ColmapDatasetCaches build_colmap_dataset_caches(
+        const fs::path& base,
+        const fs::path& images_path,
+        const LoadOptions& options,
+        std::unordered_map<std::string, BasenameLayoutInfo>& basename_layout) {
+        ColmapDatasetCaches caches;
+        tbb::task_group tasks;
+        tasks.run([&] {
+            caches.images = std::make_unique<RecursiveFileCache>(
+                images_path, options.cancel_requested, [&](const fs::path& relative_path) {
+                    if (!is_image_file(relative_path)) {
+                        return;
+                    }
+                    const std::string basename_key = detail::normalize_lookup_key(relative_path.filename());
+                    auto& info = basename_layout[basename_key];
+                    ++info.file_count;
+                    if (info.sample_relative_paths.size() < 2) {
+                        info.sample_relative_paths.push_back(relative_path);
+                    }
+                });
+        });
+        tasks.run([&] {
+            caches.masks = std::make_unique<MaskDirCache>(base, options.cancel_requested);
+        });
+        tasks.run([&] {
+            caches.depths = std::make_unique<DepthDirCache>(base, options.cancel_requested);
+        });
+        tasks.run([&] {
+            caches.normals = std::make_unique<NormalDirCache>(base, options.cancel_requested);
+        });
+        tasks.wait();
+        return caches;
+    }
+
+    static Result<ColmapDatasetCaches> validate_colmap_dataset_layout_impl(
         const fs::path& base,
         const std::string& images_folder,
         const std::vector<ImageData>& images,
@@ -877,20 +882,21 @@ namespace lfs::io {
 
         LOG_TIMER_DEBUG("COLMAP validate dataset layout");
         const fs::path images_path = base / lfs::core::utf8_to_path(images_folder);
-        LOG_INFO("[COLMAP_LOAD] validate_layout images={} images_path='{}'",
-                 images.size(),
-                 lfs::core::path_to_utf8(images_path));
         if (!safe_is_directory(images_path)) {
             return make_error(ErrorCode::PATH_NOT_FOUND, "Images folder does not exist", images_path);
         }
 
-        const auto basename_layout = scan_image_basename_layout(images_path, options);
-        RecursiveFileCache image_cache(images_path, options.cancel_requested);
-        MaskDirCache mask_cache(base, options.cancel_requested);
-        DepthDirCache depth_cache(base, options.cancel_requested);
+        log_unused_sidecars(base, options);
+        std::unordered_map<std::string, BasenameLayoutInfo> basename_layout;
+        ColmapDatasetCaches caches;
+        {
+            LOG_TIMER_DEBUG("COLMAP assemble: caches");
+            caches = build_colmap_dataset_caches(base, images_path, options, basename_layout);
+        }
 
         std::unordered_map<std::string, size_t> basename_only_metadata_counts;
         basename_only_metadata_counts.reserve(images.size());
+        std::vector<std::string> missing_images;
 
         for (size_t i = 0; i < images.size(); ++i) {
             if (should_poll_cancel(i)) {
@@ -923,11 +929,11 @@ namespace lfs::io {
                 }
             }
 
-            if (auto image_lookup = image_cache.lookup(image_rel_path); image_lookup.found()) {
-                if (auto mask_lookup = mask_cache.lookup(image.name); mask_lookup.ambiguous()) {
+            if (auto image_lookup = caches.images->lookup(image_rel_path); image_lookup.found()) {
+                if (options.load_masks && caches.masks->lookup(image.name).ambiguous()) {
                     return make_ambiguous_mask_reference_error(base, image.name);
                 }
-                if (auto depth_lookup = depth_cache.lookup(image.name); depth_lookup.ambiguous()) {
+                if (options.load_depths && caches.depths->lookup(image.name).ambiguous()) {
                     return make_error(
                         ErrorCode::INVALID_DATASET,
                         std::format("Depth map for image '{}' is ambiguous across the dataset depth folders. "
@@ -938,22 +944,37 @@ namespace lfs::io {
             } else if (image_lookup.ambiguous()) {
                 return make_ambiguous_image_reference_error(images_path, image.name);
             } else {
-                return make_error(
-                    ErrorCode::PATH_NOT_FOUND,
-                    std::format("Image '{}' was not found under '{}'",
-                                image.name,
-                                lfs::core::path_to_utf8(images_path)),
-                    images_path / image_rel_path);
+                missing_images.push_back(image.name);
             }
         }
 
-        return {};
+        if (!images.empty() && missing_images.size() == images.size()) {
+            return make_error(
+                ErrorCode::EMPTY_DATASET,
+                format_all_dataset_images_missing_message(
+                    missing_images,
+                    lfs::core::path_to_utf8(images_path)),
+                images_path);
+        }
+
+        return caches;
     }
 
     // -----------------------------------------------------------------------------
     //  Binary-file loader
     // -----------------------------------------------------------------------------
-    static std::unique_ptr<std::vector<char>>
+    struct BinaryBuffer {
+        std::unique_ptr<char[]> storage;
+        size_t byte_size = 0;
+
+        [[nodiscard]] char* data() noexcept { return storage.get(); }
+        [[nodiscard]] const char* data() const noexcept { return storage.get(); }
+        [[nodiscard]] size_t size() const noexcept { return byte_size; }
+        [[nodiscard]] const char* begin() const noexcept { return data(); }
+        [[nodiscard]] const char* end() const noexcept { return data() + size(); }
+    };
+
+    static std::unique_ptr<BinaryBuffer>
     read_binary(const std::filesystem::path& p) {
         LOG_TRACE("Reading binary file: {}", lfs::core::path_to_utf8(p));
         std::ifstream f;
@@ -996,103 +1017,137 @@ namespace lfs::io {
         }
 
         const auto sz = static_cast<std::streamsize>(file_size);
-        auto buf = std::make_unique<std::vector<char>>(static_cast<size_t>(file_size));
+        auto buf = std::make_unique<BinaryBuffer>();
+        buf->byte_size = static_cast<size_t>(file_size);
+        buf->storage = std::make_unique_for_overwrite<char[]>(buf->byte_size);
 
-        f.seekg(0, std::ios::beg);
-        if (!f.good()) {
-            throw_colmap_error(lfs::ErrorCode::Internal,
-                               std::format("Could not seek binary file: {}",
-                                           lfs::core::path_to_utf8(p)));
-        }
+        constexpr size_t READ_CHUNK_BYTES = 64ull * 1024ull * 1024ull;
         if (sz > 0) {
+            const size_t byte_count = static_cast<size_t>(sz);
+            const size_t chunk_count = byte_count / READ_CHUNK_BYTES +
+                                       (byte_count % READ_CHUNK_BYTES != 0 ? 1 : 0);
+            std::vector<size_t> chunk_actual(chunk_count, 0);
+            std::vector<uint8_t> chunk_failed(chunk_count, 0);
+
+#if defined(_WIN32)
+            f.close();
+            HANDLE handle = CreateFileW(p.c_str(), GENERIC_READ,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+            if (handle == INVALID_HANDLE_VALUE) {
+                throw_colmap_error(lfs::ErrorCode::Internal,
+                                   "Failed to open " + lfs::core::path_to_utf8(p));
+            }
+            tbb::parallel_for(size_t{0}, chunk_count, [&](const size_t chunk) {
+                const size_t offset = chunk * READ_CHUNK_BYTES;
+                const DWORD request = static_cast<DWORD>(
+                    std::min(READ_CHUNK_BYTES, byte_count - offset));
+                OVERLAPPED operation{};
+                operation.Offset = static_cast<DWORD>(offset);
+                operation.OffsetHigh = static_cast<DWORD>(offset >> 32);
+                operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (operation.hEvent == nullptr) {
+                    chunk_failed[chunk] = 1;
+                    return;
+                }
+                DWORD transferred = 0;
+                const BOOL immediate = ReadFile(handle, buf->data() + offset, request,
+                                                nullptr, &operation);
+                if (!immediate) {
+                    if (GetLastError() != ERROR_IO_PENDING ||
+                        !GetOverlappedResult(handle, &operation, &transferred, TRUE)) {
+                        CloseHandle(operation.hEvent);
+                        chunk_failed[chunk] = 1;
+                        return;
+                    }
+                } else {
+                    transferred = request;
+                }
+                CloseHandle(operation.hEvent);
+                chunk_actual[chunk] = static_cast<size_t>(transferred);
+                if (transferred != request) {
+                    chunk_failed[chunk] = 1;
+                }
+            });
+            CloseHandle(handle);
+#elif defined(__unix__) || defined(__APPLE__)
+            f.close();
+            const int fd = ::open(p.c_str(), O_RDONLY);
+            if (fd < 0) {
+                throw_colmap_error(lfs::ErrorCode::Internal,
+                                   "Failed to open " + lfs::core::path_to_utf8(p));
+            }
+            tbb::parallel_for(size_t{0}, chunk_count, [&](const size_t chunk) {
+                const size_t offset = chunk * READ_CHUNK_BYTES;
+                const size_t request = std::min(READ_CHUNK_BYTES, byte_count - offset);
+                size_t completed = 0;
+                while (completed < request) {
+                    const ssize_t count = ::pread(fd, buf->data() + offset + completed,
+                                                  request - completed,
+                                                  static_cast<off_t>(offset + completed));
+                    if (count < 0) {
+                        if (errno == EINTR) {
+                            continue;
+                        }
+                        chunk_failed[chunk] = 1;
+                        break;
+                    }
+                    if (count == 0) {
+                        chunk_failed[chunk] = 1;
+                        break;
+                    }
+                    completed += static_cast<size_t>(count);
+                }
+                chunk_actual[chunk] = completed;
+                if (completed != request) {
+                    chunk_failed[chunk] = 1;
+                }
+            });
+            ::close(fd);
+#else
+            f.seekg(0, std::ios::beg);
+            if (!f.good()) {
+                throw_colmap_error(lfs::ErrorCode::Internal,
+                                   std::format("Could not seek binary file: {}",
+                                               lfs::core::path_to_utf8(p)));
+            }
             f.read(buf->data(), sz);
-        }
-        if (!f || f.gcount() != sz) {
-            throw_colmap_error(
-                lfs::ErrorCode::DataLoss,
-                "Short read on " + lfs::core::path_to_utf8(p),
-                lfs::SmallFields{}
-                    .add("expected_bytes", static_cast<std::int64_t>(sz))
-                    .add("actual_bytes", static_cast<std::int64_t>(f.gcount())));
+            chunk_actual[0] = static_cast<size_t>(f.gcount());
+            if (!f || f.gcount() != sz) {
+                chunk_failed[0] = 1;
+            }
+#endif
+
+            for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
+                if (chunk_failed[chunk]) {
+#if defined(_WIN32) || defined(__unix__) || defined(__APPLE__)
+                    const size_t expected = std::min(READ_CHUNK_BYTES,
+                                                     byte_count - chunk * READ_CHUNK_BYTES);
+#else
+                    const size_t expected = byte_count;
+#endif
+                    throw_colmap_error(
+                        lfs::ErrorCode::DataLoss,
+                        "Short read on " + lfs::core::path_to_utf8(p),
+                        lfs::SmallFields{}
+                            .add("expected_bytes", static_cast<std::int64_t>(expected))
+                            .add("actual_bytes", static_cast<std::int64_t>(chunk_actual[chunk])));
+                }
+            }
         }
         LOG_TRACE("Read {} bytes from {}", sz, lfs::core::path_to_utf8(p));
         return buf;
     }
 
     // -----------------------------------------------------------------------------
-    //  Helper to scale camera intrinsics
-    // -----------------------------------------------------------------------------
-    static void scale_camera_intrinsics(CAMERA_MODEL model, std::vector<float>& params, float factor) {
-        switch (model) {
-        case CAMERA_MODEL::SIMPLE_PINHOLE:
-            params[0] /= factor; // f
-            params[1] /= factor; // cx
-            params[2] /= factor; // cy
-            break;
-
-        case CAMERA_MODEL::PINHOLE:
-            params[0] /= factor; // fx
-            params[1] /= factor; // fy
-            params[2] /= factor; // cx
-            params[3] /= factor; // cy
-            break;
-
-        case CAMERA_MODEL::SIMPLE_RADIAL:
-        case CAMERA_MODEL::RADIAL:
-            params[0] /= factor; // f
-            params[1] /= factor; // cx
-            params[2] /= factor; // cy
-            break;
-
-        case CAMERA_MODEL::OPENCV:
-        case CAMERA_MODEL::OPENCV_FISHEYE:
-        case CAMERA_MODEL::FULL_OPENCV:
-            params[0] /= factor; // fx
-            params[1] /= factor; // fy
-            params[2] /= factor; // cx
-            params[3] /= factor; // cy
-            break;
-
-        case CAMERA_MODEL::SIMPLE_RADIAL_FISHEYE:
-        case CAMERA_MODEL::RADIAL_FISHEYE:
-            params[0] /= factor; // f
-            params[1] /= factor; // cx
-            params[2] /= factor; // cy
-            break;
-
-        case CAMERA_MODEL::FOV:
-            params[0] /= factor; // fx
-            params[1] /= factor; // fy
-            params[2] /= factor; // cx
-            params[3] /= factor; // cy
-            break;
-
-        case CAMERA_MODEL::THIN_PRISM_FISHEYE:
-            params[0] /= factor; // fx
-            params[1] /= factor; // fy
-            params[2] /= factor; // cx
-            params[3] /= factor; // cy
-            break;
-
-        case CAMERA_MODEL::EQUIRECTANGULAR:
-            params[0] /= factor; // width
-            params[1] /= factor; // height
-            break;
-
-        default:
-            LOG_WARN("Unknown camera model for scaling");
-            if (params.size() >= 4) {
-                params[2] /= factor; // cx
-                params[3] /= factor; // cy
-            }
-            break;
-        }
-    }
-
-    // -----------------------------------------------------------------------------
     //  Helper to extract scale factor from folder name
     // -----------------------------------------------------------------------------
-    static float extract_scale_from_folder(const std::string& folder_name) {
+    static float extract_scale_from_folder(const std::string& images_folder) {
+        auto folder_path = lfs::core::utf8_to_path(images_folder);
+        if (!folder_path.has_filename()) {
+            folder_path = folder_path.parent_path();
+        }
+        const std::string folder_name = lfs::core::path_to_utf8(folder_path.filename());
         size_t underscore_pos = folder_name.rfind('_');
         if (underscore_pos != std::string::npos) {
             std::string suffix = folder_name.substr(underscore_pos + 1);
@@ -1116,7 +1171,11 @@ namespace lfs::io {
                                               SkipTally* pose_tally = nullptr,
                                               SkipTally* point2d_tally = nullptr) {
         LOG_TIMER_TRACE("Read images.bin");
-        auto buf_owner = read_binary(file_path);
+        std::unique_ptr<BinaryBuffer> buf_owner;
+        {
+            LOG_TIMER_DEBUG("COLMAP images.bin read");
+            buf_owner = read_binary(file_path);
+        }
         const char* cur = buf_owner->data();
         const char* end = cur + buf_owner->size();
 
@@ -1138,45 +1197,35 @@ namespace lfs::io {
                     .add("image_count", n_images)
                     .add("remaining_bytes", static_cast<std::uint64_t>(end - cur)));
         }
-        LOG_DEBUG("Reading {} images from binary file", n_images);
-        std::vector<ImageData> images;
-        images.reserve(n_images);
-        std::unordered_set<uint32_t> image_ids;
-        std::unordered_set<std::string> image_names;
+        struct ImageRecordSpan {
+            const char* begin = nullptr;
+            const char* end = nullptr;
+        };
+        std::vector<ImageRecordSpan> records(n_images);
 
+        // The offset pass performs every structural read in record order. It
+        // therefore retains the old first-error taxonomy while making the
+        // independent record bodies available to the parallel parser.
         for (uint64_t i = 0; i < n_images; ++i) {
             if (should_poll_cancel(static_cast<size_t>(i))) {
                 throw_if_load_cancel_requested(options, "COLMAP image metadata load cancelled");
             }
-            ImageData img;
-            img.image_id = read_u32(cur, end, "images.bin image id");
-
-            // Read quaternion [w, x, y, z]
-            for (int k = 0; k < 4; ++k) {
-                img.qvec[k] = static_cast<float>(read_f64(cur, end, "images.bin quaternion"));
+            records[i].begin = cur;
+            const uint32_t image_id = read_u32(cur, end, "images.bin image id");
+            for (int k = 0; k < 7; ++k) {
+                (void)read_f64(cur, end, k < 4 ? "images.bin quaternion" : "images.bin translation");
             }
-
-            // Read translation [x, y, z]
-            for (int k = 0; k < 3; ++k) {
-                img.tvec[k] = static_cast<float>(read_f64(cur, end, "images.bin translation"));
-            }
-
-            img.camera_id = read_u32(cur, end, "images.bin camera id");
-
+            (void)read_u32(cur, end, "images.bin camera id");
             const void* terminator = std::memchr(cur, '\0', static_cast<size_t>(end - cur));
             if (terminator == nullptr) {
                 throw_colmap_error(
                     lfs::ErrorCode::DataLoss,
                     std::format("images.bin image name must be null-terminated "
                                 "(record_index={}, image_id={}, remaining_bytes={})",
-                                i, img.image_id, static_cast<size_t>(end - cur)),
+                                i, image_id, static_cast<size_t>(end - cur)),
                     lfs::SmallFields{}.add("record_index", i));
             }
-            const char* name_end = static_cast<const char*>(terminator);
-            img.name.assign(cur, name_end);
-            cur = name_end + 1;
-            bool valid = !img.name.empty();
-
+            cur = static_cast<const char*>(terminator) + 1;
             const uint64_t npts = read_u64(cur, end, "images.bin point2D count");
             constexpr size_t POINT2D_RECORD_BYTES = 2 * sizeof(double) + sizeof(uint64_t);
             if (npts > static_cast<uint64_t>(end - cur) / POINT2D_RECORD_BYTES) {
@@ -1184,34 +1233,81 @@ namespace lfs::io {
                     lfs::ErrorCode::DataLoss,
                     std::format("images.bin point2D count exceeds the remaining payload "
                                 "(image_id={}, point_count={}, remaining_bytes={}, record_bytes={})",
-                                img.image_id, npts, static_cast<size_t>(end - cur),
-                                POINT2D_RECORD_BYTES),
+                                image_id, npts, static_cast<size_t>(end - cur), POINT2D_RECORD_BYTES),
                     lfs::SmallFields{}
                         .add("point_count", npts)
                         .add("remaining_bytes", static_cast<std::uint64_t>(end - cur)));
             }
-            img.points2D.reserve(npts);
-            for (uint64_t j = 0; j < npts; ++j) {
-                ImagePoint2D point;
-                point.x = read_f64(cur, end, "images.bin point2D x");
-                point.y = read_f64(cur, end, "images.bin point2D y");
-                point.point3D_id = read_u64(cur, end, "images.bin point3D id");
-                if (std::isfinite(point.x) && std::isfinite(point.y)) {
-                    img.points2D.push_back(point);
-                } else if (point2d_tally) {
-                    point2d_tally->record(std::format("image_id={},point_index={}", img.image_id, j));
+            cur += static_cast<size_t>(npts) * POINT2D_RECORD_BYTES;
+            records[i].end = cur;
+        }
+
+        LOG_DEBUG("Reading {} images from binary file", n_images);
+        std::vector<ImageData> parsed(n_images);
+        std::vector<uint8_t> valid(n_images, 0);
+        std::vector<SkipTally> point2d_tallies(point2d_tally ? n_images : 0);
+        std::atomic<bool> cancelled = false;
+        {
+            LOG_TIMER_DEBUG("COLMAP images.bin parse");
+            tbb::parallel_for(size_t{0}, static_cast<size_t>(n_images), [&](const size_t i) {
+                if (should_poll_cancel(i) && is_load_cancel_requested(options)) {
+                    cancelled.store(true, std::memory_order_relaxed);
+                    return;
                 }
+                const char* record_cur = records[i].begin;
+                const char* record_end = records[i].end;
+                auto& img = parsed[i];
+                img.image_id = read_u32(record_cur, record_end, "images.bin image id");
+                for (int k = 0; k < 4; ++k) {
+                    img.qvec[k] = static_cast<float>(read_f64(record_cur, record_end, "images.bin quaternion"));
+                }
+                for (int k = 0; k < 3; ++k) {
+                    img.tvec[k] = static_cast<float>(read_f64(record_cur, record_end, "images.bin translation"));
+                }
+                img.camera_id = read_u32(record_cur, record_end, "images.bin camera id");
+                const char* name_end = static_cast<const char*>(
+                    std::memchr(record_cur, '\0', static_cast<size_t>(record_end - record_cur)));
+                img.name.assign(record_cur, name_end);
+                record_cur = name_end + 1;
+                bool image_valid = !img.name.empty();
+                const uint64_t npts = read_u64(record_cur, record_end, "images.bin point2D count");
+                img.points2D.reserve(npts);
+                auto* local_point2d_tally = point2d_tally ? &point2d_tallies[i] : nullptr;
+                for (uint64_t j = 0; j < npts; ++j) {
+                    ImagePoint2D point;
+                    point.x = read_f64(record_cur, record_end, "images.bin point2D x");
+                    point.y = read_f64(record_cur, record_end, "images.bin point2D y");
+                    point.point3D_id = read_u64(record_cur, record_end, "images.bin point3D id");
+                    if (std::isfinite(point.x) && std::isfinite(point.y)) {
+                        img.points2D.push_back(point);
+                    } else if (local_point2d_tally) {
+                        local_point2d_tally->record(std::format("image_id={},point_index={}", img.image_id, j));
+                    }
+                }
+                const double qnorm = std::sqrt(
+                    static_cast<double>(img.qvec[0]) * img.qvec[0] +
+                    static_cast<double>(img.qvec[1]) * img.qvec[1] +
+                    static_cast<double>(img.qvec[2]) * img.qvec[2] +
+                    static_cast<double>(img.qvec[3]) * img.qvec[3]);
+                image_valid = image_valid && std::isfinite(qnorm) && std::abs(qnorm - 1.0) <= 1e-4 &&
+                              std::ranges::all_of(img.tvec, [](const float value) { return std::isfinite(value); });
+                valid[i] = image_valid ? 1 : 0;
+            });
+        }
+        if (cancelled.load(std::memory_order_relaxed)) {
+            throw_if_load_cancel_requested(options, "COLMAP image metadata load cancelled");
+        }
+
+        std::vector<ImageData> images;
+        images.reserve(n_images);
+        std::unordered_set<uint32_t> image_ids;
+        std::unordered_set<std::string> image_names;
+        for (size_t i = 0; i < parsed.size(); ++i) {
+            if (point2d_tally) {
+                point2d_tally->merge(point2d_tallies[i]);
             }
-
-            const double qnorm = std::sqrt(
-                static_cast<double>(img.qvec[0]) * img.qvec[0] +
-                static_cast<double>(img.qvec[1]) * img.qvec[1] +
-                static_cast<double>(img.qvec[2]) * img.qvec[2] +
-                static_cast<double>(img.qvec[3]) * img.qvec[3]);
-            valid = valid && std::isfinite(qnorm) && std::abs(qnorm - 1.0) <= 1e-4 &&
-                    std::ranges::all_of(img.tvec, [](const float value) { return std::isfinite(value); });
-
-            if (!valid) {
+            auto& img = parsed[i];
+            if (!valid[i]) {
                 if (pose_tally) {
                     pose_tally->record(std::format("image_id={}", img.image_id));
                 }
@@ -1222,7 +1318,7 @@ namespace lfs::io {
                                    std::format("images.bin image ids must be unique among kept images "
                                                "(record_index={}, image_id={})",
                                                i, img.image_id),
-                                   lfs::SmallFields{}.add("image_id", static_cast<std::uint64_t>(img.image_id)));
+                                   lfs::SmallFields{}.add("image_id", static_cast<uint64_t>(img.image_id)));
             }
             if (!image_names.insert(img.name).second) {
                 throw_colmap_error(lfs::ErrorCode::DataLoss,
@@ -1233,7 +1329,6 @@ namespace lfs::io {
             }
             images.push_back(std::move(img));
         }
-
         if (cur != end) {
             throw_colmap_error(lfs::ErrorCode::DataLoss,
                                "images.bin: trailing bytes",
@@ -1310,6 +1405,8 @@ namespace lfs::io {
             if (valid) {
                 cam.width = static_cast<int>(width);
                 cam.height = static_cast<int>(height);
+                cam.original_width = cam.width;
+                cam.original_height = cam.height;
                 if (scale_factor != 1.0f) {
                     cam.width = static_cast<int>(cam.width / scale_factor);
                     cam.height = static_cast<int>(cam.height / scale_factor);
@@ -1330,10 +1427,6 @@ namespace lfs::io {
             for (int j = 0; j < param_cnt; j++) {
                 cam.params[j] = static_cast<float>(read_f64(cur, end, "cameras.bin parameter"));
                 valid = valid && std::isfinite(cam.params[j]);
-            }
-
-            if (scale_factor != 1.0f) {
-                scale_camera_intrinsics(it->second.first, cam.params, scale_factor);
             }
 
             if (!valid) {
@@ -1376,7 +1469,12 @@ namespace lfs::io {
                                                          const LoadOptions& options = {},
                                                          SkipTally* tally = nullptr) {
         LOG_TIMER_TRACE("Read points3D.bin");
-        auto buf_owner = read_binary(file_path);
+        std::unique_ptr<BinaryBuffer> buf_owner;
+        {
+            LOG_TIMER_DEBUG("COLMAP points3D read");
+            buf_owner = read_binary(file_path);
+        }
+        LOG_TIMER_DEBUG("COLMAP points3D parse");
         const char* cur = buf_owner->data();
         const char* end = cur + buf_owner->size();
 
@@ -1394,62 +1492,105 @@ namespace lfs::io {
                     .add("point_count", N)
                     .add("remaining_bytes", static_cast<std::uint64_t>(end - cur)));
         }
-        LOG_DEBUG("Reading {} 3D points from binary file", N);
-
-        std::vector<Point3DData> points;
-        points.reserve(N);
-        std::unordered_set<uint64_t> point_ids;
-
+        struct PointRecordSpan {
+            const char* begin = nullptr;
+            const char* end = nullptr;
+            uint64_t point_id = 0;
+            uint64_t track_length = 0;
+        };
+        std::vector<PointRecordSpan> records(N);
         for (uint64_t i = 0; i < N; ++i) {
             if (should_poll_cancel(static_cast<size_t>(i))) {
                 throw_if_load_cancel_requested(options, "COLMAP point cloud load cancelled");
             }
-            Point3DData point;
-            point.point3D_id = read_u64(cur, end, "points3D.bin point id");
-
-            point.xyz[0] = read_f64(cur, end, "points3D.bin x");
-            point.xyz[1] = read_f64(cur, end, "points3D.bin y");
-            point.xyz[2] = read_f64(cur, end, "points3D.bin z");
-            bool valid = std::ranges::all_of(point.xyz, [](const double value) { return std::isfinite(value); });
-
+            records[i].begin = cur;
+            records[i].point_id = read_u64(cur, end, "points3D.bin point id");
+            (void)read_f64(cur, end, "points3D.bin x");
+            (void)read_f64(cur, end, "points3D.bin y");
+            (void)read_f64(cur, end, "points3D.bin z");
             if (static_cast<size_t>(end - cur) < 3) {
                 throw_colmap_error(
                     lfs::ErrorCode::DataLoss,
                     std::format("points3D.bin color payload requires three remaining bytes "
                                 "(point_id={}, remaining_bytes={}, required_bytes=3, record_index={})",
-                                point.point3D_id, static_cast<size_t>(end - cur), i),
+                                records[i].point_id, static_cast<size_t>(end - cur), i),
                     lfs::SmallFields{}.add("remaining_bytes", static_cast<std::uint64_t>(end - cur)));
             }
-            point.color[0] = static_cast<uint8_t>(*cur++);
-            point.color[1] = static_cast<uint8_t>(*cur++);
-            point.color[2] = static_cast<uint8_t>(*cur++);
-
-            point.error = read_f64(cur, end, "points3D.bin error");
-            valid = valid && std::isfinite(point.error) && point.error >= 0.0;
+            cur += 3;
+            (void)read_f64(cur, end, "points3D.bin error");
             const uint64_t track_len = read_u64(cur, end, "points3D.bin track length");
             if (track_len > static_cast<uint64_t>(end - cur) / (2 * sizeof(uint32_t))) {
                 throw_colmap_error(
                     lfs::ErrorCode::DataLoss,
                     std::format("points3D.bin track length must fit the remaining payload "
                                 "(point_id={}, track_length={}, remaining_bytes={}, track_record_bytes={})",
-                                point.point3D_id, track_len, static_cast<size_t>(end - cur),
+                                records[i].point_id, track_len, static_cast<size_t>(end - cur),
                                 2 * sizeof(uint32_t)),
                     lfs::SmallFields{}
                         .add("track_length", track_len)
                         .add("remaining_bytes", static_cast<std::uint64_t>(end - cur)));
             }
-            point.track_count = static_cast<size_t>(track_len);
-            point.track.reserve(track_len);
-            for (uint64_t j = 0; j < track_len; ++j) {
-                Point3DTrackElement track;
-                track.image_id = read_u32(cur, end, "points3D.bin track image id");
-                track.point2D_idx = read_u32(cur, end, "points3D.bin track point index");
-                point.track.push_back(track);
-            }
-            if (!valid) {
-                if (tally) {
-                    tally->record(std::format("point_id={}", point.point3D_id));
+            cur += static_cast<size_t>(track_len) * 2 * sizeof(uint32_t);
+            records[i].track_length = track_len;
+            records[i].end = cur;
+        }
+        LOG_DEBUG("Reading {} 3D points from binary file", N);
+        std::vector<Point3DData> parsed(N);
+        // Keep the public Point3DData::track representation, but perform its
+        // vector allocations in one ordered pass. The parallel pass then only
+        // fills already-sized storage and cannot serialize on the allocator.
+        for (size_t i = 0; i < static_cast<size_t>(N); ++i) {
+            parsed[i].track_count = static_cast<size_t>(records[i].track_length);
+            parsed[i].track.resize(static_cast<size_t>(records[i].track_length));
+        }
+        std::vector<uint8_t> valid(N, 0);
+        std::vector<SkipTally> local_tallies(tally ? N : 0);
+        std::atomic<bool> cancelled = false;
+        {
+            tbb::parallel_for(size_t{0}, static_cast<size_t>(N), [&](const size_t i) {
+                if (should_poll_cancel(i) && is_load_cancel_requested(options)) {
+                    cancelled.store(true, std::memory_order_relaxed);
+                    return;
                 }
+                const char* record_cur = records[i].begin;
+                const char* record_end = records[i].end;
+                auto& point = parsed[i];
+                point.point3D_id = read_u64(record_cur, record_end, "points3D.bin point id");
+                point.xyz[0] = read_f64(record_cur, record_end, "points3D.bin x");
+                point.xyz[1] = read_f64(record_cur, record_end, "points3D.bin y");
+                point.xyz[2] = read_f64(record_cur, record_end, "points3D.bin z");
+                bool point_valid = std::ranges::all_of(point.xyz, [](const double value) { return std::isfinite(value); });
+                point.color[0] = static_cast<uint8_t>(*record_cur++);
+                point.color[1] = static_cast<uint8_t>(*record_cur++);
+                point.color[2] = static_cast<uint8_t>(*record_cur++);
+                point.error = read_f64(record_cur, record_end, "points3D.bin error");
+                point_valid = point_valid && std::isfinite(point.error);
+                const uint64_t track_len = read_u64(record_cur, record_end, "points3D.bin track length");
+                point.track_count = static_cast<size_t>(track_len);
+                for (uint64_t j = 0; j < track_len; ++j) {
+                    auto& track = point.track[static_cast<size_t>(j)];
+                    track.image_id = read_u32(record_cur, record_end, "points3D.bin track image id");
+                    track.point2D_idx = read_u32(record_cur, record_end, "points3D.bin track point index");
+                }
+                valid[i] = point_valid ? 1 : 0;
+                if (!point_valid && tally) {
+                    local_tallies[i].record(std::format("point_id={}", point.point3D_id));
+                }
+            });
+        }
+        if (cancelled.load(std::memory_order_relaxed)) {
+            throw_if_load_cancel_requested(options, "COLMAP point cloud load cancelled");
+        }
+
+        std::vector<Point3DData> points;
+        points.reserve(N);
+        std::unordered_set<uint64_t> point_ids;
+        for (size_t i = 0; i < parsed.size(); ++i) {
+            if (tally) {
+                tally->merge(local_tallies[i]);
+            }
+            auto& point = parsed[i];
+            if (!valid[i]) {
                 continue;
             }
             if (!point_ids.insert(point.point3D_id).second) {
@@ -1461,20 +1602,88 @@ namespace lfs::io {
             }
             points.push_back(std::move(point));
         }
-
         if (cur != end) {
             throw_colmap_error(lfs::ErrorCode::DataLoss,
                                "points3D.bin: trailing bytes",
                                lfs::SmallFields{}.add("points_read", points.size()));
         }
-
         return points;
+    }
+
+    // Parallax a track must still resolve at a point's depth, in pixels.
+    constexpr double kResolvedParallaxPixels = 0.25;
+
+    // Each image's centre and focal, by image id, for clamp_unresolved_depths.
+    static void record_views(const std::vector<ImageData>& images,
+                             const std::unordered_map<uint32_t, CameraDataIntermediate>& cameras,
+                             ColmapPointCloudRecords& records) {
+        records.views.clear();
+        for (const auto& image : images) {
+            const auto camera = cameras.find(image.camera_id);
+            if (camera == cameras.end() || camera->second.params.empty())
+                continue;
+            const auto r = qvec2rotmat_values(image.qvec);
+            std::array<double, 4> view{0.0, 0.0, 0.0, camera->second.params[0]};
+            for (int a = 0; a < 3; ++a)
+                view[a] = -(r[a] * image.tvec[0] + r[3 + a] * image.tvec[1] + r[6 + a] * image.tvec[2]);
+            records.views.emplace(image.image_id, view);
+        }
+    }
+
+    // Moves each point beyond the depth at which its track's baseline across its ray resolves kResolvedParallaxPixels
+    // along that ray, from the track's mean centre, to that depth.
+    static void clamp_unresolved_depths(std::vector<Point3DData>& points,
+                                        const std::unordered_map<uint32_t, std::array<double, 4>>& views) {
+        std::atomic<size_t> moved{0};
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, points.size(), 4096), [&](const tbb::blocked_range<size_t>& range) {
+            std::vector<std::array<double, 4>> track;
+            std::vector<double> focals;
+            size_t moved_here = 0;
+            for (size_t i = range.begin(); i != range.end(); ++i) {
+                auto& point = points[i];
+                track.clear();
+                for (const auto& element : point.track)
+                    if (const auto view = views.find(element.image_id); view != views.end())
+                        track.push_back(view->second);
+                if (track.size() < 2)
+                    continue;
+                double center[3] = {0.0, 0.0, 0.0};
+                for (const auto& view : track)
+                    for (int a = 0; a < 3; ++a)
+                        center[a] += view[a] / static_cast<double>(track.size());
+                const double ray[3] = {point.xyz[0] - center[0], point.xyz[1] - center[1], point.xyz[2] - center[2]};
+                const double depth = std::sqrt(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
+                if (!(depth > 0.0) || !std::isfinite(depth))
+                    continue;
+                double across_sq = 0.0;
+                focals.clear();
+                for (const auto& view : track) {
+                    const double offset[3] = {view[0] - center[0], view[1] - center[1], view[2] - center[2]};
+                    const double along = (offset[0] * ray[0] + offset[1] * ray[1] + offset[2] * ray[2]) / depth;
+                    across_sq = std::max(across_sq,
+                                         offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2] - along * along);
+                    focals.push_back(view[3]);
+                }
+                std::nth_element(focals.begin(), focals.begin() + focals.size() / 2, focals.end());
+                const double limit = focals[focals.size() / 2] * 2.0 * std::sqrt(across_sq) / kResolvedParallaxPixels;
+                if (!(limit > 0.0) || depth <= limit)
+                    continue;
+                for (int a = 0; a < 3; ++a)
+                    point.xyz[a] = center[a] + ray[a] * (limit / depth);
+                ++moved_here;
+            }
+            moved += moved_here;
+        });
+        if (moved > 0)
+            LOG_INFO("COLMAP: moved {} of {} sparse points with unresolved depth to their parallax limit", moved.load(),
+                     points.size());
     }
 
     PointCloud point3D_records_to_point_cloud(const std::vector<Point3DData>& points) {
         const uint64_t N = points.size();
-        if (N == 0)
-            return PointCloud();
+        if (N == 0) {
+            return {};
+        }
 
         std::vector<float> positions(N * 3);
         std::vector<uint8_t> colors(N * 3);
@@ -1488,12 +1697,12 @@ namespace lfs::io {
             colors[i * 3 + 2] = points[i].color[2];
         }
 
-        Tensor means = Tensor::from_vector(positions, {N, 3}, Device::CUDA);
-        Tensor colors_tensor = Tensor::from_blob(colors.data(), {N, 3}, Device::CPU, DataType::UInt8)
-                                   .to(Device::CUDA)
-                                   .contiguous();
+        Tensor means = Tensor::from_vector(positions, {N, 3}, Device::CPU);
+        Tensor colors_tensor = Tensor::empty({N, 3}, Device::CPU, DataType::UInt8);
+        std::memcpy(colors_tensor.data_ptr(), colors.data(), colors.size());
 
-        return PointCloud(std::move(means), std::move(colors_tensor));
+        PointCloud cloud(std::move(means), std::move(colors_tensor));
+        return cloud;
     }
 
     ColmapPointCloudLoadStats point3D_records_to_point_cloud_with_stats(
@@ -1524,15 +1733,62 @@ namespace lfs::io {
         return point3D_records_to_point_cloud(read_point3D_binary_records(file_path, options));
     }
 
+    Result<LoadOutcome<std::vector<ImageData>>> read_colmap_images_binary(
+        const std::filesystem::path& file_path,
+        const LoadOptions& options) {
+        try {
+            SkipTally pose_tally;
+            SkipTally point2d_tally;
+            auto images = read_images_binary(file_path, options, &pose_tally, &point2d_tally);
+            std::vector<Diagnostic> warnings;
+            if (auto diagnostic = pose_tally.to_diagnostic(
+                    lfs::ErrorCode::DataLoss, "image(s) with an invalid pose")) {
+                warnings.push_back(std::move(*diagnostic));
+            }
+            if (auto diagnostic = point2d_tally.to_diagnostic(
+                    lfs::ErrorCode::DataLoss, "point2D observation(s)")) {
+                warnings.push_back(std::move(*diagnostic));
+            }
+            return LoadOutcome<std::vector<ImageData>>{std::move(images), std::move(warnings)};
+        } catch (const LoadCancelledError& e) {
+            return make_error(ErrorCode::CANCELLED, e.what(), file_path);
+        } catch (const lfs::Exception& e) {
+            return std::unexpected(from_lfs_error(lfs::Error(e.error()).with_context(
+                "read COLMAP images.bin", LFS_SOURCE_SITE_CURRENT())));
+        } catch (const std::exception& e) {
+            return make_error(ErrorCode::CORRUPTED_DATA,
+                              std::format("Failed to read COLMAP images.bin: {}", e.what()), file_path);
+        }
+    }
+
+    Result<LoadOutcome<std::vector<Point3DData>>> read_colmap_point3D_binary_records(
+        const std::filesystem::path& file_path,
+        const LoadOptions& options) {
+        try {
+            SkipTally tally;
+            auto records = read_point3D_binary_records(file_path, options, &tally);
+            std::vector<Diagnostic> warnings;
+            if (auto diagnostic = tally.to_diagnostic(lfs::ErrorCode::DataLoss, "point(s)")) {
+                warnings.push_back(std::move(*diagnostic));
+            }
+            return LoadOutcome<std::vector<Point3DData>>{std::move(records), std::move(warnings)};
+        } catch (const LoadCancelledError& e) {
+            return make_error(ErrorCode::CANCELLED, e.what(), file_path);
+        } catch (const lfs::Exception& e) {
+            return std::unexpected(from_lfs_error(lfs::Error(e.error()).with_context(
+                "read COLMAP points3D.bin", LFS_SOURCE_SITE_CURRENT())));
+        } catch (const std::exception& e) {
+            return make_error(ErrorCode::CORRUPTED_DATA,
+                              std::format("Failed to read COLMAP points3D.bin: {}", e.what()), file_path);
+        }
+    }
+
     // -----------------------------------------------------------------------------
     //  Text-file helpers
     // -----------------------------------------------------------------------------
     std::vector<std::string> read_text_file(const std::filesystem::path& file_path,
                                             const LoadOptions& options = {}) {
         LOG_TRACE("Reading text file: {}", lfs::core::path_to_utf8(file_path));
-        const auto start = std::chrono::high_resolution_clock::now();
-        std::error_code file_size_ec;
-        const auto byte_size = fs::file_size(file_path, file_size_ec);
         std::ifstream file;
         if (!lfs::core::open_file_for_read(file_path, file)) {
             throw_colmap_error(lfs::ErrorCode::Internal,
@@ -1559,11 +1815,6 @@ namespace lfs::io {
             lines.pop_back();
 
         LOG_TRACE("Read {} lines from text file", lines.size());
-        LOG_INFO("[COLMAP_LOAD] read_text_file file='{}' bytes={} data_lines={} elapsed_ms={:.2f}",
-                 lfs::core::path_to_utf8(file_path),
-                 file_size_ec ? std::string("unknown") : std::format("{}", byte_size),
-                 lines.size(),
-                 elapsed_ms(start));
         return lines;
     }
 
@@ -1775,9 +2026,6 @@ namespace lfs::io {
         const LoadOptions& options = {},
         SkipTally* pose_tally = nullptr) {
         LOG_TIMER_TRACE("Read images.txt camera metadata");
-        const auto start = std::chrono::high_resolution_clock::now();
-        std::error_code file_size_ec;
-        const auto byte_size = fs::file_size(file_path, file_size_ec);
 
         std::ifstream file;
         if (!lfs::core::open_file_for_read(file_path, file)) {
@@ -1854,11 +2102,6 @@ namespace lfs::io {
             throw_colmap_error(lfs::ErrorCode::DataLoss, "No valid images in images.txt");
         }
 
-        LOG_INFO("[COLMAP_LOAD] parse images.txt camera_metadata_fast images={} file_lines={} bytes={} elapsed_ms={:.2f}",
-                 images.size(),
-                 file_lines,
-                 file_size_ec ? std::string("unknown") : std::format("{}", byte_size),
-                 elapsed_ms(start));
         LOG_DEBUG("Read {} images from text file", images.size());
         return images;
     }
@@ -1913,6 +2156,8 @@ namespace lfs::io {
             cam.model_id = static_cast<int>(camera_model_names.at(model_name));
             cam.width = static_cast<int>(width);
             cam.height = static_cast<int>(height);
+            cam.original_width = cam.width;
+            cam.original_height = cam.height;
 
             bool valid = true;
             double parameter = 0.0;
@@ -1944,10 +2189,6 @@ namespace lfs::io {
                 }
                 continue;
             }
-            if (scale_factor != 1.0f) {
-                scale_camera_intrinsics(it->second.first, cam.params, scale_factor);
-            }
-
             const auto [_, inserted] = cams.emplace(cam.camera_id, std::move(cam));
             if (!inserted) {
                 throw_colmap_error(lfs::ErrorCode::DataLoss,
@@ -1976,21 +2217,18 @@ namespace lfs::io {
                                                        SkipTally* tally = nullptr) {
         LOG_TIMER_TRACE("Read points3D.txt");
         auto buffer = read_binary(file_path);
-        const auto parse_start = std::chrono::high_resolution_clock::now();
 
-        size_t total_track_elements = 0;
-        size_t file_lines = 0;
         std::vector<Point3DData> points;
 
         if (buffer->size() < POINTS3D_PARALLEL_MIN_BYTES) {
             points.reserve(std::max<size_t>(buffer->size() / 96, 1));
-            file_lines = for_each_data_line(
-                std::span<const char>(*buffer),
+            for_each_data_line(
+                std::span<const char>(buffer->data(), buffer->size()),
                 options,
                 "COLMAP point cloud parse cancelled",
                 [&](const std::string_view line, const size_t source_line) {
                     Point3DData point;
-                    if (parse_point3D_record_line(line, track_mode, point, total_track_elements)) {
+                    if (parse_point3D_record_line(line, track_mode, point)) {
                         points.push_back(std::move(point));
                     } else if (tally) {
                         tally->record(std::format("source_line={}", source_line));
@@ -1999,25 +2237,24 @@ namespace lfs::io {
         } else {
             struct RecordChunkResult {
                 std::vector<Point3DData> points;
-                size_t file_lines = 0;
-                size_t track_elements = 0;
                 SkipTally tally;
             };
 
-            const auto chunks = split_line_aligned_chunks(std::span<const char>(*buffer));
+            const auto chunks = split_line_aligned_chunks(
+                std::span<const char>(buffer->data(), buffer->size()));
             std::vector<RecordChunkResult> results(chunks.size());
             // oneTBB propagates parse/cancellation exceptions to the caller and cancels sibling work.
             tbb::parallel_for(size_t{0}, chunks.size(), [&](const size_t chunk_index) {
                 const auto& chunk = chunks[chunk_index];
                 auto& result = results[chunk_index];
                 result.points.reserve(std::max<size_t>(static_cast<size_t>(chunk.end - chunk.begin) / 96, 1));
-                result.file_lines = for_each_data_line(
+                for_each_data_line(
                     std::span<const char>(chunk.begin, static_cast<size_t>(chunk.end - chunk.begin)),
                     options,
                     "COLMAP point cloud parse cancelled",
                     [&](const std::string_view line, const size_t source_line) {
                         Point3DData point;
-                        if (parse_point3D_record_line(line, track_mode, point, result.track_elements)) {
+                        if (parse_point3D_record_line(line, track_mode, point)) {
                             result.points.push_back(std::move(point));
                         } else {
                             result.tally.record(std::format("source_line={}", source_line));
@@ -2028,8 +2265,6 @@ namespace lfs::io {
             size_t total_points = 0;
             for (const auto& result : results) {
                 total_points += result.points.size();
-                total_track_elements += result.track_elements;
-                file_lines += result.file_lines;
                 if (tally) {
                     tally->merge(result.tally);
                 }
@@ -2056,14 +2291,6 @@ namespace lfs::io {
         }
 
         LOG_DEBUG("Reading {} 3D points from text file", points.size());
-        const char* mode_name = track_mode == TrackParseMode::Full ? "full" : (track_mode == TrackParseMode::CountOnly ? "count_only" : "none");
-        LOG_INFO("[COLMAP_LOAD] parse points3D.txt points={} track_elements={} parse_tracks={} mode={} file_lines={} elapsed_ms={:.2f}",
-                 points.size(),
-                 total_track_elements,
-                 track_mode == TrackParseMode::Full,
-                 mode_name,
-                 file_lines,
-                 elapsed_ms(parse_start));
         return points;
     }
 
@@ -2087,12 +2314,13 @@ namespace lfs::io {
             }
 
             data.file_lines = for_each_data_line(
-                std::span<const char>(*buffer),
+                std::span<const char>(buffer->data(), buffer->size()),
                 options,
                 "COLMAP point cloud parse cancelled",
                 [&](const std::string_view line, const size_t source_line) {
                     if (!parse_point3D_point_cloud_line(
-                            line, data.positions, data.colors, data.point_ids, data.point_count) &&
+                            line, data.positions, data.colors, data.point_ids, data.point_count,
+                            data.track_elements) &&
                         tally) {
                         tally->record(std::format("source_line={}", source_line));
                     }
@@ -2103,11 +2331,13 @@ namespace lfs::io {
                 std::vector<uint8_t> colors;
                 std::vector<uint64_t> point_ids;
                 size_t point_count = 0;
+                size_t track_elements = 0;
                 size_t file_lines = 0;
                 SkipTally tally;
             };
 
-            const auto chunks = split_line_aligned_chunks(std::span<const char>(*buffer));
+            const auto chunks = split_line_aligned_chunks(
+                std::span<const char>(buffer->data(), buffer->size()));
             std::vector<PointCloudChunkResult> results(chunks.size());
             // oneTBB propagates parse/cancellation exceptions to the caller and cancels sibling work.
             tbb::parallel_for(size_t{0}, chunks.size(), [&](const size_t chunk_index) {
@@ -2123,7 +2353,8 @@ namespace lfs::io {
                     "COLMAP point cloud parse cancelled",
                     [&](const std::string_view line, const size_t source_line) {
                         if (!parse_point3D_point_cloud_line(
-                                line, result.positions, result.colors, result.point_ids, result.point_count)) {
+                                line, result.positions, result.colors, result.point_ids, result.point_count,
+                                result.track_elements)) {
                             result.tally.record(std::format("source_line={}", source_line));
                         }
                     });
@@ -2134,6 +2365,7 @@ namespace lfs::io {
             size_t total_point_ids = 0;
             for (const auto& result : results) {
                 data.point_count += result.point_count;
+                data.track_elements += result.track_elements;
                 data.file_lines += result.file_lines;
                 total_position_values += result.positions.size();
                 total_color_values += result.colors.size();
@@ -2178,8 +2410,9 @@ namespace lfs::io {
             }
         }
 
-        LOG_INFO("[COLMAP_LOAD] parse points3D.txt point_cloud_fast points={} file_lines={} bytes={} elapsed_ms={:.2f}",
+        LOG_INFO("[COLMAP_LOAD] parse points3D.txt point_cloud_fast points={} track_elements={} file_lines={} bytes={} elapsed_ms={:.2f}",
                  data.point_count,
+                 data.track_elements,
                  data.file_lines,
                  file_size_ec ? std::string("unknown") : std::format("{}", byte_size),
                  elapsed_ms(start));
@@ -2193,12 +2426,325 @@ namespace lfs::io {
         LOG_TIMER_TRACE("Read points3D.txt point cloud");
         auto data = parse_points3D_text_point_cloud_fast(file_path, options, tally);
 
+        if (data.point_count == 0) {
+            return {};
+        }
+
         Tensor means = Tensor::from_vector(data.positions, {data.point_count, 3}, Device::CUDA);
         Tensor colors_tensor = Tensor::from_blob(data.colors.data(), {data.point_count, 3}, Device::CPU, DataType::UInt8)
                                    .to(Device::CUDA)
                                    .contiguous();
 
-        return PointCloud(std::move(means), std::move(colors_tensor));
+        PointCloud cloud(std::move(means), std::move(colors_tensor));
+        return cloud;
+    }
+
+    struct ColmapPointPositions {
+        std::unordered_map<uint64_t, std::array<float, 3>> sparse;
+        std::vector<std::array<float, 3>> dense;
+        std::vector<uint8_t> dense_valid;
+
+        [[nodiscard]] bool empty() const noexcept {
+            return sparse.empty() && dense.empty();
+        }
+
+        [[nodiscard]] const std::array<float, 3>* find(const uint64_t id) const noexcept {
+            if (!dense.empty()) {
+                if (id < dense_valid.size() && dense_valid[static_cast<size_t>(id)]) {
+                    return &dense[static_cast<size_t>(id)];
+                }
+                return nullptr;
+            }
+            const auto it = sparse.find(id);
+            return it == sparse.end() ? nullptr : &it->second;
+        }
+    };
+
+    ColmapPointPositions make_colmap_point_positions(const std::vector<Point3DData>& records) {
+        ColmapPointPositions positions;
+        uint64_t max_id = 0;
+        size_t valid_count = 0;
+        for (const auto& point : records) {
+            if (std::isfinite(point.xyz[0]) && std::isfinite(point.xyz[1]) &&
+                std::isfinite(point.xyz[2])) {
+                max_id = std::max(max_id, point.point3D_id);
+                ++valid_count;
+            }
+        }
+        constexpr uint64_t DENSE_ID_MULTIPLIER = 4;
+        if (valid_count > 0 && max_id <= DENSE_ID_MULTIPLIER * records.size() &&
+            max_id < static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            const auto dense_size = static_cast<size_t>(max_id) + 1;
+            positions.dense.resize(dense_size);
+            positions.dense_valid.resize(dense_size, 0);
+            for (const auto& point : records) {
+                if (std::isfinite(point.xyz[0]) && std::isfinite(point.xyz[1]) &&
+                    std::isfinite(point.xyz[2])) {
+                    const auto index = static_cast<size_t>(point.point3D_id);
+                    positions.dense[index] = {
+                        static_cast<float>(point.xyz[0]),
+                        static_cast<float>(point.xyz[1]),
+                        static_cast<float>(point.xyz[2])};
+                    positions.dense_valid[index] = 1;
+                }
+            }
+        } else {
+            positions.sparse.reserve(records.size());
+            for (const auto& point : records) {
+                if (std::isfinite(point.xyz[0]) && std::isfinite(point.xyz[1]) &&
+                    std::isfinite(point.xyz[2])) {
+                    positions.sparse.emplace(
+                        point.point3D_id,
+                        std::array<float, 3>{
+                            static_cast<float>(point.xyz[0]),
+                            static_cast<float>(point.xyz[1]),
+                            static_cast<float>(point.xyz[2])});
+                }
+            }
+        }
+        return positions;
+    }
+
+    ColmapPointPositions
+    load_colmap_point_positions_if_needed(const std::filesystem::path& base,
+                                          const std::vector<ImageData>& images,
+                                          const LoadOptions& options,
+                                          ColmapPointCloudRecords* shared_records = nullptr,
+                                          SkipTally* point_tally = nullptr) {
+        ColmapPointPositions points_xyz;
+        bool any_observations = false;
+        for (const auto& image : images) {
+            if (!image.points2D.empty()) {
+                any_observations = true;
+                break;
+            }
+        }
+        if (!any_observations) {
+            return points_xyz;
+        }
+
+        try {
+            const auto search_paths = get_colmap_search_paths(base);
+            const fs::path points_bin = find_file_in_paths(search_paths, "points3D.bin");
+            const fs::path points_txt = find_file_in_paths(search_paths, "points3D.txt");
+            std::vector<Point3DData> records;
+            const std::vector<Point3DData>* records_ptr = nullptr;
+            if (shared_records && shared_records->loaded) {
+                records_ptr = &shared_records->records;
+            } else if (!points_bin.empty()) {
+                records = read_point3D_binary_records(points_bin, options, point_tally);
+                if (shared_records) {
+                    shared_records->records = std::move(records);
+                    shared_records->loaded = true;
+                    records_ptr = &shared_records->records;
+                } else {
+                    records_ptr = &records;
+                }
+            } else if (!points_txt.empty()) {
+                records = read_point3D_text_records(points_txt, options, TrackParseMode::CountOnly);
+                records_ptr = &records;
+            }
+            if (records_ptr) {
+                points_xyz = make_colmap_point_positions(*records_ptr);
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("COLMAP SfM points unavailable for eval depth_absrel: {}", e.what());
+        }
+        return points_xyz;
+    }
+
+    void attach_sfm_observations(
+        Camera& camera,
+        const ImageData& image,
+        const CameraDataIntermediate& cam_data,
+        const ColmapPointPositions& points_xyz) {
+        if (image.points2D.empty() || points_xyz.empty()) {
+            return;
+        }
+        const float u_scale =
+            cam_data.original_width > 0
+                ? static_cast<float>(cam_data.width) / static_cast<float>(cam_data.original_width)
+                : 1.0f;
+        const float v_scale =
+            cam_data.original_height > 0
+                ? static_cast<float>(cam_data.height) / static_cast<float>(cam_data.original_height)
+                : 1.0f;
+        std::vector<Camera::SfmObservation> observations;
+        observations.reserve(image.points2D.size());
+        for (const auto& point : image.points2D) {
+            if (point.point3D_id == INVALID_POINT3D_ID) {
+                continue;
+            }
+            const auto* xyz = points_xyz.find(point.point3D_id);
+            if (!xyz) {
+                continue;
+            }
+            if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
+                continue;
+            }
+            observations.push_back(Camera::SfmObservation{
+                .u = static_cast<float>(point.x) * u_scale,
+                .v = static_cast<float>(point.y) * v_scale,
+                .x = (*xyz)[0],
+                .y = (*xyz)[1],
+                .z = (*xyz)[2]});
+        }
+        camera.set_sfm_observations(std::move(observations));
+    }
+
+    struct ColmapCameraCalibration {
+        float focal_x = 0.0f;
+        float focal_y = 0.0f;
+        float center_x = 0.0f;
+        float center_y = 0.0f;
+        Tensor radial_distortion;
+        Tensor tangential_distortion;
+        lfs::core::CameraModelType camera_model_type = lfs::core::CameraModelType::PINHOLE;
+    };
+
+    static std::optional<ColmapCameraCalibration>
+    make_colmap_camera_calibration(const CameraDataIntermediate& cam_data) {
+        const auto model_it = camera_model_ids.find(cam_data.model_id);
+        if (model_it == camera_model_ids.end()) {
+            return std::nullopt;
+        }
+
+        const CAMERA_MODEL model = model_it->second.first;
+        const auto& params = cam_data.params;
+        ColmapCameraCalibration calibration;
+        switch (model) {
+        case CAMERA_MODEL::SIMPLE_PINHOLE:
+            calibration.focal_x = calibration.focal_y = params[0];
+            calibration.center_x = params[1];
+            calibration.center_y = params[2];
+            calibration.radial_distortion = Tensor::empty({0}, Device::CPU);
+            calibration.tangential_distortion = Tensor::empty({0}, Device::CPU);
+            break;
+
+        case CAMERA_MODEL::PINHOLE:
+            calibration.focal_x = params[0];
+            calibration.focal_y = params[1];
+            calibration.center_x = params[2];
+            calibration.center_y = params[3];
+            calibration.radial_distortion = Tensor::empty({0}, Device::CPU);
+            calibration.tangential_distortion = Tensor::empty({0}, Device::CPU);
+            break;
+
+        case CAMERA_MODEL::SIMPLE_RADIAL:
+            calibration.focal_x = calibration.focal_y = params[0];
+            calibration.center_x = params[1];
+            calibration.center_y = params[2];
+            calibration.radial_distortion = params[3] != 0.0f
+                                                ? Tensor::from_vector({params[3]}, {1}, Device::CPU)
+                                                : Tensor::empty({0}, Device::CPU);
+            calibration.tangential_distortion = Tensor::empty({0}, Device::CPU);
+            break;
+
+        case CAMERA_MODEL::RADIAL:
+            calibration.focal_x = calibration.focal_y = params[0];
+            calibration.center_x = params[1];
+            calibration.center_y = params[2];
+            calibration.radial_distortion = make_distortion_tensor({params[3], params[4]});
+            calibration.tangential_distortion = Tensor::empty({0}, Device::CPU);
+            break;
+
+        case CAMERA_MODEL::OPENCV:
+            calibration.focal_x = params[0];
+            calibration.focal_y = params[1];
+            calibration.center_x = params[2];
+            calibration.center_y = params[3];
+            calibration.radial_distortion = make_distortion_tensor({params[4], params[5]});
+            calibration.tangential_distortion = make_distortion_tensor({params[6], params[7]});
+            break;
+
+        case CAMERA_MODEL::FULL_OPENCV:
+            calibration.focal_x = params[0];
+            calibration.focal_y = params[1];
+            calibration.center_x = params[2];
+            calibration.center_y = params[3];
+            calibration.radial_distortion = make_distortion_tensor(
+                {params[4], params[5], params[8], params[9], params[10], params[11]});
+            calibration.tangential_distortion = make_distortion_tensor({params[6], params[7]});
+            break;
+
+        case CAMERA_MODEL::OPENCV_FISHEYE:
+            calibration.focal_x = params[0];
+            calibration.focal_y = params[1];
+            calibration.center_x = params[2];
+            calibration.center_y = params[3];
+            calibration.radial_distortion = Tensor::from_vector(
+                {params[4], params[5], params[6], params[7]}, {4}, Device::CPU);
+            calibration.tangential_distortion = Tensor::empty({0}, Device::CPU);
+            calibration.camera_model_type = lfs::core::CameraModelType::FISHEYE;
+            break;
+
+        case CAMERA_MODEL::RADIAL_FISHEYE:
+            calibration.focal_x = calibration.focal_y = params[0];
+            calibration.center_x = params[1];
+            calibration.center_y = params[2];
+            calibration.radial_distortion = Tensor::from_vector({params[3], params[4]}, {2}, Device::CPU);
+            calibration.tangential_distortion = Tensor::empty({0}, Device::CPU);
+            calibration.camera_model_type = lfs::core::CameraModelType::FISHEYE;
+            break;
+
+        case CAMERA_MODEL::SIMPLE_RADIAL_FISHEYE:
+            calibration.focal_x = calibration.focal_y = params[0];
+            calibration.center_x = params[1];
+            calibration.center_y = params[2];
+            calibration.radial_distortion = Tensor::from_vector({params[3]}, {1}, Device::CPU);
+            calibration.tangential_distortion = Tensor::empty({0}, Device::CPU);
+            calibration.camera_model_type = lfs::core::CameraModelType::FISHEYE;
+            break;
+
+        case CAMERA_MODEL::THIN_PRISM_FISHEYE:
+            // fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, sx1, sy1
+            calibration.focal_x = params[0];
+            calibration.focal_y = params[1];
+            calibration.center_x = params[2];
+            calibration.center_y = params[3];
+            calibration.radial_distortion = Tensor::from_vector(
+                {params[4], params[5], params[8], params[9]}, {4}, Device::CPU);
+            calibration.tangential_distortion = Tensor::from_vector(
+                {params[6], params[7], params[10], params[11]}, {4}, Device::CPU);
+            calibration.camera_model_type = lfs::core::CameraModelType::THIN_PRISM_FISHEYE;
+            break;
+
+        case CAMERA_MODEL::EQUIRECTANGULAR:
+            calibration.focal_x = calibration.focal_y = EQUIRECTANGULAR_DUMMY_FOCAL;
+            calibration.center_x = 0.5f * static_cast<float>(cam_data.width);
+            calibration.center_y = 0.5f * static_cast<float>(cam_data.height);
+            calibration.radial_distortion = Tensor::empty({0}, Device::CPU);
+            calibration.tangential_distortion = Tensor::empty({0}, Device::CPU);
+            calibration.camera_model_type = lfs::core::CameraModelType::EQUIRECTANGULAR;
+            break;
+
+        case CAMERA_MODEL::FOV:
+        default:
+            return std::nullopt;
+        }
+        // Expand shared focal lengths before applying the exact ratio for each axis.
+        if (model != CAMERA_MODEL::EQUIRECTANGULAR) {
+            const float x_scale = static_cast<float>(cam_data.width) / static_cast<float>(cam_data.original_width);
+            const float y_scale = static_cast<float>(cam_data.height) / static_cast<float>(cam_data.original_height);
+            calibration.focal_x *= x_scale;
+            calibration.focal_y *= y_scale;
+            calibration.center_x *= x_scale;
+            calibration.center_y *= y_scale;
+        }
+        return calibration;
+    }
+
+    static bool colmap_calibration_has_distortion(const ColmapCameraCalibration& calibration) {
+        if (calibration.camera_model_type == lfs::core::CameraModelType::EQUIRECTANGULAR) {
+            return false;
+        }
+        if (calibration.radial_distortion.is_valid() && calibration.radial_distortion.numel() > 0) {
+            return true;
+        }
+        if (calibration.tangential_distortion.is_valid() && calibration.tangential_distortion.numel() > 0) {
+            return true;
+        }
+        return calibration.camera_model_type != lfs::core::CameraModelType::PINHOLE;
     }
 
     // -----------------------------------------------------------------------------
@@ -2209,9 +2755,12 @@ namespace lfs::io {
                             const std::unordered_map<uint32_t, CameraDataIntermediate>& cam_map,
                             const std::vector<ImageData>& images,
                             const std::string& images_folder,
-                            const LoadOptions& options = {}) {
+                            const LoadOptions& options = {},
+                            ColmapDatasetCaches caches = {},
+                            const ColmapPointPositions& points_xyz = {}) {
 
         LOG_TIMER_TRACE("Assemble COLMAP cameras");
+        LOG_TIMER_DEBUG("COLMAP assemble: cameras");
 
         std::filesystem::path images_path = base_path / lfs::core::utf8_to_path(images_folder);
 
@@ -2222,314 +2771,430 @@ namespace lfs::io {
 
         std::vector<std::shared_ptr<Camera>> cameras;
         cameras.reserve(images.size());
+        std::vector<const ImageData*> camera_images;
+        std::vector<const CameraDataIntermediate*> camera_data;
+        camera_images.reserve(images.size());
+        camera_data.reserve(images.size());
+        PriorResolutionSummary prior_resolutions;
         SkipTally image_tally;
+        std::vector<std::string> missing_images;
 
-        RecursiveFileCache image_cache(images_path, options.cancel_requested);
-        MaskDirCache mask_cache(base_path, options.cancel_requested);
-        DepthDirCache depth_cache(base_path, options.cancel_requested);
-        NormalDirCache normal_cache(base_path, options.cancel_requested);
-        bool used_recursive_image_lookup = false;
+        struct CameraAssemblyEntry {
+            std::shared_ptr<Camera> camera;
+            const ImageData* image = nullptr;
+            const CameraDataIntermediate* camera_data = nullptr;
+            std::array<float, 3> position{};
+            bool missing_image = false;
+            bool depth_matched = false;
+            bool normal_matched = false;
+            std::array<int, 4> depth_sizes{}, normal_sizes{};
+            std::optional<Diagnostic> image_aspect_warning;
+            size_t undistort_crop_failures = 0;
+            size_t undistort_fisheye_crop_failures = 0;
+        };
+        std::vector<CameraAssemblyEntry> assembled(images.size());
+        std::vector<SkipTally> image_tallies(images.size());
+        std::vector<std::optional<Error>> errors(images.size());
+
+        LFS_ASSERT_MSG(caches.images && caches.masks && caches.depths && caches.normals,
+                       "COLMAP camera assembly requires validated dataset caches");
+        const auto& image_cache = *caches.images;
+        const auto& mask_cache = *caches.masks;
+        const auto& depth_cache = *caches.depths;
+        const auto& normal_cache = *caches.normals;
         size_t depth_matched_count = 0;
         size_t normal_matched_count = 0;
+        size_t undistort_crop_failures = 0;
+        size_t undistort_camera_count = 0;
+        size_t undistort_fisheye_crop_failures = 0;
+        std::unordered_map<uint32_t, std::optional<lfs::core::UndistortParams>> undistort_cache;
+        undistort_cache.reserve(cam_map.size());
+        std::unordered_map<uint32_t, ColmapCameraCalibration> calibrations;
+        calibrations.reserve(cam_map.size());
+
+        // Undistortion depends only on the COLMAP camera calibration, not on
+        // the image pose. Compute it once per camera before workers start so
+        // the image loop only installs an immutable memoized value.
+        for (const auto& [camera_id, cam_data] : cam_map) {
+            auto calibration = make_colmap_camera_calibration(cam_data);
+            if (!calibration) {
+                continue;
+            }
+            if (colmap_calibration_has_distortion(*calibration)) {
+                LOG_TIMER_DEBUG("COLMAP assemble: undistort");
+                undistort_cache.emplace(
+                    camera_id,
+                    lfs::core::compute_undistort_params(
+                        calibration->focal_x, calibration->focal_y,
+                        calibration->center_x, calibration->center_y,
+                        cam_data.width, cam_data.height,
+                        calibration->radial_distortion,
+                        calibration->tangential_distortion,
+                        calibration->camera_model_type));
+            } else {
+                undistort_cache.emplace(camera_id, std::nullopt);
+            }
+            calibrations.emplace(camera_id, std::move(*calibration));
+        }
+
+        // Preserve the serial loader's compact UID assignment even though
+        // camera construction below is indexed by the source image.
+        std::vector<int> camera_indices(images.size(), -1);
+        int next_camera_index = 0;
+        for (size_t i = 0; i < images.size(); ++i) {
+            const auto camera_it = cam_map.find(images[i].camera_id);
+            if (camera_it != cam_map.end() && calibrations.contains(images[i].camera_id)) {
+                camera_indices[i] = next_camera_index++;
+            }
+        }
 
         // Accumulate camera positions for scene center
         std::vector<float> camera_positions;
         camera_positions.reserve(images.size() * 3);
 
-        for (size_t i = 0; i < images.size(); ++i) {
-            if (should_poll_cancel(i)) {
-                throw_if_load_cancel_requested(options, "COLMAP camera assembly cancelled");
-            }
-            const ImageData& img = images[i];
-            const std::filesystem::path image_rel_path = lfs::core::utf8_to_path(img.name);
-            std::filesystem::path image_path = images_path / image_rel_path;
+        std::atomic<bool> cancelled = false;
+        std::atomic<bool> used_recursive_image_lookup = false;
+        auto rotation_storage = std::make_shared<std::vector<float>>(images.size() * 9);
+        auto translation_storage = std::make_shared<std::vector<float>>(images.size() * 3);
+        const Tensor rotation_batch = Tensor::from_external_owner(
+            rotation_storage->data(), {images.size(), 3, 3}, Device::CPU, DataType::Float32,
+            rotation_storage, images.size());
+        const Tensor translation_batch = Tensor::from_external_owner(
+            translation_storage->data(), {images.size(), 3}, Device::CPU, DataType::Float32,
+            translation_storage, images.size());
+        {
+            LOG_TIMER_DEBUG("COLMAP assemble: parallel build");
+            tbb::parallel_for(size_t{0}, images.size(), [&](const size_t i) {
+                if (should_poll_cancel(i) && is_load_cancel_requested(options)) {
+                    cancelled.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                const ImageData& img = images[i];
+                auto& output = assembled[i];
+                output.image = &img;
+                const std::filesystem::path image_rel_path = lfs::core::utf8_to_path(img.name);
+                std::filesystem::path image_path = images_path / image_rel_path;
 
-            if (!safe_exists(image_path)) {
-                if (auto image_lookup = image_cache.lookup(image_rel_path);
-                    image_lookup.found()) {
-                    if (!used_recursive_image_lookup) {
-                        LOG_WARN("COLMAP images are not in the expected flat layout under '{}'; "
-                                 "falling back to recursive image lookup",
-                                 lfs::core::path_to_utf8(images_path));
-                        used_recursive_image_lookup = true;
+                if (!safe_exists(image_path)) {
+                    if (auto image_lookup = image_cache.lookup(image_rel_path);
+                        image_lookup.found()) {
+                        used_recursive_image_lookup.store(true, std::memory_order_relaxed);
+                        image_path = std::move(image_lookup.path);
+                    } else if (image_lookup.ambiguous()) {
+                        errors[i] = make_ambiguous_image_reference_error(images_path, img.name).error();
+                        return;
                     }
-                    image_path = std::move(image_lookup.path);
-                } else if (image_lookup.ambiguous()) {
-                    return make_ambiguous_image_reference_error(images_path, img.name);
-                } else {
-                    return make_error(ErrorCode::PATH_NOT_FOUND,
-                                      std::format("Image '{}' was not found under '{}'",
-                                                  img.name,
-                                                  lfs::core::path_to_utf8(images_path)),
-                                      image_path);
                 }
-            }
 
-            auto it = cam_map.find(img.camera_id);
-            if (it == cam_map.end()) {
-                image_tally.record(img.name);
-                continue;
-            }
+                const bool image_file_present = safe_is_regular_file(image_path);
 
-            const auto& cam_data = it->second;
-
-            // Convert quaternion to rotation matrix
-            Tensor R = qvec2rotmat(img.qvec);
-
-            // Create translation tensor
-            Tensor T = Tensor::from_vector(img.tvec, {3}, Device::CPU);
-
-            // Calculate camera position: -R^T * T
-            auto R_cpu = R.cpu();
-            auto T_cpu = T.cpu();
-
-            float RT[9];
-            for (int r = 0; r < 3; ++r) {
-                for (int c = 0; c < 3; ++c) {
-                    RT[r * 3 + c] = R_cpu.ptr<float>()[c * 3 + r]; // Transpose
+                auto it = cam_map.find(img.camera_id);
+                if (it == cam_map.end()) {
+                    image_tallies[i].record(img.name);
+                    return;
                 }
-            }
 
-            float cam_pos[3] = {0, 0, 0};
-            for (int r = 0; r < 3; ++r) {
-                for (int c = 0; c < 3; ++c) {
-                    cam_pos[r] -= RT[r * 3 + c] * T_cpu.ptr<float>()[c];
+                const auto& cam_data = it->second;
+
+                const auto model_it = camera_model_ids.find(cam_data.model_id);
+                if (model_it == camera_model_ids.end()) {
+                    errors[i] = make_error(
+                                    ErrorCode::UNSUPPORTED_FORMAT,
+                                    std::format("Invalid camera model ID {} for image '{}'", cam_data.model_id, img.name),
+                                    image_path)
+                                    .error();
+                    return;
                 }
-            }
-
-            // Extract camera parameters based on model
-            auto model_it = camera_model_ids.find(cam_data.model_id);
-            if (model_it == camera_model_ids.end()) {
-                return make_error(ErrorCode::UNSUPPORTED_FORMAT,
-                                  std::format("Invalid camera model ID {} for image '{}'", cam_data.model_id, img.name),
-                                  image_path);
-            }
-
-            CAMERA_MODEL model = model_it->second.first;
-            const auto& params = cam_data.params;
-
-            float focal_x = 0, focal_y = 0, center_x = 0, center_y = 0;
-            Tensor radial_dist, tangential_dist;
-            lfs::core::CameraModelType camera_model_type = lfs::core::CameraModelType::PINHOLE;
-
-            switch (model) {
-            case CAMERA_MODEL::SIMPLE_PINHOLE:
-                focal_x = focal_y = params[0];
-                center_x = params[1];
-                center_y = params[2];
-                radial_dist = Tensor::empty({0}, Device::CPU);
-                tangential_dist = Tensor::empty({0}, Device::CPU);
-                break;
-
-            case CAMERA_MODEL::PINHOLE:
-                focal_x = params[0];
-                focal_y = params[1];
-                center_x = params[2];
-                center_y = params[3];
-                radial_dist = Tensor::empty({0}, Device::CPU);
-                tangential_dist = Tensor::empty({0}, Device::CPU);
-                break;
-
-            case CAMERA_MODEL::SIMPLE_RADIAL:
-                focal_x = focal_y = params[0];
-                center_x = params[1];
-                center_y = params[2];
-                if (params[3] != 0.0f) {
-                    radial_dist = Tensor::from_vector({params[3]}, {1}, Device::CPU);
-                } else {
-                    radial_dist = Tensor::empty({0}, Device::CPU);
+                const auto calibration_it = calibrations.find(img.camera_id);
+                if (calibration_it == calibrations.end()) {
+                    image_tallies[i].record(img.name);
+                    return;
                 }
-                tangential_dist = Tensor::empty({0}, Device::CPU);
-                camera_model_type = lfs::core::CameraModelType::PINHOLE;
-                break;
+                const auto& calibration = calibration_it->second;
 
-            case CAMERA_MODEL::RADIAL:
-                focal_x = focal_y = params[0];
-                center_x = params[1];
-                center_y = params[2];
-                radial_dist = make_distortion_tensor({params[3], params[4]});
-                tangential_dist = Tensor::empty({0}, Device::CPU);
-                break;
+                // Keep the per-image pose data in pageable batch storage. CPU
+                // Tensor::empty uses the pinned allocator, whose mutex would turn
+                // these tiny per-image allocations into a serial section.
+                const auto rotation = qvec2rotmat_values(img.qvec);
+                std::copy(rotation.begin(), rotation.end(), rotation_storage->begin() + i * 9);
+                std::copy(img.tvec.begin(), img.tvec.end(), translation_storage->begin() + i * 3);
+                // Drop the batch dimension before handing the views to Camera. Both
+                // slices are dense, so contiguous() preserves the shared pageable
+                // storage and its lifetime while making the tensor contract explicit.
+                Tensor R = rotation_batch.slice(0, i, i + 1).squeeze(0).contiguous();
+                Tensor T = translation_batch.slice(0, i, i + 1).squeeze(0).contiguous();
 
-            case CAMERA_MODEL::OPENCV:
-                focal_x = params[0];
-                focal_y = params[1];
-                center_x = params[2];
-                center_y = params[3];
-                radial_dist = make_distortion_tensor({params[4], params[5]});
-                tangential_dist = make_distortion_tensor({params[6], params[7]});
-                break;
-
-            case CAMERA_MODEL::FULL_OPENCV:
-                focal_x = params[0];
-                focal_y = params[1];
-                center_x = params[2];
-                center_y = params[3];
-                radial_dist = make_distortion_tensor({params[4], params[5], params[8], params[9], params[10], params[11]});
-                tangential_dist = make_distortion_tensor({params[6], params[7]});
-                break;
-
-            case CAMERA_MODEL::OPENCV_FISHEYE:
-                focal_x = params[0];
-                focal_y = params[1];
-                center_x = params[2];
-                center_y = params[3];
-                radial_dist = Tensor::from_vector({params[4], params[5], params[6], params[7]}, {4}, Device::CPU);
-                tangential_dist = Tensor::empty({0}, Device::CPU);
-                camera_model_type = lfs::core::CameraModelType::FISHEYE;
-                break;
-
-            case CAMERA_MODEL::RADIAL_FISHEYE:
-                focal_x = focal_y = params[0];
-                center_x = params[1];
-                center_y = params[2];
-                radial_dist = Tensor::from_vector({params[3], params[4]}, {2}, Device::CPU);
-                tangential_dist = Tensor::empty({0}, Device::CPU);
-                camera_model_type = lfs::core::CameraModelType::FISHEYE;
-                break;
-
-            case CAMERA_MODEL::SIMPLE_RADIAL_FISHEYE:
-                focal_x = focal_y = params[0];
-                center_x = params[1];
-                center_y = params[2];
-                radial_dist = Tensor::from_vector({params[3]}, {1}, Device::CPU);
-                tangential_dist = Tensor::empty({0}, Device::CPU);
-                camera_model_type = lfs::core::CameraModelType::FISHEYE;
-                break;
-
-            case CAMERA_MODEL::THIN_PRISM_FISHEYE:
-                // fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, sx1, sy1
-                focal_x = params[0];
-                focal_y = params[1];
-                center_x = params[2];
-                center_y = params[3];
-                radial_dist = Tensor::from_vector({params[4], params[5], params[8], params[9]}, {4}, Device::CPU);       // k1,k2,k3,k4
-                tangential_dist = Tensor::from_vector({params[6], params[7], params[10], params[11]}, {4}, Device::CPU); // p1,p2,sx1,sy1
-                camera_model_type = lfs::core::CameraModelType::THIN_PRISM_FISHEYE;
-                break;
-
-            case CAMERA_MODEL::FOV:
-                image_tally.record(img.name);
-                continue;
-
-            case CAMERA_MODEL::EQUIRECTANGULAR:
-                // Equirectangular 360 panorama. params = [width, height]; no real
-                // intrinsics. The EQUIRECTANGULAR rasterizer derives projection
-                // from the image dimensions, so we only set placeholder focal/center.
-                focal_x = focal_y = EQUIRECTANGULAR_DUMMY_FOCAL;
-                center_x = 0.5f * static_cast<float>(cam_data.width);
-                center_y = 0.5f * static_cast<float>(cam_data.height);
-                radial_dist = Tensor::empty({0}, Device::CPU);
-                tangential_dist = Tensor::empty({0}, Device::CPU);
-                camera_model_type = lfs::core::CameraModelType::EQUIRECTANGULAR;
-                break;
-
-            default:
-                image_tally.record(img.name);
-                continue;
-            }
-
-            camera_positions.push_back(cam_pos[0]);
-            camera_positions.push_back(cam_pos[1]);
-            camera_positions.push_back(cam_pos[2]);
-
-            std::filesystem::path mask_path;
-            if (auto mask_lookup = mask_cache.lookup(img.name); mask_lookup.found()) {
-                mask_path = std::move(mask_lookup.path);
-            } else if (mask_lookup.ambiguous()) {
-                return make_ambiguous_mask_reference_error(base_path, img.name);
-            }
-
-            std::filesystem::path depth_path;
-            if (auto depth_lookup = depth_cache.lookup(img.name); depth_lookup.found()) {
-                depth_path = std::move(depth_lookup.path);
-                ++depth_matched_count;
-            } else if (depth_lookup.ambiguous()) {
-                return make_error(
-                    ErrorCode::INVALID_DATASET,
-                    std::format("Depth map for image '{}' is ambiguous across the dataset depth folders. "
-                                "Keep depth maps in the same relative subdirectories as the images or rename them uniquely.",
-                                img.name),
-                    base_path);
-            }
-
-            std::filesystem::path normal_path;
-            if (auto normal_lookup = normal_cache.lookup(img.name); normal_lookup.found()) {
-                normal_path = std::move(normal_lookup.path);
-                ++normal_matched_count;
-            } else if (normal_lookup.ambiguous()) {
-                return make_error(
-                    ErrorCode::INVALID_DATASET,
-                    std::format("Normal map for image '{}' is ambiguous across the dataset normal folders. "
-                                "Keep normal maps in the same relative subdirectories as the images or rename them uniquely.",
-                                img.name),
-                    base_path);
-            }
-
-            // Validate mask/depth dimensions match image dimensions
-            std::optional<std::tuple<int, int, int>> image_info;
-            auto get_image_info_cached = [&]() {
-                if (!image_info.has_value()) {
-                    image_info = lfs::core::get_image_info(image_path);
+                // Calculate camera position: -R^T * T
+                float RT[9];
+                const float* R_ptr = R.ptr<float>();
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        RT[r * 3 + c] = R_ptr[c * 3 + r]; // Transpose
+                    }
                 }
-                return *image_info;
-            };
-            if (!mask_path.empty()) {
-                auto [img_w, img_h, img_c] = get_image_info_cached();
-                auto [mask_w, mask_h, mask_c] = lfs::core::get_image_info(mask_path);
-                if (img_w != mask_w || img_h != mask_h) {
-                    return make_error(ErrorCode::MASK_SIZE_MISMATCH,
-                                      std::format("Mask '{}' is {}x{} but image '{}' is {}x{}",
-                                                  lfs::core::path_to_utf8(mask_path.filename()), mask_w, mask_h,
-                                                  img.name, img_w, img_h),
-                                      mask_path);
-                }
-            }
-            if (!depth_path.empty()) {
-                auto [img_w, img_h, img_c] = get_image_info_cached();
-                auto [depth_w, depth_h, depth_c] = lfs::core::get_image_info(depth_path);
-                if (img_w != depth_w || img_h != depth_h) {
-                    return make_error(ErrorCode::DEPTH_SIZE_MISMATCH,
-                                      std::format("Depth map '{}' is {}x{} but image '{}' is {}x{}",
-                                                  lfs::core::path_to_utf8(depth_path.filename()), depth_w, depth_h,
-                                                  img.name, img_w, img_h),
-                                      depth_path);
-                }
-            }
-            if (!normal_path.empty()) {
-                auto [img_w, img_h, img_c] = get_image_info_cached();
-                auto [normal_w, normal_h, normal_c] = lfs::core::get_image_info(normal_path);
-                if (img_w != normal_w || img_h != normal_h) {
-                    return make_error(ErrorCode::NORMAL_SIZE_MISMATCH,
-                                      std::format("Normal map '{}' is {}x{} but image '{}' is {}x{}",
-                                                  lfs::core::path_to_utf8(normal_path.filename()), normal_w, normal_h,
-                                                  img.name, img_w, img_h),
-                                      normal_path);
-                }
-            }
 
-            // Create Camera
-            auto camera = std::make_shared<Camera>(
-                R,
-                T,
-                focal_x, focal_y,
-                center_x, center_y,
-                radial_dist,
-                tangential_dist,
-                camera_model_type,
-                img.name,
-                image_path,
-                mask_path,
-                cam_data.width,
-                cam_data.height,
-                static_cast<int>(cameras.size()),
-                static_cast<int>(img.camera_id),
-                depth_path,
-                normal_path);
+                float cam_pos[3] = {0, 0, 0};
+                const float* T_ptr = T.ptr<float>();
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        cam_pos[r] -= RT[r * 3 + c] * T_ptr[c];
+                    }
+                }
 
-            camera->precompute_undistortion();
+                output.position = {cam_pos[0], cam_pos[1], cam_pos[2]};
 
-            cameras.push_back(std::move(camera));
+                std::filesystem::path mask_path;
+                if (auto mask_lookup = mask_cache.lookup(img.name); mask_lookup.found()) {
+                    mask_path = std::move(mask_lookup.path);
+                } else if (mask_lookup.ambiguous()) {
+                    if (options.load_masks) {
+                        errors[i] = make_ambiguous_mask_reference_error(base_path, img.name).error();
+                        return;
+                    }
+                    LOG_WARN("Mask for image '{}' is ambiguous; skipping sidecar because mask usage is disabled",
+                             img.name);
+                }
+
+                std::filesystem::path depth_path;
+                if (auto depth_lookup = depth_cache.lookup(img.name); depth_lookup.found()) {
+                    depth_path = std::move(depth_lookup.path);
+                    output.depth_matched = true;
+                } else if (depth_lookup.ambiguous()) {
+                    if (options.load_depths) {
+                        errors[i] = make_error(
+                                        ErrorCode::INVALID_DATASET,
+                                        std::format("Depth map for image '{}' is ambiguous across the dataset depth folders. "
+                                                    "Keep depth maps in the same relative subdirectories as the images or rename them uniquely.",
+                                                    img.name),
+                                        base_path)
+                                        .error();
+                        return;
+                    }
+                    LOG_WARN("Depth map for image '{}' is ambiguous; skipping sidecar because depth usage is disabled",
+                             img.name);
+                }
+
+                std::filesystem::path normal_path;
+                if (auto normal_lookup = normal_cache.lookup(img.name); normal_lookup.found()) {
+                    normal_path = std::move(normal_lookup.path);
+                    output.normal_matched = true;
+                } else if (normal_lookup.ambiguous()) {
+                    if (options.load_normals) {
+                        errors[i] = make_error(
+                                        ErrorCode::INVALID_DATASET,
+                                        std::format("Normal map for image '{}' is ambiguous across the dataset normal folders. "
+                                                    "Keep normal maps in the same relative subdirectories as the images or rename them uniquely.",
+                                                    img.name),
+                                        base_path)
+                                        .error();
+                        return;
+                    }
+                    LOG_WARN("Normal map for image '{}' is ambiguous; skipping sidecar because normal usage is disabled",
+                             img.name);
+                }
+
+                // Validate mask/depth dimensions match image dimensions
+                std::optional<std::tuple<int, int, int>> image_info;
+                auto get_image_info_cached = [&]() {
+                    if (!image_info.has_value()) {
+                        image_info = lfs::core::get_image_info(image_path);
+                    }
+                    return *image_info;
+                };
+                // Advisory only: retain existing import behavior when a header cannot be probed.
+                if (image_file_present) {
+                    try {
+                        const auto [img_w, img_h, img_c] = get_image_info_cached();
+                        if (img_w > 0 && img_h > 0) {
+                            const double aspect_scale = (static_cast<double>(img_w) * cam_data.height) /
+                                                        (static_cast<double>(img_h) * cam_data.width);
+                            if (std::abs(aspect_scale - 1.0) > 0.01) {
+                                output.image_aspect_warning = Diagnostic{
+                                    .code = lfs::ErrorCode::InvalidArgument,
+                                    .message = std::format(
+                                        "Image '{}' is {}x{} but COLMAP camera {} is {}x{} (aspect ratio differs by {:.1f}%). "
+                                        "Intrinsics will be scaled independently in x and y; check for cropping or incorrect camera metadata.",
+                                        img.name, img_w, img_h, img.camera_id, cam_data.width, cam_data.height,
+                                        std::abs(aspect_scale - 1.0) * 100.0),
+                                    .fields = lfs::SmallFields{},
+                                };
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_DEBUG("Could not check image aspect ratio for '{}': {}", img.name, e.what());
+                    }
+                }
+                if (image_file_present && options.load_masks && !mask_path.empty()) {
+                    auto [img_w, img_h, img_c] = get_image_info_cached();
+                    auto [mask_w, mask_h, mask_c] = lfs::core::get_image_info(mask_path);
+                    if (img_w != mask_w || img_h != mask_h) {
+                        errors[i] = make_error(
+                                        ErrorCode::MASK_SIZE_MISMATCH,
+                                        std::format("Mask '{}' is {}x{} but image '{}' is {}x{}",
+                                                    lfs::core::path_to_utf8(mask_path.filename()), mask_w, mask_h,
+                                                    img.name, img_w, img_h),
+                                        mask_path)
+                                        .error();
+                        return;
+                    }
+                }
+                if (image_file_present && options.load_depths && !depth_path.empty()) {
+                    auto [img_w, img_h, img_c] = get_image_info_cached();
+                    auto [depth_w, depth_h, depth_c] = lfs::core::get_image_info(depth_path);
+                    if (depth_c != 1 || !sidecar_dimensions_match_contract(depth_w, depth_h, img_w, img_h)) {
+                        if (!options.depth_auto_generate) {
+                            errors[i] = make_error(
+                                            ErrorCode::DEPTH_SIZE_MISMATCH,
+                                            std::format("Depth map '{}' is {}x{} but image '{}' is {}x{}; expected a 1-channel map with aspect ratio within 1%",
+                                                        lfs::core::path_to_utf8(depth_path.filename()), depth_w, depth_h,
+                                                        img.name, img_w, img_h),
+                                            depth_path)
+                                            .error();
+                            return;
+                        }
+                        LOG_WARN("Depth map '{}' is {}x{} but image '{}' is {}x{}; "
+                                 "ignoring it so auto-generate can overwrite that file",
+                                 lfs::core::path_to_utf8(depth_path.filename()),
+                                 depth_w, depth_h, img.name, img_w, img_h);
+                        output.depth_matched = false;
+                        depth_path.clear();
+                    } else {
+                        output.depth_sizes = {depth_w, depth_h, img_w, img_h};
+                    }
+                }
+                if (image_file_present && options.load_normals && !normal_path.empty()) {
+                    auto [img_w, img_h, img_c] = get_image_info_cached();
+                    auto [normal_w, normal_h, normal_c] = lfs::core::get_image_info(normal_path);
+                    if (normal_c != 3 || !sidecar_dimensions_match_contract(normal_w, normal_h, img_w, img_h)) {
+                        if (options.normal_auto_generate) {
+                            LOG_WARN("Normal map '{}' is {}x{} but image '{}' is {}x{}; "
+                                     "ignoring it so auto-generate can overwrite that file",
+                                     lfs::core::path_to_utf8(normal_path.filename()),
+                                     normal_w, normal_h, img.name, img_w, img_h);
+                            output.normal_matched = false;
+                            normal_path.clear();
+                        } else {
+                            errors[i] = make_error(
+                                            ErrorCode::NORMAL_SIZE_MISMATCH,
+                                            std::format("Normal map '{}' is {}x{} but image '{}' is {}x{}; expected a 3-channel map with aspect ratio within 1%",
+                                                        lfs::core::path_to_utf8(normal_path.filename()), normal_w, normal_h,
+                                                        img.name, img_w, img_h),
+                                            normal_path)
+                                            .error();
+                            return;
+                        }
+                    }
+                    if (!normal_path.empty())
+                        output.normal_sizes = {normal_w, normal_h, img_w, img_h};
+                }
+
+                // Create Camera
+                auto camera = std::make_shared<Camera>(
+                    R,
+                    T,
+                    calibration.focal_x, calibration.focal_y,
+                    calibration.center_x, calibration.center_y,
+                    calibration.radial_distortion,
+                    calibration.tangential_distortion,
+                    calibration.camera_model_type,
+                    img.name,
+                    image_path,
+                    mask_path,
+                    cam_data.width,
+                    cam_data.height,
+                    camera_indices[i],
+                    static_cast<int>(img.camera_id),
+                    depth_path,
+                    normal_path);
+
+                const auto undistort_it = undistort_cache.find(img.camera_id);
+                if (undistort_it != undistort_cache.end() && undistort_it->second) {
+                    camera->adopt_undistortion(*undistort_it->second);
+                }
+                if (camera->undistort_params().crop_solve_failed) {
+                    output.undistort_crop_failures = 1;
+                    if (calibration.camera_model_type == lfs::core::CameraModelType::FISHEYE ||
+                        calibration.camera_model_type == lfs::core::CameraModelType::THIN_PRISM_FISHEYE) {
+                        output.undistort_fisheye_crop_failures = 1;
+                    }
+                }
+                if (!image_file_present) {
+                    camera->set_has_image(false);
+                    output.missing_image = true;
+                }
+                output.camera_data = &cam_data;
+                output.camera = std::move(camera);
+            });
+        }
+
+        if (cancelled.load(std::memory_order_relaxed)) {
+            throw_if_load_cancel_requested(options, "COLMAP camera assembly cancelled");
+        }
+        for (const auto& error : errors) {
+            if (error) {
+                return std::unexpected<Error>(*error);
+            }
+        }
+        if (used_recursive_image_lookup.load(std::memory_order_relaxed)) {
+            LOG_WARN("COLMAP images are not in the expected flat layout under '{}'; "
+                     "falling back to recursive image lookup",
+                     lfs::core::path_to_utf8(images_path));
+        }
+        {
+            LOG_TIMER_DEBUG("COLMAP assemble: compact");
+            for (size_t i = 0; i < assembled.size(); ++i) {
+                auto& output = assembled[i];
+                image_tally.merge(image_tallies[i]);
+                if (!output.camera) {
+                    continue;
+                }
+                camera_positions.insert(camera_positions.end(), output.position.begin(), output.position.end());
+                camera_images.push_back(output.image);
+                camera_data.push_back(output.camera_data);
+                cameras.push_back(std::move(output.camera));
+                if (output.missing_image) {
+                    missing_images.push_back(output.image->name);
+                }
+                prior_resolutions.add(output.depth_sizes, false);
+                prior_resolutions.add(output.normal_sizes, true);
+                depth_matched_count += output.depth_matched ? 1 : 0;
+                normal_matched_count += output.normal_matched ? 1 : 0;
+                undistort_camera_count += 1;
+                undistort_crop_failures += output.undistort_crop_failures;
+                undistort_fisheye_crop_failures += output.undistort_fisheye_crop_failures;
+            }
+        }
+
+        prior_resolutions.log();
+
+        std::atomic<bool> observation_cancelled = false;
+        {
+            LOG_TIMER_DEBUG("COLMAP assemble: sfm observations");
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, cameras.size(), 32),
+                              [&](const tbb::blocked_range<size_t>& range) {
+                                  for (size_t i = range.begin(); i != range.end(); ++i) {
+                                      if (should_poll_cancel(i) && is_load_cancel_requested(options)) {
+                                          observation_cancelled.store(true, std::memory_order_relaxed);
+                                          return;
+                                      }
+                                      attach_sfm_observations(*cameras[i], *camera_images[i],
+                                                              *camera_data[i], points_xyz);
+                                  }
+                              });
+        }
+        if (observation_cancelled.load(std::memory_order_relaxed)) {
+            throw_if_load_cancel_requested(options, "COLMAP camera assembly cancelled");
+        }
+
+        if (undistort_crop_failures > 0) {
+            if (undistort_fisheye_crop_failures > 0) {
+                LOG_WARN("Undistort crop solve failed for {} of {} cameras; original intrinsics kept; "
+                         "fisheye-family lenses cannot be rectified to pinhole and are handled natively by GUT",
+                         undistort_crop_failures, undistort_camera_count);
+            } else {
+                LOG_WARN("Undistort crop solve failed for {} of {} cameras; original intrinsics kept",
+                         undistort_crop_failures, undistort_camera_count);
+            }
         }
 
         if (cameras.empty()) {
@@ -2538,11 +3203,30 @@ namespace lfs::io {
                               base_path);
         }
 
-        // Compute scene center as mean of camera positions
-        Tensor scene_center_tensor = Tensor::from_vector(camera_positions, {cameras.size(), 3}, Device::CPU);
-        Tensor scene_center = scene_center_tensor.mean({0}, false);
+        const bool any_present_image = std::any_of(
+            cameras.begin(), cameras.end(), [](const auto& camera) { return camera->has_image(); });
+        if (!any_present_image) {
+            return make_error(
+                ErrorCode::EMPTY_DATASET,
+                format_all_dataset_images_missing_message(
+                    missing_images,
+                    lfs::core::path_to_utf8(images_path)),
+                images_path);
+        }
 
-        LOG_INFO("Training with {} images", cameras.size());
+        Tensor scene_center;
+        {
+            LOG_TIMER_DEBUG("COLMAP assemble: scene center");
+            // Compute scene center as mean of camera positions
+            Tensor scene_center_tensor = Tensor::from_vector(camera_positions, {cameras.size(), 3}, Device::CPU);
+            scene_center = scene_center_tensor.mean({0}, false);
+        }
+
+        const size_t training_image_count = static_cast<size_t>(
+            std::count_if(cameras.begin(), cameras.end(), [](const auto& camera) {
+                return camera->has_image();
+            }));
+        LOG_INFO("Training with {} images ({} camera records)", training_image_count, cameras.size());
         if (depth_cache.has_depth_dirs()) {
             if (depth_matched_count == 0) {
                 LOG_WARN("Depth folder found but no depth map matched any of the {} images. "
@@ -2563,9 +3247,35 @@ namespace lfs::io {
         }
 
         std::vector<Diagnostic> warnings;
+        // A whole cropped dataset would otherwise add one warning per image.
+        size_t aspect_mismatches = 0;
+        for (auto& output : assembled) {
+            if (!output.image_aspect_warning)
+                continue;
+            if (++aspect_mismatches > kMaxSkipSamples) {
+                LOG_DEBUG("{}", output.image_aspect_warning->message);
+                continue;
+            }
+            LOG_WARN("{}", output.image_aspect_warning->message);
+            warnings.push_back(std::move(*output.image_aspect_warning));
+        }
+        if (aspect_mismatches > kMaxSkipSamples) {
+            auto summary = std::format("{} more image(s) differ in aspect ratio from their COLMAP camera",
+                                       aspect_mismatches - kMaxSkipSamples);
+            LOG_WARN("{}", summary);
+            warnings.push_back(Diagnostic{
+                .code = lfs::ErrorCode::InvalidArgument,
+                .message = std::move(summary),
+                .fields = lfs::SmallFields{}.add("count", static_cast<std::int64_t>(aspect_mismatches)),
+            });
+        }
         if (auto diagnostic = image_tally.to_diagnostic(
                 lfs::ErrorCode::DataLoss, "image(s) with an unusable camera")) {
             warnings.push_back(std::move(*diagnostic));
+        }
+        if (!missing_images.empty()) {
+            warnings.push_back(missing_dataset_images_diagnostic(missing_images));
+            notify_missing_dataset_images(missing_images);
         }
         return LoadOutcome<std::tuple<std::vector<std::shared_ptr<Camera>>, Tensor>>{
             std::make_tuple(std::move(cameras), scene_center), std::move(warnings)};
@@ -3112,22 +3822,23 @@ namespace lfs::io {
                                return std::isfinite(value);
                            }),
                            std::format("COLMAP point {} coordinates must be finite", point.point3D_id));
-            LFS_ASSERT_MSG(std::isfinite(point.error) && point.error >= 0.0,
-                           std::format("COLMAP point {} error must be finite and non-negative",
+            LFS_ASSERT_MSG(std::isfinite(point.error),
+                           std::format("COLMAP point {} error must be finite",
                                        point.point3D_id));
             LFS_ASSERT_MSG(point.track_count == point.track.size(),
                            std::format("COLMAP point track count must match its stored track "
                                        "(point3D_id={}, declared_count={}, stored_count={})",
                                        point.point3D_id, point.track_count, point.track.size()));
-            std::unordered_set<uint32_t> track_images;
+            std::unordered_set<uint64_t> track_observations;
             for (const auto& track : point.track) {
                 const auto image = image_by_id.find(track.image_id);
                 LFS_ASSERT_MSG(image != image_by_id.end(),
                                std::format("COLMAP point {} track references missing image {}",
                                            point.point3D_id, track.image_id));
-                LFS_ASSERT_MSG(track_images.insert(track.image_id).second,
-                               std::format("COLMAP point {} track repeats image {}",
-                                           point.point3D_id, track.image_id));
+                const uint64_t observation = (uint64_t{track.image_id} << 32) | track.point2D_idx;
+                LFS_ASSERT_MSG(track_observations.insert(observation).second,
+                               std::format("COLMAP point {} track repeats observation in image {} at point2D {}",
+                                           point.point3D_id, track.image_id, track.point2D_idx));
                 LFS_ASSERT_MSG(track.point2D_idx < image->second->points2D.size(),
                                std::format("COLMAP point track index must be in bounds for its image "
                                            "(point3D_id={}, image_id={}, point2D_index={}, point2D_count={})",
@@ -3542,17 +4253,29 @@ namespace lfs::io {
 
     Result<LoadOutcome<PointCloud>> read_colmap_point_cloud(
         const std::filesystem::path& filepath,
-        const LoadOptions& options) {
+        const LoadOptions& options,
+        ColmapPointCloudRecords* point_records) {
         LOG_TIMER_TRACE("Read COLMAP point cloud");
         try {
             const fs::path points3d_file = get_sparse_file_path(filepath, "points3D.bin");
             SkipTally tally;
-            auto records = read_point3D_binary_records(points3d_file, options, &tally);
-            auto cloud = point3D_records_to_point_cloud(records);
+            std::vector<Point3DData> records;
             std::vector<Diagnostic> warnings;
-            if (auto diagnostic = tally.to_diagnostic(lfs::ErrorCode::DataLoss, "point(s)")) {
-                warnings.push_back(std::move(*diagnostic));
+            if (point_records && point_records->loaded) {
+                records = std::move(point_records->records);
+                warnings = std::move(point_records->warnings);
+                point_records->records.clear();
+                point_records->warnings.clear();
+                point_records->loaded = false;
+            } else {
+                records = read_point3D_binary_records(points3d_file, options, &tally);
+                if (auto diagnostic = tally.to_diagnostic(lfs::ErrorCode::DataLoss, "point(s)")) {
+                    warnings.push_back(std::move(*diagnostic));
+                }
             }
+            if (point_records)
+                clamp_unresolved_depths(records, point_records->views);
+            auto cloud = point3D_records_to_point_cloud(records);
             return LoadOutcome<PointCloud>{std::move(cloud), std::move(warnings)};
         } catch (const LoadCancelledError& e) {
             return make_error(ErrorCode::CANCELLED, e.what(), filepath);
@@ -3569,17 +4292,29 @@ namespace lfs::io {
 
     Result<LoadOutcome<ColmapPointCloudLoadStats>> read_colmap_point_cloud_with_stats(
         const std::filesystem::path& filepath,
-        const LoadOptions& options) {
+        const LoadOptions& options,
+        ColmapPointCloudRecords* point_records) {
         LOG_TIMER_TRACE("Read COLMAP point cloud");
         try {
             const fs::path points3d_file = get_sparse_file_path(filepath, "points3D.bin");
             SkipTally tally;
-            auto records = read_point3D_binary_records(points3d_file, options, &tally);
-            auto stats = point3D_records_to_point_cloud_with_stats(std::move(records), options);
+            std::vector<Point3DData> records;
             std::vector<Diagnostic> warnings;
-            if (auto diagnostic = tally.to_diagnostic(lfs::ErrorCode::DataLoss, "point(s)")) {
-                warnings.push_back(std::move(*diagnostic));
+            if (point_records && point_records->loaded) {
+                records = std::move(point_records->records);
+                warnings = std::move(point_records->warnings);
+                point_records->records.clear();
+                point_records->warnings.clear();
+                point_records->loaded = false;
+            } else {
+                records = read_point3D_binary_records(points3d_file, options, &tally);
+                if (auto diagnostic = tally.to_diagnostic(lfs::ErrorCode::DataLoss, "point(s)")) {
+                    warnings.push_back(std::move(*diagnostic));
+                }
             }
+            if (point_records)
+                clamp_unresolved_depths(records, point_records->views);
+            auto stats = point3D_records_to_point_cloud_with_stats(std::move(records), options);
             return LoadOutcome<ColmapPointCloudLoadStats>{std::move(stats), std::move(warnings)};
         } catch (const LoadCancelledError& e) {
             return make_error(ErrorCode::CANCELLED, e.what(), filepath);
@@ -3620,7 +4355,11 @@ namespace lfs::io {
                 images = read_images_text_camera_metadata_only(images_txt, options);
             }
 
-            return validate_colmap_dataset_layout_impl(base, images_folder, images, options);
+            auto validation = validate_colmap_dataset_layout_impl(base, images_folder, images, options);
+            if (!validation) {
+                return std::unexpected(validation.error());
+            }
+            return {};
         } catch (const LoadCancelledError& e) {
             return make_error(ErrorCode::CANCELLED, e.what(), base);
         } catch (const lfs::Exception& e) {
@@ -3638,7 +4377,8 @@ namespace lfs::io {
     Result<LoadOutcome<std::tuple<std::vector<std::shared_ptr<Camera>>, Tensor>>>
     read_colmap_cameras_and_images(const std::filesystem::path& base,
                                    const std::string& images_folder,
-                                   const LoadOptions& options) {
+                                   const LoadOptions& options,
+                                   ColmapPointCloudRecords* point_records) {
 
         LOG_TIMER_TRACE("Read COLMAP cameras and images");
 
@@ -3650,15 +4390,26 @@ namespace lfs::io {
             SkipTally camera_tally;
             SkipTally pose_tally;
             SkipTally point2d_tally;
+            SkipTally point_tally;
             auto cam_map = read_cameras_binary(cams_file, scale_factor, options, &camera_tally);
             auto images = read_images_binary(images_file, options, &pose_tally, &point2d_tally);
+            if (point_records)
+                record_views(images, cam_map, *point_records);
 
-            LOG_INFO("Read {} cameras and {} images from COLMAP", cam_map.size(), images.size());
-            if (auto validation = validate_colmap_dataset_layout_impl(base, images_folder, images, options); !validation) {
+            auto validation = validate_colmap_dataset_layout_impl(base, images_folder, images, options);
+            if (!validation) {
                 return std::unexpected(validation.error());
             }
 
-            auto assembled = assemble_colmap_cameras(base, cam_map, images, images_folder, options);
+            auto points_xyz = load_colmap_point_positions_if_needed(
+                base, images, options, point_records, point_records ? &point_tally : nullptr);
+            if (point_records && point_records->loaded) {
+                if (auto diagnostic = point_tally.to_diagnostic(lfs::ErrorCode::DataLoss, "point(s)")) {
+                    point_records->warnings.push_back(std::move(*diagnostic));
+                }
+            }
+            auto assembled = assemble_colmap_cameras(
+                base, cam_map, images, images_folder, options, std::move(*validation), points_xyz);
             if (!assembled) {
                 return std::unexpected(assembled.error());
             }
@@ -3690,12 +4441,20 @@ namespace lfs::io {
 
     Result<LoadOutcome<PointCloud>> read_colmap_point_cloud_text(
         const std::filesystem::path& filepath,
-        const LoadOptions& options) {
+        const LoadOptions& options,
+        ColmapPointCloudRecords* point_records) {
         LOG_TIMER_TRACE("Read COLMAP point cloud (text)");
         try {
             const fs::path points3d_file = get_sparse_file_path(filepath, "points3D.txt");
             SkipTally tally;
-            auto cloud = read_point3D_text(points3d_file, options, &tally);
+            PointCloud cloud;
+            if (point_records && !point_records->views.empty()) {
+                auto records = read_point3D_text_records(points3d_file, options, TrackParseMode::Full, &tally);
+                clamp_unresolved_depths(records, point_records->views);
+                cloud = point3D_records_to_point_cloud(records);
+            } else {
+                cloud = read_point3D_text(points3d_file, options, &tally);
+            }
             std::vector<Diagnostic> warnings;
             if (auto diagnostic = tally.to_diagnostic(lfs::ErrorCode::DataLoss, "point(s)")) {
                 warnings.push_back(std::move(*diagnostic));
@@ -3716,13 +4475,17 @@ namespace lfs::io {
 
     Result<LoadOutcome<ColmapPointCloudLoadStats>> read_colmap_point_cloud_text_with_stats(
         const std::filesystem::path& filepath,
-        const LoadOptions& options) {
+        const LoadOptions& options,
+        ColmapPointCloudRecords* point_records) {
         LOG_TIMER_TRACE("Read COLMAP point cloud (text)");
         try {
             const fs::path points3d_file = get_sparse_file_path(filepath, "points3D.txt");
             SkipTally tally;
+            const bool clamping = point_records && !point_records->views.empty();
             auto records = read_point3D_text_records(
-                points3d_file, options, TrackParseMode::CountOnly, &tally);
+                points3d_file, options, clamping ? TrackParseMode::Full : TrackParseMode::CountOnly, &tally);
+            if (clamping)
+                clamp_unresolved_depths(records, point_records->views);
             auto stats = point3D_records_to_point_cloud_with_stats(std::move(records), options);
             std::vector<Diagnostic> warnings;
             if (auto diagnostic = tally.to_diagnostic(lfs::ErrorCode::DataLoss, "point(s)")) {
@@ -3745,7 +4508,8 @@ namespace lfs::io {
     Result<LoadOutcome<std::tuple<std::vector<std::shared_ptr<Camera>>, Tensor>>>
     read_colmap_cameras_and_images_text(const std::filesystem::path& base,
                                         const std::string& images_folder,
-                                        const LoadOptions& options) {
+                                        const LoadOptions& options,
+                                        ColmapPointCloudRecords* point_records) {
 
         LOG_TIMER_TRACE("Read COLMAP cameras and images (text)");
 
@@ -3758,12 +4522,16 @@ namespace lfs::io {
             SkipTally pose_tally;
             auto cam_map = read_cameras_text(cams_file, scale_factor, options, &camera_tally);
             auto images = read_images_text_camera_metadata_only(images_file, options, &pose_tally);
+            if (point_records)
+                record_views(images, cam_map, *point_records);
 
-            LOG_INFO("Read {} cameras and {} images from COLMAP text files", cam_map.size(), images.size());
-            if (auto validation = validate_colmap_dataset_layout_impl(base, images_folder, images, options); !validation) {
+            auto validation = validate_colmap_dataset_layout_impl(base, images_folder, images, options);
+            if (!validation) {
                 return std::unexpected(validation.error());
             }
-            auto assembled = assemble_colmap_cameras(base, cam_map, images, images_folder, options);
+            auto points_xyz = load_colmap_point_positions_if_needed(base, images, options);
+            auto assembled = assemble_colmap_cameras(
+                base, cam_map, images, images_folder, options, std::move(*validation), points_xyz);
             if (!assembled) {
                 return std::unexpected(assembled.error());
             }
@@ -3790,7 +4558,7 @@ namespace lfs::io {
     }
 
     Result<std::tuple<std::vector<std::shared_ptr<Camera>>, Tensor>>
-    read_colmap_cameras_only(const std::filesystem::path& sparse_path, float scale_factor) {
+    read_colmap_cameras_only(const std::filesystem::path& sparse_path, float scale_factor, int first_uid) {
         LOG_TIMER_TRACE("Read COLMAP cameras only");
         try {
 
@@ -3986,6 +4754,15 @@ namespace lfs::io {
                     continue;
                 }
 
+                if (model != CAMERA_MODEL::EQUIRECTANGULAR) {
+                    const float x_scale = static_cast<float>(cam_data.width) / static_cast<float>(cam_data.original_width);
+                    const float y_scale = static_cast<float>(cam_data.height) / static_cast<float>(cam_data.original_height);
+                    focal_x *= x_scale;
+                    focal_y *= y_scale;
+                    center_x *= x_scale;
+                    center_y *= y_scale;
+                }
+
                 camera_positions.push_back(cam_pos[0]);
                 camera_positions.push_back(cam_pos[1]);
                 camera_positions.push_back(cam_pos[2]);
@@ -4003,7 +4780,7 @@ namespace lfs::io {
                     fs::path{}, // Empty mask path
                     cam_data.width,
                     cam_data.height,
-                    static_cast<int>(cameras.size()));
+                    first_uid + static_cast<int>(cameras.size()));
 
                 cameras.push_back(std::move(camera));
             }

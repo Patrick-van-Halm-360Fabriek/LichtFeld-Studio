@@ -9,6 +9,7 @@
 #include "formats/spz.hpp"
 #include "io/error.hpp"
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -39,20 +40,27 @@ namespace lfs::io {
         if (options.validate_only) {
             LOG_DEBUG("Validation only mode for SPZ: {}", lfs::core::path_to_utf8(path));
 
-            // Check for gzip magic bytes
+            // Accept legacy gzip (v1-v3) or NGSP (v4) containers.
             std::ifstream file;
             if (!lfs::core::open_file_for_read(path, std::ios::binary, file)) {
                 return make_error(ErrorCode::READ_FAILURE,
                                   "Cannot open SPZ file", path);
             }
 
-            uint8_t header[2];
-            file.read(reinterpret_cast<char*>(header), 2);
+            uint8_t header[4] = {};
+            file.read(reinterpret_cast<char*>(header), 4);
+            const auto bytes_read = file.gcount();
 
-            // Gzip magic: 0x1f 0x8b
-            if (header[0] != 0x1f || header[1] != 0x8b) {
-                return make_error(ErrorCode::INVALID_HEADER,
-                                  "Invalid SPZ format (expected gzip compressed data)", path);
+            const bool is_gzip = bytes_read >= 2 && header[0] == 0x1f && header[1] == 0x8b;
+            const bool is_ngsp = bytes_read >= 4 &&
+                                 header[0] == 'N' && header[1] == 'G' &&
+                                 header[2] == 'S' && header[3] == 'P';
+            const bool is_glb = bytes_read >= 4 && std::memcmp(header, "glTF", 4) == 0;
+            if (!is_gzip && !is_ngsp && !is_glb) {
+                return make_error(
+                    ErrorCode::INVALID_HEADER,
+                    "Invalid SPZ format (expected gzip (v1-v3) or NGSP (v4) container)",
+                    path);
             }
 
             if (options.progress) {
@@ -78,7 +86,7 @@ namespace lfs::io {
         auto splat_result = load_spz(path);
         if (!splat_result) {
             return make_error(ErrorCode::CORRUPTED_DATA,
-                              std::format("Failed to load SPZ: {}", splat_result.error()), path);
+                              splat_result.error(), path);
         }
 
         if (options.progress) {
@@ -94,7 +102,8 @@ namespace lfs::io {
             .scene_center = Tensor::zeros({3}, Device::CPU),
             .loader_used = name(),
             .load_time = load_time,
-            .warnings = {}};
+            .warnings = {},
+            .georeference = std::nullopt};
 
         LOG_INFO("SPZ loaded successfully in {}ms", load_time.count());
 
@@ -112,7 +121,7 @@ namespace lfs::io {
 
         auto ext = path.extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        return ext == ".spz";
+        return ext == ".spz" || (ext == ".glb" && is_spz_glb(path));
     }
 
     std::string SpzLoader::name() const {

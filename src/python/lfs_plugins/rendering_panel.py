@@ -9,6 +9,7 @@ import lichtfeld as lf
 
 from . import rml_widgets as w
 from .scrub_fields import ScrubFieldController, ScrubFieldSpec
+from .selection_groups import GROUPS_LIST_ID, SelectionGroupsSection
 from .types import Panel
 from .ui import RuntimeState, PanelStateBinding, native_value as _native_store_value
 
@@ -85,7 +86,7 @@ BOOL_PROPS = [
 
 SLIDER_PROPS = [
     "axes_size", "grid_opacity", "camera_frustum_scale", "voxel_size",
-    "focal_length_mm", "render_scale", "environment_exposure", "environment_rotation_degrees",
+    "focal_length_mm", "render_scale", "color_exposure", "environment_exposure", "environment_rotation_degrees",
     "mesh_wireframe_width", "mesh_light_intensity", "mesh_ambient",
     "ppisp_exposure", "ppisp_vignette_strength", "ppisp_gamma_multiplier",
     "ppisp_gamma_red", "ppisp_gamma_green", "ppisp_gamma_blue",
@@ -101,6 +102,7 @@ SCRUB_FIELD_DEFS = {
     "voxel_size": ScrubFieldSpec(0.001, 0.1, 0.001, "%.3f"),
     "focal_length_mm": ScrubFieldSpec(10.0, 200.0, 0.1, "%.1f"),
     "render_scale": ScrubFieldSpec(0.25, 1.0, 0.01, "%.2f"),
+    "color_exposure": ScrubFieldSpec(0.1, 8.0, 0.01, "%.2f"),
     "environment_exposure": ScrubFieldSpec(-6.0, 6.0, 0.01, "%.2f"),
     "environment_rotation_degrees": ScrubFieldSpec(-180.0, 180.0, 0.1, "%.1f"),
     "mesh_wireframe_width": ScrubFieldSpec(0.5, 5.0, 0.01, "%.2f"),
@@ -137,7 +139,7 @@ SCRUB_FIELD_DEFS = {
 }
 
 SELECT_PROPS = [
-    "grid_plane", "sh_degree", "raster_backend", "camera_metrics_mode", "mesh_shadow_resolution",
+    "grid_plane", "sh_degree", "raster_backend", "camera_metrics_mode", "mesh_shadow_resolution", "color_tonemapping",
 ]
 RASTER_BACKENDS = {"3dgs", "3dgut"}
 
@@ -159,7 +161,7 @@ BACKGROUND_COLOR_PROP = "background_color"
 
 COLOR_PROPS = [
     BACKGROUND_COLOR_PROP,
-    "selection_color_committed", "selection_color_preview",
+    "selection_color_preview",
     "selection_color_center_marker",
     "mesh_wireframe_color",
 ]
@@ -191,11 +193,16 @@ LOCALE_KEY = {
     "grid_opacity": "main_panel.grid_opacity",
     "focal_length_mm": "main_panel.focal_length",
     "render_scale": "main_panel.render_scale",
+    "environment_mode": "main_panel.environment",
+    "environment_map_path": "main_panel.environment_map_path",
+    "color_exposure": "main_panel.color_exposure",
+    "color_tonemapping": "main_panel.color_tonemapping",
+    "environment_exposure": "main_panel.environment_exposure",
+    "environment_rotation_degrees": "main_panel.environment_rotation",
     "camera_metrics_mode": "main_panel.camera_metrics",
     "sh_degree": "main_panel.sh_degree",
     "grid_plane": "main_panel.plane",
     "background_color": "main_panel.color",
-    "selection_color_committed": "main_panel.committed",
     "selection_color_preview": "main_panel.preview",
     "selection_color_center_marker": "main_panel.center_marker",
     "mesh_wireframe": "main_panel.mesh_wireframe",
@@ -249,7 +256,7 @@ def _entry_label(text: str) -> str:
     text = str(text).strip()
     if not text:
         return ":"
-    return text if text.endswith(":") else f"{text}:"
+    return text if text.endswith((":", "：")) else f"{text}:"
 
 
 def _normalize_raster_backend(value):
@@ -268,25 +275,35 @@ def _color_channel_field(prop_id, suffix):
     return f"{prop_id}_{suffix}"
 
 
+RENDERING_INITIALLY_COLLAPSED = {
+    "lod",
+    "selection",
+    "mesh",
+    "post_process",
+    "ppisp_crf",
+}
+
+
 class RenderingPanel(Panel):
     id = "lfs.rendering"
-    label = "Rendering"
+    label = "window.rendering"
     space = lf.ui.PanelSpace.MAIN_PANEL_TAB
     order = 10
     template = "rmlui/rendering.rml"
-    height_mode = lf.ui.PanelHeightMode.CONTENT
+    height_mode = lf.ui.PanelHeightMode.FILL
     update_policy = "dirty"
 
     def __init__(self):
         self._handle = None
         self._color_edit_prop = None
-        self._collapsed = {"lod", "selection", "mesh", "post_process", "ppisp_crf"}
+        self._color_edit_group = None
+        self._selection_groups = SelectionGroupsSection(self._show_group_color_picker)
+        self._collapsed = set(RENDERING_INITIALLY_COLLAPSED)
         self._popup_el = None
         self._doc = None
         self._picker_click_handled = False
         self._last_swatch_colors = {}
         self._color_text_bufs = {}
-        self._last_panel_label = ""
         self._simplify_target_count = 0
         self._simplify_target_touched = False
         self._simplify_lod_base = DEFAULT_SIMPLIFY_LOD_BASE
@@ -311,16 +328,20 @@ class RenderingPanel(Panel):
         )
         self._reactive_binding = PanelStateBinding()
 
-    def _sync_panel_label(self):
-        label = tr("window.rendering")
-        if not label or label == self._last_panel_label:
-            return
-        if lf.ui.set_panel_label(self.id, label):
-            self._last_panel_label = label
+    def capture_chrome(self):
+        return {"collapsed": sorted(self._collapsed)}
+
+    def apply_chrome(self, payload):
+        self._collapsed = set(RENDERING_INITIALLY_COLLAPSED)
+        if isinstance(payload, dict):
+            collapsed = payload.get("collapsed")
+            if isinstance(collapsed, (list, tuple)):
+                self._collapsed = {str(name) for name in collapsed}
+        if self._handle:
+            self._handle.dirty_all()
 
     def on_mount(self, doc):
         self._doc = doc
-        self._sync_panel_label()
         self._popup_el = doc.get_element_by_id("color-picker-popup")
         if self._popup_el:
             self._popup_el.add_event_listener("click", self._on_popup_click)
@@ -361,6 +382,7 @@ class RenderingPanel(Panel):
             el.add_event_listener("blur", self._on_color_text_blur)
         self._refresh_simplify_source(force=True)
         self._scrub_fields.mount(doc)
+        self._selection_groups.mount(doc)
         self._sync_section_states()
         self._subscribe_reactive_state()
         self._request_reactive_update()
@@ -394,6 +416,8 @@ class RenderingPanel(Panel):
             return
 
         s = lf.get_render_settings
+        model.bind("navigation_up_idx", self._navigation_up_index, self._set_navigation_up_index)
+        model.bind_event("align_navigation_grid", self._align_navigation_grid)
 
         for prop_id in BOOL_PROPS:
             if prop_id == "equirectangular":
@@ -448,8 +472,6 @@ class RenderingPanel(Panel):
                     lambda: str(getattr(s(), "ppisp_mode", "")),
                     lambda v: self._set_ppisp_mode(v))
 
-        model.bind_func("environment_enabled",
-                        lambda: s() is not None and getattr(s(), "environment_mode", "") == "EQUIRECTANGULAR")
         model.bind_func("mesh_wireframe_supported", _mesh_wireframe_supported)
         model.bind_func("mesh_wide_lines_supported", _mesh_wide_lines_supported)
 
@@ -521,7 +543,7 @@ class RenderingPanel(Panel):
                        lambda v, p=prop_id: setattr(s(), p, float(v)) if s() else None)
 
         model.bind("simplify_target",
-                   lambda: str(self._compute_simplify_target_count()),
+                   lambda: f"{self._compute_simplify_target_count():,}",
                    lambda v: self._set_simplify_target_count(v))
         model.bind("simplify_lod_base",
                    lambda: f"{self._compute_simplify_lod_base():.1f}",
@@ -533,22 +555,20 @@ class RenderingPanel(Panel):
         model.bind_func("ppisp_auto",
                          lambda: s() is not None and getattr(s(), "ppisp_mode", "") != "MANUAL")
 
-        model.bind_func("label_panel_title",
-                         lambda: lf.ui.tr("rendering") or "Rendering")
         model.bind_func("label_hdr_viewport",
-                         lambda: "Viewport")
+                         lambda: _tr_fallback("rendering_panel.section_viewport", "Viewport"))
         model.bind_func("label_hdr_camera",
-                         lambda: "Camera & Projection")
+                         lambda: _tr_fallback("rendering_panel.section_camera", "Camera & Projection"))
         model.bind_func("label_hdr_lod",
                          lambda: _tr_fallback("rendering_panel.section_lod", "LOD"))
         model.bind_func("label_hdr_simplify",
                          lambda: _tr_fallback("rendering_panel.section_simplify", "Splat Simplify"))
         model.bind_func("label_hdr_selection",
-                         lambda: "Selection & Overlays")
+                         lambda: _tr_fallback("rendering_panel.section_selection", "Selection & Overlays"))
         model.bind_func("label_hdr_mesh",
                          lambda: lf.ui.tr("main_panel.mesh") or "Mesh")
         model.bind_func("label_hdr_post_process",
-                         lambda: "Post Processing")
+                         lambda: _tr_fallback("rendering_panel.section_post_process", "Post Processing"))
         model.bind_func("label_environment_map_browse",
                          lambda: lf.ui.tr("common.browse") or "Browse...")
         model.bind_func("label_simplify_source",
@@ -579,15 +599,9 @@ class RenderingPanel(Panel):
 
         model.bind_func("fov_display", self._compute_fov)
 
-        model.bind_func("picker_r",
-                         lambda: float(getattr(s(), self._color_edit_prop, (0, 0, 0))[0])
-                         if self._color_edit_prop and s() else 0.0)
-        model.bind_func("picker_g",
-                         lambda: float(getattr(s(), self._color_edit_prop, (0, 0, 0))[1])
-                         if self._color_edit_prop and s() else 0.0)
-        model.bind_func("picker_b",
-                         lambda: float(getattr(s(), self._color_edit_prop, (0, 0, 0))[2])
-                         if self._color_edit_prop and s() else 0.0)
+        model.bind_func("picker_r", lambda: float(self._picker_color()[0]))
+        model.bind_func("picker_g", lambda: float(self._picker_color()[1]))
+        model.bind_func("picker_b", lambda: float(self._picker_color()[2]))
         model.bind_func(
             "editing_background_color",
             lambda: self._color_edit_prop == BACKGROUND_COLOR_PROP,
@@ -642,12 +656,27 @@ class RenderingPanel(Panel):
         model.bind_event("toggle_console",
                          lambda h, e, a: lf.ui.toggle_system_console())
         model.bind_event("browse_environment_map", self._on_browse_environment_map)
+        self._selection_groups.bind(model)
 
         self._handle = model.get_handle()
-        self._sync_panel_label()
+        self._selection_groups.attach(self._handle)
+
+    def _navigation_up_index(self):
+        return "1" if lf.get_navigation_up_axis() == "data_z" else "0"
+
+    def _set_navigation_up_index(self, value):
+        axis = {"0": "legacy_y", "1": "data_z"}.get(str(value))
+        if axis is not None:
+            lf.set_navigation_up_axis(axis)
+            if self._handle:
+                self._handle.dirty("navigation_up_idx")
+
+    def _align_navigation_grid(self, *_):
+        lf.set_navigation_up_axis(lf.get_navigation_up_axis(), align_grid=True)
+        if self._handle:
+            self._handle.dirty("grid_plane")
 
     def on_update(self, doc):
-        self._sync_panel_label()
         s = lf.get_render_settings()
         if not s:
             return False
@@ -675,6 +704,7 @@ class RenderingPanel(Panel):
         dirty |= self._refresh_simplify_source(force=False)
         dirty |= self._sync_simplify_task_state(force=False)
         dirty |= self._scrub_fields.sync_all()
+        dirty |= self._selection_groups.sync(visible=self._selection_section_expanded())
         return dirty
 
     def _environment_state_snapshot(self):
@@ -701,6 +731,12 @@ class RenderingPanel(Panel):
             return False
         self._last_environment_state = state
         self._dirty_environment_bindings()
+        if self._doc and current_path and current_path not in ENVIRONMENT_PRESET_PATHS:
+            select = self._doc.get_element_by_id("environment-map-preset")
+            if select and select.get_attribute("value", "") == CUSTOM_ENVIRONMENT_PRESET_VALUE:
+                # RmlUi caches the closed label even when the selected option's
+                # text changes. Reapply the value to refresh that copy on update.
+                select.set_attribute("value", CUSTOM_ENVIRONMENT_PRESET_VALUE)
         return True
 
     def _projection_state_snapshot(self):
@@ -742,11 +778,7 @@ class RenderingPanel(Panel):
         settings = lf.get_render_settings()
         if not settings:
             return
-        enabled = bool(value)
-        current_backend = _normalize_raster_backend(getattr(settings, "raster_backend", ""))
-        if enabled and current_backend != "3dgut":
-            settings.raster_backend = "3dgut"
-        settings.equirectangular = enabled
+        settings.equirectangular = bool(value)
         self._sync_projection_state()
 
     def _environment_map_is_custom(self):
@@ -874,10 +906,13 @@ class RenderingPanel(Panel):
         dirty = False
         dirty |= self._refresh_simplify_source(force=False)
         dirty |= self._sync_simplify_task_state(force=False)
+        self._selection_groups.invalidate()
+        dirty |= self._selection_groups.sync(visible=self._selection_section_expanded())
         return dirty
 
     def on_unmount(self, doc):
         self._unsubscribe_reactive_state()
+        self._selection_groups.unmount()
         doc.remove_data_model("rendering")
         self._handle = None
         self._popup_el = None
@@ -1107,34 +1142,81 @@ class RenderingPanel(Panel):
         header, arrow, content = self._get_section_elements(name)
         if content:
             w.animate_section_toggle(content, expanding, arrow, header_element=header)
+        if name == "selection" and expanding:
+            self._selection_groups.sync()
 
-    def _on_color_click(self, handle, event, args):
-        if not args or not self._popup_el:
-            return
+    def _selection_section_expanded(self):
+        return "selection" not in self._collapsed
+
+    def reveal_selection_groups(self):
+        """Expand Selection & Overlays and scroll the group list into view."""
+        if not self._selection_section_expanded():
+            self._collapsed.discard("selection")
+            self._sync_section_states()
+            self._selection_groups.sync()
+        groups_list = self._doc.get_element_by_id(GROUPS_LIST_ID) if self._doc else None
+        if groups_list:
+            groups_list.scroll_into_view(False)
+        return True
+
+    def _picker_color(self):
+        if self._color_edit_group is not None:
+            return self._selection_groups.group_color(self._color_edit_group) or (0.0, 0.0, 0.0)
+        s = lf.get_render_settings()
+        if not self._color_edit_prop or not s:
+            return (0.0, 0.0, 0.0)
+        return getattr(s, self._color_edit_prop, (0.0, 0.0, 0.0))
+
+    def _open_picker(self, event):
         self._picker_click_handled = True
-        prop_id = str(args[0])
-        if self._color_edit_prop == prop_id:
-            self._hide_picker()
-            return
-        self._color_edit_prop = prop_id
         mx = int(float(event.get_parameter("mouse_x", "0")))
         my = int(float(event.get_parameter("mouse_y", "0")))
         left = max(0, mx - 210)
         self._popup_el.set_property("left", f"{left}px")
         self._popup_el.set_property("top", f"{my + 2}px")
         self._popup_el.set_class("visible", True)
-        handle.dirty("picker_r")
-        handle.dirty("picker_g")
-        handle.dirty("picker_b")
-        handle.dirty("editing_background_color")
+        if self._handle:
+            self._handle.dirty("picker_r")
+            self._handle.dirty("picker_g")
+            self._handle.dirty("picker_b")
+            self._handle.dirty("editing_background_color")
+
+    def _on_color_click(self, handle, event, args):
+        del handle
+        if not args or not self._popup_el:
+            return
+        prop_id = str(args[0])
+        if self._color_edit_prop == prop_id:
+            self._picker_click_handled = True
+            self._hide_picker()
+            return
+        self._color_edit_group = None
+        self._color_edit_prop = prop_id
+        self._open_picker(event)
+
+    def _show_group_color_picker(self, gid, event):
+        if not self._popup_el:
+            return
+        if self._color_edit_group == gid:
+            self._picker_click_handled = True
+            self._hide_picker()
+            return
+        self._color_edit_prop = None
+        self._color_edit_group = gid
+        self._open_picker(event)
 
     def _on_picker_change(self, handle, event, args):
-        s = lf.get_render_settings()
-        if not s or not event or not self._color_edit_prop:
+        if not event:
             return
         r = float(event.get_parameter("red", "0"))
         g = float(event.get_parameter("green", "0"))
         b = float(event.get_parameter("blue", "0"))
+        if self._color_edit_group is not None:
+            self._selection_groups.set_group_color(self._color_edit_group, (r, g, b))
+            return
+        s = lf.get_render_settings()
+        if not s or not self._color_edit_prop:
+            return
         prop = self._color_edit_prop
         setattr(s, prop, w.normalize_color((r, g, b)))
         self._dirty_color_bindings(prop, handle)
@@ -1164,6 +1246,7 @@ class RenderingPanel(Panel):
 
     def _hide_picker(self):
         self._color_edit_prop = None
+        self._color_edit_group = None
         if self._popup_el:
             self._popup_el.set_class("visible", False)
         if self._handle:

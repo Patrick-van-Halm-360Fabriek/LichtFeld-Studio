@@ -91,6 +91,7 @@ namespace lfs::gui {
         void reloadRmlResources() override;
 
     private:
+        friend class VideoExtractorDialogTestAccess;
         struct EventListener final : Rml::EventListener {
             VideoExtractorDialog* owner = nullptr;
             void ProcessEvent(Rml::Event& event) override;
@@ -144,11 +145,12 @@ namespace lfs::gui {
         void syncOutputPreview();
         void handleEvent(Rml::Event& event);
         void handleClick(const std::string& id);
-        void handleChange(const std::string& id);
+        void handleChange(const std::string& id, bool explicit_edit = true);
         void handleTimelineEvent(Rml::Event& event);
         void seekFromTimeline(float mouse_x);
         void setTrimFromTimeline(TimelineDragTarget target, float mouse_x);
         void applyTextInput(const std::string& id);
+        [[nodiscard]] bool resolveFilenamePattern(std::string& pattern, std::string& error) const;
         void beginExtractionFromUi();
         void requestStopExtraction();
         void markContentDirty();
@@ -172,10 +174,12 @@ namespace lfs::gui {
         int custom_width_ = 1920;
         int custom_height_ = 1080;
 
-        std::array<char, 64> filename_pattern_{"frame_%d"};
+        int naming_selection_ = 2;
+        std::string filename_pattern_ = "frame_%05d";
 
         float trim_start_ = 0.0f;
         float trim_end_ = -1.0f;
+        bool trim_end_is_auto_ = true;
 
         std::atomic<bool> extracting_{false};
         std::atomic<bool> stop_extraction_requested_{false};
@@ -251,6 +255,10 @@ namespace lfs::gui {
         Rml::Element* custom_width_input_el_ = nullptr;
         Rml::Element* custom_height_input_el_ = nullptr;
         Rml::Element* output_resolution_el_ = nullptr;
+        Rml::ElementFormControlSelect* naming_select_el_ = nullptr;
+        Rml::Element* custom_pattern_row_el_ = nullptr;
+        Rml::Element* naming_help_el_ = nullptr;
+        Rml::Element* naming_error_el_ = nullptr;
         Rml::Element* pattern_input_el_ = nullptr;
         Rml::Element* pattern_example_el_ = nullptr;
         Rml::Element* start_btn_el_ = nullptr;

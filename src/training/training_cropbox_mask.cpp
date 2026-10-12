@@ -17,12 +17,7 @@ namespace lfs::training {
 
     std::optional<TrainingCropBoxGeometry> resolve_training_cropbox_geom(
         const core::Scene& scene) {
-        const auto training_model_name = scene.getTrainingModelNodeName();
-        if (training_model_name.empty()) {
-            return std::nullopt;
-        }
-
-        const auto* training_node = scene.getNode(training_model_name);
+        const auto* training_node = scene.getNodeByUuid(scene.getTrainingModelNodeUuid());
         if (!training_node) {
             return std::nullopt;
         }
@@ -46,6 +41,20 @@ namespace lfs::training {
             .model_to_cropbox =
                 world_to_cropbox * scene.getWorldTransform(training_node->id),
             .inverse = cropbox->inverse};
+    }
+
+    std::array<std::array<float, 3>, 8> training_cropbox_model_corners(
+        const TrainingCropBoxGeometry& geometry) {
+        const glm::mat4 cropbox_to_model = glm::inverse(geometry.model_to_cropbox);
+        std::array<std::array<float, 3>, 8> corners{};
+        for (size_t corner = 0; corner < corners.size(); ++corner) {
+            const glm::vec3 local{corner & 1 ? geometry.max.x : geometry.min.x,
+                                  corner & 2 ? geometry.max.y : geometry.min.y,
+                                  corner & 4 ? geometry.max.z : geometry.min.z};
+            const glm::vec4 model = cropbox_to_model * glm::vec4(local, 1.0f);
+            corners[corner] = {model.x, model.y, model.z};
+        }
+        return corners;
     }
 
     std::optional<TrainingCropBoxGeometry> resolve_training_cropbox_loss_geom(

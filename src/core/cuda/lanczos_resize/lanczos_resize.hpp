@@ -13,7 +13,7 @@ namespace lfs::core {
     /**
      * High-quality Lanczos resampling on GPU
      *
-     * @param input Input tensor in [H, W, C] format (uint8)
+     * @param input Input tensor in [H, W, C] format (uint8 or float32, 1 to 4 channels)
      * @param output_h Target height
      * @param output_w Target width
      * @param kernel_size Lanczos kernel size (typically 2 or 3)
@@ -60,5 +60,13 @@ namespace lfs::core {
         int output_w,
         int kernel_size = 2,
         cudaStream_t cuda_stream = nullptr);
+
+    // Bilinear prior resampling excludes invalid neighbors and carries validity
+    // with nearest sampling. Depth <= 0/nonfinite and normal norms < 0.5 are
+    // invalid; outputs use zero sentinels and valid normals have unit length.
+    Tensor resize_depth_prior(const Tensor& input, int output_h, int output_w,
+                              cudaStream_t cuda_stream = nullptr);
+    Tensor resize_normal_prior(const Tensor& input, int output_h, int output_w,
+                               cudaStream_t cuda_stream = nullptr);
 
 } // namespace lfs::core

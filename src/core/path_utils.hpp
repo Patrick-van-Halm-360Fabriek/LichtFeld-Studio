@@ -5,12 +5,15 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
+#include <share.h>
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -307,6 +310,14 @@ namespace lfs::core {
 #endif
     }
 
+    inline std::string path_to_generic_utf8(const std::filesystem::path& p) {
+#ifdef _WIN32
+        return wstring_to_utf8(p.generic_wstring());
+#else
+        return p.generic_string();
+#endif
+    }
+
     /**
      * @brief Convert UTF-8 string to filesystem path
      *
@@ -329,6 +340,49 @@ namespace lfs::core {
         // On Linux/Mac, native encoding is UTF-8, so use string directly
         // Also handle embedded nulls by using c_str()
         return std::filesystem::path(utf8_str.c_str());
+#endif
+    }
+
+    /**
+     * @brief Copy process arguments into a UTF-8 representation.
+     *
+     * Windows applications must enter through wmain so the CRT does not first
+     * decode arguments using the active code page. Linux keeps its native argv
+     * surface and simply copies it into the same representation.
+     */
+    inline std::vector<std::string> utf8_argv(int argc, char* argv[]) {
+        std::vector<std::string> result;
+        result.reserve(argc > 0 ? static_cast<std::size_t>(argc) : 0);
+        for (int i = 0; i < argc; ++i) {
+            result.emplace_back(argv[i] != nullptr ? argv[i] : "");
+        }
+        return result;
+    }
+
+#ifdef _WIN32
+    inline std::vector<std::string> utf8_argv(int argc, wchar_t* argv[]) {
+        std::vector<std::string> result;
+        result.reserve(argc > 0 ? static_cast<std::size_t>(argc) : 0);
+        for (int i = 0; i < argc; ++i) {
+            result.emplace_back(argv[i] != nullptr ? wstring_to_utf8(argv[i]) : std::string{});
+        }
+        return result;
+    }
+#endif
+
+    /**
+     * @brief Open a C stdio file using a filesystem path without an ACP round trip.
+     */
+    inline std::FILE* open_file(const std::filesystem::path& path, const char* mode) {
+#ifdef _WIN32
+        const auto wide_mode = utf8_to_wstring(mode != nullptr ? std::string(mode) : std::string{});
+        if (wide_mode.empty()) {
+            return nullptr;
+        }
+        // Preserve fopen's read/write sharing without the deprecated CRT API.
+        return _wfsopen(path.c_str(), wide_mode.c_str(), _SH_DENYNO);
+#else
+        return std::fopen(path.c_str(), mode);
 #endif
     }
 

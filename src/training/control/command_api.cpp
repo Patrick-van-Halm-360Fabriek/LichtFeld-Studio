@@ -4,8 +4,11 @@
 #include "command_api.hpp"
 
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#include "lfs/training/live_model_mutation_guard.hpp"
+#include "lfs/training/sh_value_storage.hpp"
 #include "training/optimizer/adam_optimizer.hpp"
 #include "training/trainer.hpp"
 
@@ -15,18 +18,6 @@
 namespace lfs::training {
 
     namespace {
-        core::Tensor expand_mask(const core::Tensor& row_mask, const core::TensorShape& target_shape) {
-            if (row_mask.shape().rank() == 0 || target_shape.rank() == 0) {
-                return row_mask;
-            }
-            if (row_mask.shape().rank() == 1 && target_shape.rank() > 1) {
-                auto expanded = row_mask.unsqueeze(-1);
-                std::vector<size_t> dims = target_shape.dims();
-                expanded = expanded.expand(core::TensorShape{dims});
-                return expanded;
-            }
-            return row_mask;
-        }
 
         core::Tensor make_full_like_mask(const core::Tensor& mask, double value) {
             return core::Tensor::full(mask.shape(), static_cast<float>(value), mask.device(), core::DataType::Float32);
@@ -129,6 +120,63 @@ namespace lfs::training {
         snapshot_.is_running = is_running;
         snapshot_.stop_requested = stop_requested;
         snapshot_.phase = phase;
+        if (ctx.trainer) {
+            snapshot_.session_hydrated = true;
+            if (ctx.trainer->isInitialized()) {
+                snapshot_.strategy = ctx.trainer->get_strategy().strategy_type();
+            }
+            const auto project =
+                ctx.trainer
+                    ->get_project_snapshot_metrics();
+            snapshot_.project_snapshot =
+                project.capture;
+            snapshot_.project_snapshot_path =
+                lfs::core::path_to_utf8(
+                    project.last_path);
+            snapshot_.project_snapshot_writer_error =
+                project.last_writer_error;
+            snapshot_.project_snapshot_pre_step_mean_ms =
+                project.pre_snapshot_step_mean_ms;
+            snapshot_.project_snapshot_post_step_mean_ms =
+                project.post_resume_step_mean_ms;
+            snapshot_
+                .project_snapshot_pre_step_first_iteration =
+                project
+                    .pre_snapshot_step_first_iteration;
+            snapshot_
+                .project_snapshot_pre_step_last_iteration =
+                project
+                    .pre_snapshot_step_last_iteration;
+            snapshot_
+                .project_snapshot_pre_step_samples =
+                project.pre_snapshot_step_samples;
+            snapshot_
+                .project_snapshot_post_step_first_iteration =
+                project
+                    .post_resume_step_first_iteration;
+            snapshot_
+                .project_snapshot_post_step_last_iteration =
+                project
+                    .post_resume_step_last_iteration;
+            snapshot_
+                .project_snapshot_step_regression_percent =
+                project
+                    .post_resume_step_regression_percent;
+            snapshot_
+                .project_snapshot_post_step_samples =
+                project.post_resume_step_samples;
+            snapshot_
+                .project_snapshot_step_regression_gate_evaluated =
+                project
+                    .step_regression_gate_evaluated;
+            snapshot_
+                .project_snapshot_step_regression_within_gate =
+                project
+                    .step_regression_within_gate;
+            snapshot_
+                .project_snapshot_writer_in_flight =
+                project.writer_in_flight;
+        }
 
         if (ctx.iteration > last_recorded_iteration_ && ctx.loss > 0.0f) {
             loss_history_.push_back({ctx.iteration, ctx.loss});
@@ -136,14 +184,35 @@ namespace lfs::training {
         }
     }
 
+    void CommandCenter::overlay_stored_session(std::string strategy, bool hydrated) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.strategy = std::move(strategy);
+        snapshot_.session_hydrated = hydrated;
+    }
+
+    void CommandCenter::reset_snapshot_locked() {
+        snapshot_ = {};
+        pending_commands_.clear();
+        phase_.store(TrainingPhase::Idle, std::memory_order_relaxed);
+    }
+
     void CommandCenter::clear_snapshot(const Trainer* trainer) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (snapshot_.trainer != trainer) {
             return;
         }
-        snapshot_ = {};
-        pending_commands_.clear();
-        phase_.store(TrainingPhase::Idle, std::memory_order_relaxed);
+        const TrainingSnapshot finished = snapshot_;
+        reset_snapshot_locked();
+        snapshot_.iteration = finished.iteration;
+        snapshot_.max_iterations = finished.max_iterations;
+        snapshot_.loss = finished.loss;
+        snapshot_.num_gaussians = finished.num_gaussians;
+        snapshot_.strategy = finished.strategy;
+    }
+
+    void CommandCenter::reset_snapshot() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        reset_snapshot_locked();
     }
 
     TrainingSnapshot CommandCenter::snapshot() const {
@@ -162,6 +231,16 @@ namespace lfs::training {
         std::lock_guard<std::mutex> lock(mutex_);
         loss_history_.clear();
         last_recorded_iteration_ = -1;
+    }
+
+    void CommandCenter::replace_loss_history(
+        std::vector<LossHistoryPoint> history) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        loss_history_ = std::move(history);
+        last_recorded_iteration_ =
+            loss_history_.empty()
+                ? -1
+                : loss_history_.back().iteration;
     }
 
     std::vector<OperationInfo> CommandCenter::operations(std::optional<CommandTarget> target) const {
@@ -188,11 +267,6 @@ namespace lfs::training {
             }
         }
         return filtered;
-    }
-
-    void CommandCenter::enqueue_command(const Command& cmd) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pending_commands_.push_back(cmd);
     }
 
     void CommandCenter::drain_enqueued(TrainingSnapshot& view) {
@@ -272,7 +346,7 @@ namespace lfs::training {
                 return mask;
             }
             auto slice = mask.slice(0, s.start, effective_end);
-            slice = core::Tensor::ones_bool({len}, device);
+            slice.copy_from(core::Tensor::ones_bool({len}, device));
             return mask;
         }
         case SelectionKind::Indices: {
@@ -290,7 +364,7 @@ namespace lfs::training {
     }
 
     std::expected<void, std::string> CommandCenter::apply_set(core::Tensor& tensor, const core::Tensor& mask_rows, const ArgValue& value) {
-        auto mask_full = expand_mask(mask_rows, tensor.shape());
+        auto mask_full = expand_row_mask(mask_rows, tensor.shape());
 
         if (std::holds_alternative<double>(value)) {
             const double v = std::get<double>(value);
@@ -324,7 +398,7 @@ namespace lfs::training {
     }
 
     std::expected<void, std::string> CommandCenter::apply_scale(core::Tensor& tensor, const core::Tensor& mask_rows, double factor) {
-        const auto mask_full = expand_mask(mask_rows, tensor.shape());
+        const auto mask_full = expand_row_mask(mask_rows, tensor.shape());
         const auto mask_float = mask_full.to(tensor.dtype());
         const auto one = make_full_like_mask(mask_full, 1.0).to(tensor.dtype());
         const auto scale = make_full_like_mask(mask_full, factor).to(tensor.dtype());
@@ -336,7 +410,7 @@ namespace lfs::training {
         if (!minv && !maxv) {
             return std::unexpected("clamp_attribute requires min or max");
         }
-        const auto mask_full = expand_mask(mask_rows, tensor.shape());
+        const auto mask_full = expand_row_mask(mask_rows, tensor.shape());
         const auto mask_float = mask_full.to(tensor.dtype());
         const auto keep = mask_full.logical_not().to(tensor.dtype());
         auto clamped = tensor;
@@ -374,7 +448,6 @@ namespace lfs::training {
                 return std::unexpected("shN storage is not allocated (max sh-degree 0)");
             }
             shN_canon = model.shN_canonical();
-            prev_capacity = std::max<size_t>(model.means().capacity(), model.size());
             tensor = &shN_canon;
         } else {
             size_t row_dim = 0;
@@ -427,9 +500,14 @@ namespace lfs::training {
             return result;
         }
 
-        // For shN, write the mutated canonical view back into swizzled storage.
+        // Write only selected shN rows through the training storage helper, preserving live q16 storage.
         if (is_shN) {
-            model.shN_set_from_canonical(shN_canon, prev_capacity);
+            const auto written_rows = mask->nonzero().squeeze(-1);
+            if (written_rows.numel() > 0) {
+                LiveModelMutationGuard mutation_guard("CommandCenter::exec_model shN");
+                sh_value::scatter_canonical_into_shN(
+                    model, written_rows, shN_canon.index_select(0, written_rows));
+            }
         }
 
         if (auto p = param_type_from_attribute(attr_name)) {
@@ -520,6 +598,14 @@ namespace lfs::training {
             }
             if (!argument_is_finite(value)) {
                 return std::unexpected("Non-finite argument '" + name + "' in op " + cmd.op);
+            }
+            if (const auto* number = std::get_if<double>(&value)) {
+                if (spec->exclusive_minimum && *number <= *spec->exclusive_minimum)
+                    return std::unexpected(std::format("Argument '{}' must be > {} (got {})", name,
+                                                       *spec->exclusive_minimum, *number));
+                if (spec->maximum && *number > *spec->maximum)
+                    return std::unexpected(std::format("Argument '{}' must be <= {} (got {})", name,
+                                                       *spec->maximum, *number));
             }
         }
         for (const auto& spec : it_op->args) {

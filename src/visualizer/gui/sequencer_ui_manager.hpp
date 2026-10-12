@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <core/error.hpp>
 #include <core/export.hpp>
 #include <cstdint>
 #include <deque>
@@ -29,6 +30,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace lfs::vis::gui {
@@ -36,11 +38,19 @@ namespace lfs::vis::gui {
 }
 
 namespace lfs::vis {
+    class SequencerFrameDemandTest_ApplyCurrentViewRecordsHistory_Test;
     class VisualizerImpl;
+    class SequencerPreviewLayoutTest;
+    class SequencerFrameIntegrityTest;
+    class SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
+    class SequencerFrameDemandTest_ReportsFrameFailureUntilSuccessfulRetry_Test;
+
+    class SequencerFrameDemandTest_ExportUsesExactFrameAndRestoresPlayback_Test;
+    class SequencerFrameDemandTest_CameraFollowSettlesAfterPlaybackStops_Test;
 
     namespace gui {
 
-        class SequencerUIManager {
+        class LFS_VIS_API SequencerUIManager {
         public:
             SequencerUIManager(VisualizerImpl* viewer, panels::SequencerUIState& ui_state,
                                gui::RmlUIManager* rml_manager);
@@ -50,33 +60,56 @@ namespace lfs::vis {
             void render(const UIContext& ctx, const ViewportLayout& viewport,
                         float panel_x, float panel_y, float panel_width, float panel_height,
                         const PanelInputState& panel_input);
-            void compositeOverlays(int screen_w, int screen_h);
             void setSequencerEnabled(bool enabled);
             void reloadRmlResources();
 
             void destroyGraphicsResources();
             void tickPlaybackBeforeSceneRender();
+            [[nodiscard]] bool scrubToTime(float time, bool update_camera);
+            // False means the exact frame is still streaming; never export a fallback.
+            [[nodiscard]] lfs::Result<bool> preparePlySequenceExportFrame(size_t frame);
+            void finishPlySequenceExport();
+            lfs::Result<void> loadPlySequenceFromDirectory(
+                const std::filesystem::path& directory, float fps = 0.0f);
 
             [[nodiscard]] SequencerController& controller() { return controller_; }
             [[nodiscard]] const SequencerController& controller() const { return controller_; }
+            void syncKeyframesToSceneGraph() { scene_sync_->syncToSceneGraph(); }
             void setFloating(bool floating);
             [[nodiscard]] bool blocksPointer(double x, double y) const;
             [[nodiscard]] bool blocksKeyboard() const;
-            [[nodiscard]] bool needsAnimationFrame() const;
+            [[nodiscard]] bool needsAnimationFrame(bool ui_visible = true) const;
             [[nodiscard]] float preferredFloatingHeight() const;
             // Serialized status of the active PLY sequence (empty when inactive).
             // Used by MCP tooling to verify playback/scrub behaviour.
-            [[nodiscard]] LFS_VIS_API std::string plyPlayerStatusJson() const;
+            [[nodiscard]] std::string plyPlayerStatusJson() const;
+            [[nodiscard]] float timelineZoom() const;
+            [[nodiscard]] float timelinePan() const;
+            void setTimelineView(float zoom, float pan);
 
         private:
+            friend class lfs::vis::SequencerFrameDemandTest_ApplyCurrentViewRecordsHistory_Test;
+            friend class lfs::vis::SequencerPreviewLayoutTest;
+            friend class lfs::vis::SequencerFrameIntegrityTest;
+            friend class lfs::vis::SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
+            friend class lfs::vis::SequencerFrameDemandTest_ReportsFrameFailureUntilSuccessfulRetry_Test;
+
+            friend class lfs::vis::SequencerFrameDemandTest_ExportUsesExactFrameAndRestoresPlayback_Test;
+            friend class lfs::vis::SequencerFrameDemandTest_CameraFollowSettlesAfterPlaybackStops_Test;
             void renderSequencerPanel(const UIContext& ctx, const ViewportLayout& viewport,
                                       float panel_x, float panel_y, float panel_width,
                                       float panel_height, const PanelInputState& panel_input);
             void renderCameraPath(const ViewportLayout& viewport);
             void renderKeyframeGizmo(const UIContext& ctx, const ViewportLayout& viewport);
             void handleOverlayActions();
-            void loadPlySequenceFromDirectory(const std::filesystem::path& directory);
+            void recordKeyframeAddition(std::optional<sequencer::Keyframe> before,
+                                        sequencer::KeyframeId id, float duration_before);
+            bool updateKeyframeFromView(sequencer::KeyframeId id, const sequencer::CameraState& view_state);
             void applyPlySequenceFrame();
+            [[nodiscard]] std::optional<size_t> requestedPlySequenceFrame() const {
+                return export_ply_frame_ ? export_ply_frame_ : controller_.currentPlySequenceFrameIndex();
+            }
+            std::optional<size_t> export_ply_frame_;
             void startPlySequenceStreaming(std::vector<std::filesystem::path> paths,
                                            lfs::io::SplatTensorAllocator allocator);
             void stopPlySequenceStreaming();
@@ -85,7 +118,7 @@ namespace lfs::vis {
             void requestPlySequenceFrame(size_t frame_index, bool priority);
             void requestPlySequenceWindow(size_t frame_index);
             void prunePlySequenceRequests(size_t frame_index);
-            void evictPlySequenceFrames(size_t keep_frame_index);
+            bool evictPlySequenceFrames(size_t keep_frame_index, const core::Scene::PerNodeSelectionSlices& selection);
             [[nodiscard]] std::optional<size_t> selectPlySequenceDisplayFrame(size_t requested_frame) const;
             [[nodiscard]] bool isPlySequenceFrameInWindow(size_t frame_index, size_t center_frame, size_t frame_count) const;
             [[nodiscard]] bool isPlySequenceFrameInWindow(size_t frame_index,
@@ -98,11 +131,30 @@ namespace lfs::vis {
             float advancePlaybackClock();
             [[nodiscard]] float playbackDelta(float delta_time) const;
             void advancePlayback(float delta_time);
+            [[nodiscard]] bool applyCurrentTimelineCamera();
             void applyPlaybackCameraFollow();
             void renderKeyframeEditOverlay(const ViewportLayout& viewport);
             void initPipPreview();
             void renderKeyframePreview(const UIContext& ctx);
+            [[nodiscard]] glm::vec2 pipPreviewPosition(const ViewportLayout& viewport,
+                                                       float scaled_width, float scaled_height) const;
             void syncPipPreviewWindow(const ViewportLayout& viewport);
+
+            struct PipPreviewKey {
+                std::optional<sequencer::KeyframeId> selected_id;
+                uint64_t timeline_revision = 0;
+                float playhead = 0.0f;
+                glm::vec3 position{0.0f};
+                glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+                float focal_length_mm = 0.0f;
+                bool equirectangular = false;
+                int width = 0;
+                int height = 0;
+
+                bool operator==(const PipPreviewKey&) const = default;
+            };
+
+            [[nodiscard]] PipPreviewKey currentPipPreviewKey() const;
             void beginViewportKeyframeEdit(size_t keyframe_index);
             void endViewportKeyframeEdit();
             [[nodiscard]] sequencer::CameraState currentViewportCameraState() const;
@@ -111,6 +163,7 @@ namespace lfs::vis {
             VisualizerImpl* viewer_;
             panels::SequencerUIState& ui_state_;
             SequencerController controller_;
+            std::shared_ptr<void> history_lifetime_ = std::make_shared<int>(0);
             std::unique_ptr<RmlSequencerPanel> panel_;
             std::unique_ptr<gui::RmlSequencerOverlay> overlay_;
             std::unique_ptr<KeyframeSceneSync> scene_sync_;
@@ -128,13 +181,14 @@ namespace lfs::vis {
             float panel_elapsed_time_ = 0.0f;
             bool playback_ticked_before_scene_ = false;
 
-            static constexpr int PREVIEW_WIDTH = 320;
-            static constexpr int PREVIEW_HEIGHT = 180;
             static constexpr float PREVIEW_TARGET_FPS = 30.0f;
             VulkanUiTexture pip_texture_;
             bool pip_initialized_ = false;
-            std::optional<size_t> pip_last_keyframe_;
+            std::optional<PipPreviewKey> pip_last_key_;
+            // Rml reload / GPU reset are not encoded in model state.
             bool pip_needs_update_ = true;
+            int pip_render_width_ = 320;
+            int pip_render_height_ = 180;
             bool last_equirectangular_ = false;
             std::optional<size_t> last_ply_sequence_frame_;
             std::vector<size_t> loaded_ply_sequence_frames_;
@@ -174,6 +228,8 @@ namespace lfs::vis {
             std::vector<std::filesystem::path> ply_stream_paths_;
             lfs::io::SplatTensorAllocator ply_stream_allocator_;
             std::vector<PlyStreamFrameState> ply_stream_states_;
+            // Retain failures while retries are queued or loading; successful loads clear them.
+            std::unordered_set<size_t> ply_stream_failed_frames_;
             std::deque<size_t> ply_stream_requests_;
             std::deque<PlyStreamResult> ply_stream_completed_;
             bool ply_stream_inflight_ = false;

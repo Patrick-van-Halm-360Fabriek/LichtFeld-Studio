@@ -7,14 +7,18 @@
 #include "core/camera_types.h"
 #include "core/cuda/undistort/undistort.hpp"
 #include "core/export.hpp"
+#include "core/image_loader.hpp"
 #include "core/tensor.hpp"
+#include "core/uuid.hpp"
 #include <array>
 #include <cassert>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <future>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace lfs::core {
 
@@ -59,10 +63,17 @@ namespace lfs::core {
         // Load image from disk and return it
         Tensor load_and_get_image(int resize_factor = -1, int max_width = 0, bool output_uint8 = false,
                                   bool update_dimensions = true);
+        Tensor load_and_get_image(int resize_factor, int max_width, bool output_uint8,
+                                  bool update_dimensions, const ImageLoadFunc& image_loader);
 
         // Load mask from disk, process it, and return it (cached)
         Tensor load_and_get_mask(int resize_factor = -1, int max_width = 0,
-                                 bool invert_mask = false, float mask_threshold = 0.5f, bool binarize = true);
+                                 bool invert_mask = false, float mask_threshold = 0.5f, bool binarize = true,
+                                 bool apply_undistortion = true);
+
+        // Same processing as load_and_get_mask for an explicit mask file, without caching.
+        Tensor load_mask_file(const std::filesystem::path& path, int resize_factor, int max_width,
+                              bool invert_mask, float mask_threshold, bool binarize, bool apply_undistortion) const;
 
         // Load depth map from disk, convert to [H,W] float32 [0,1], and return it (cached)
         Tensor load_and_get_depth(int resize_factor = -1, int max_width = 0);
@@ -82,7 +93,8 @@ namespace lfs::core {
         // Load normal map from disk, decode unit normals as [3,H,W]
         // float32 in [-1,1] (file encoding v = n*0.5+0.5), and return it (cached).
         Tensor load_and_get_normal(int resize_factor, int max_width,
-                                   const NormalPriorDecode& decode);
+                                   const NormalPriorDecode& decode,
+                                   bool apply_undistortion = true);
 
         // Quantization step of the depth prior's file encoding in target units
         // (1/255 for 8-bit, 1/65535 for 16-bit, 0 for float). Header probe on
@@ -142,6 +154,11 @@ namespace lfs::core {
             _image_height = height;
             _image_size_loaded = true;
         }
+        void restore_image_dimensions(int width, int height, bool size_loaded) noexcept {
+            _image_width = width;
+            _image_height = height;
+            _image_size_loaded = size_loaded;
+        }
         int camera_height() const noexcept { return _camera_height; }
         int camera_width() const noexcept { return _camera_width; }
         float focal_x() const noexcept { return _focal_x; }
@@ -156,6 +173,59 @@ namespace lfs::core {
         const std::filesystem::path& mask_path() const noexcept { return _mask_path; }
         const std::filesystem::path& depth_path() const noexcept { return _depth_path; }
         const std::filesystem::path& normal_path() const noexcept { return _normal_path; }
+        void set_depth_path(std::filesystem::path path);
+        void set_normal_path(std::filesystem::path path);
+        void set_mask_path(std::filesystem::path path);
+
+        // Sparse SfM observations for this image (COLMAP 2D points with a 3D id).
+        // Pixel coordinates are in the camera's native width/height at load
+        // (images_N scale already applied). World xyz is reconstruction space
+        // and follows Camera::translate.
+        struct SfmObservation {
+            float u = 0.0f;
+            float v = 0.0f;
+            float x = 0.0f;
+            float y = 0.0f;
+            float z = 0.0f;
+        };
+
+        // Observations stored in a project and decoded on first use.
+        class SfmObservationSource {
+        public:
+            virtual ~SfmObservationSource() = default;
+            [[nodiscard]] virtual const std::vector<SfmObservation>& observations(
+                const Uuid& camera_node) const = 0;
+        };
+
+        void set_sfm_observations(std::vector<SfmObservation> observations) {
+            _sfm_observations = std::move(observations);
+            _sfm_observation_source.reset();
+        }
+        void set_sfm_observation_source(std::shared_ptr<const SfmObservationSource> source,
+                                        const Uuid& camera_node, std::size_t count) {
+            _sfm_observations.clear();
+            _sfm_observation_source = std::move(source);
+            _sfm_observation_node = camera_node;
+            _sfm_observation_count = count;
+        }
+        [[nodiscard]] const std::vector<SfmObservation>& sfm_observations() const {
+            return _sfm_observation_source ? _sfm_observation_source->observations(_sfm_observation_node)
+                                           : _sfm_observations;
+        }
+        [[nodiscard]] std::size_t sfm_observation_count() const noexcept {
+            return _sfm_observation_source ? _sfm_observation_count : _sfm_observations.size();
+        }
+        [[nodiscard]] const SfmObservationSource* sfm_observation_source() const noexcept {
+            return _sfm_observation_source.get();
+        }
+
+        // Rewrites image/mask/depth/normal paths that live under old_root to the same
+        // relative location under new_root. Paths outside old_root are left unchanged.
+        // Sidecar caches and in-memory masks (set_mask_tensor) are not cleared: a
+        // dataset relocation keeps the same files, and injected masks do not originate
+        // from _mask_path.
+        void rebase_asset_paths(const std::filesystem::path& old_root,
+                                const std::filesystem::path& new_root);
         bool has_in_memory_mask() const noexcept { return _in_memory_mask_raw.is_valid(); }
         bool has_mask() const noexcept {
             return has_in_memory_mask() ||
@@ -169,6 +239,11 @@ namespace lfs::core {
         }
         bool has_alpha() const noexcept { return _has_alpha; }
         void set_has_alpha(bool v) noexcept { _has_alpha = v; }
+        // Set at dataset load when the bound image file is absent. Independent of
+        // scene-graph training_enabled (user disable). Dummy/test cameras keep the
+        // default true even if image_path does not exist.
+        bool has_image() const noexcept { return _has_image; }
+        void set_has_image(bool v) noexcept { _has_image = v; }
         CameraSplit split() const noexcept { return _split; }
         void set_split(const CameraSplit split) noexcept {
             assert((split == CameraSplit::Train || split == CameraSplit::Eval) && "Camera split must be Train or Eval");
@@ -184,6 +259,14 @@ namespace lfs::core {
         void translate(const Tensor& trans);
 
         void precompute_undistortion(float blank_pixels = 0.0f);
+        enum class UndistortDestination { Calibration,
+                                          Explicit };
+
+        // Install parameters computed for an equivalent camera record without
+        // repeating the distortion solve or its device-to-host copies.
+        // An explicit destination keeps its grid regardless of the source file resolution.
+        void adopt_undistortion(const UndistortParams& params,
+                                UndistortDestination destination = UndistortDestination::Calibration) noexcept;
         bool is_undistort_precomputed() const noexcept { return _undistort_precomputed; }
         void prepare_undistortion(float blank_pixels = 0.0f);
         bool is_undistort_prepared() const noexcept { return _undistort_prepared; }
@@ -212,10 +295,15 @@ namespace lfs::core {
         // Image info
         std::string _image_name;
         std::filesystem::path _image_path;
+        Tensor read_mask_image(const std::filesystem::path& path, int resize_factor, int max_width,
+                               bool apply_undistortion) const;
+        Tensor finish_mask(Tensor mask, int resize_factor, int max_width, bool invert_mask, float mask_threshold,
+                           bool binarize, bool apply_undistortion) const;
         std::filesystem::path _mask_path;
         std::filesystem::path _depth_path;
         std::filesystem::path _normal_path;
         bool _has_alpha = false;
+        bool _has_image = true;
         CameraSplit _split = CameraSplit::Train;
         int _camera_width = 0;
         int _camera_height = 0;
@@ -227,9 +315,17 @@ namespace lfs::core {
         Tensor _world_view_transform;
         Tensor _cam_position;
 
-        // Mask caching (processed mask stored on GPU)
+        // Mask caching (processed mask stored on GPU). Keyed on the processing
+        // arguments: a binarized 0.5 load must not poison a later SegmentAndIgnore
+        // keep-band load (or the reverse).
         Tensor _cached_mask;
         bool _mask_loaded = false;
+        int _cached_mask_resize_factor = 0;
+        int _cached_mask_max_width = 0;
+        bool _cached_mask_invert = false;
+        float _cached_mask_threshold = 0.5f;
+        bool _cached_mask_binarize = true;
+        bool _cached_mask_was_undistorted = false;
         // Raw, pre-supplied in-memory mask (used by direct-scene plugins) —
         // takes precedence over _mask_path when set. Processed on first use.
         Tensor _in_memory_mask_raw;
@@ -246,10 +342,16 @@ namespace lfs::core {
         // Undistortion state
         bool _undistort_precomputed = false;
         bool _undistort_prepared = false;
+        UndistortDestination _undistort_destination = UndistortDestination::Calibration;
         UndistortParams _undistort_params{};
 
         // CUDA stream for async operations
         cudaStream_t _stream = nullptr;
+
+        std::vector<SfmObservation> _sfm_observations;
+        std::shared_ptr<const SfmObservationSource> _sfm_observation_source;
+        Uuid _sfm_observation_node{};
+        std::size_t _sfm_observation_count = 0;
     };
     inline float focal2fov(float focal, int pixels) {
         return 2.0f * std::atan(pixels / (2.0f * focal));

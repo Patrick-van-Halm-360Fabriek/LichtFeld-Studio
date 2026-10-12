@@ -7,7 +7,10 @@ import ctypes.util
 
 import pytest
 
+from selection_submode_contract import check_selection_submode_follows_native_mode
 
+
+@pytest.mark.integration
 def test_draw_hook_receives_overlay_capable_layout(lf):
     observed = {}
 
@@ -40,6 +43,7 @@ def test_draw_hook_receives_overlay_capable_layout(lf):
     assert observed["draw_result"] is None
 
 
+@pytest.mark.integration
 def test_is_key_down_matches_live_sdl_state_when_a_mapped_key_is_held(lf):
     library_name = ctypes.util.find_library("SDL3")
     if not library_name:
@@ -121,5 +125,90 @@ def test_legacy_template_stubs_raise_instead_of_claiming_success(lf):
         )
     with pytest.raises(TypeError, match="RmlUILayout.combo"):
         layout.template_id("Item", ["a", "b"], "a")
-    with pytest.raises(TypeError, match="RmlUILayout.tree_node/tree_pop"):
+    with pytest.raises(TypeError, match="RmlUILayout.collapsing_header"):
         layout.template_tree("Items", lambda _: None)
+
+
+REMOVED_RML_COMPATIBILITY_METHODS = (
+    "set_next_item_width",
+    "begin_group",
+    "end_group",
+    "tree_node",
+    "tree_node_ex",
+    "set_next_item_open",
+    "tree_pop",
+    "push_style_var",
+    "push_style_var_vec2",
+    "pop_style_var",
+    "push_style_color",
+    "pop_style_color",
+    "get_cursor_pos",
+    "set_cursor_pos",
+    "set_cursor_pos_x",
+    "begin_window",
+    "begin_window_closable",
+    "end_window",
+    "push_window_style",
+    "pop_window_style",
+    "set_next_window_pos",
+    "set_next_window_size",
+    "set_next_window_pos_centered",
+    "set_next_window_bg_alpha",
+    "set_next_window_pos_center",
+    "set_next_window_pos_viewport_center",
+    "set_next_window_focus",
+    "set_keyboard_focus_here",
+    "is_window_focused",
+    "is_window_hovered",
+    "capture_keyboard_from_app",
+    "capture_mouse_from_app",
+    "set_scroll_here_y",
+    "push_modal_style",
+    "pop_modal_style",
+    "begin_drag_drop_source",
+    "set_drag_drop_payload",
+    "end_drag_drop_source",
+    "begin_drag_drop_target",
+    "accept_drag_drop_payload",
+    "end_drag_drop_target",
+    "draw_circle",
+    "draw_circle_filled",
+    "draw_rect",
+    "draw_rect_filled",
+    "draw_rect_rounded",
+    "draw_rect_rounded_filled",
+    "draw_triangle_filled",
+    "draw_line",
+    "draw_polyline",
+    "draw_poly_filled",
+    "draw_text",
+    "draw_window_rect_filled",
+    "draw_window_rect",
+    "draw_window_rect_rounded",
+    "draw_window_rect_rounded_filled",
+    "draw_window_line",
+    "draw_window_text",
+    "draw_window_triangle_filled",
+    "crf_curve_preview",
+    "chromaticity_diagram",
+    "menu",
+    "popover",
+)
+
+
+@pytest.mark.parametrize("method", REMOVED_RML_COMPATIBILITY_METHODS)
+def test_rml_layout_does_not_advertise_removed_compatibility_methods(lf, method):
+    assert not hasattr(lf.ui.RmlUILayout, method)
+
+
+def test_rml_sublayout_uses_collapsing_headers_instead_of_tree_aliases(lf):
+    assert not hasattr(lf.ui.RmlSubLayout, "tree_node")
+    assert not hasattr(lf.ui.RmlSubLayout, "tree_pop")
+
+
+@pytest.mark.integration
+def test_selection_submode_follows_native_mode(lf):
+    # Headless imports have no native viewer to receive selection events.
+    if lf.get_scene() is None:
+        pytest.skip("requires a native viewer (also run by SelectionSubmodeTest)")
+    check_selection_submode_follows_native_mode(lf)

@@ -7,12 +7,16 @@
 #include "core/error_reporter.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/provenance.hpp"
+#include <algorithm>
+#include <cctype>
 #include <cuda_runtime.h>
 #include <format>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/dict.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #include <libavutil/opt.h>
@@ -24,6 +28,15 @@ namespace lfs::io::video {
         constexpr int DEFAULT_FRAMERATE = 30;
         constexpr int NVENC_FRAME_POOL_SIZE = 4;
         constexpr int NVENC_QP_OFFSET = 3;
+
+        void applyProvenanceMetadata(AVFormatContext* fmt_ctx, const VideoExportOptions& opts) {
+            if (!fmt_ctx || !opts.provenance)
+                return;
+            if (av_dict_set(&fmt_ctx->metadata, "comment",
+                            core::provenance_to_json(*opts.provenance).c_str(), 0) < 0) {
+                LOG_WARN("Failed to set video provenance comment metadata");
+            }
+        }
     } // namespace
 
     class VideoEncoderImpl {
@@ -32,12 +45,23 @@ namespace lfs::io::video {
 
         std::expected<void, std::string> open(
             const std::filesystem::path& path,
-            const VideoExportOptions& opts) {
+            const VideoExportOptions& opts_in) {
+
+            VideoExportOptions opts = opts_in;
+            if (!opts.provenance) {
+                opts.provenance = core::make_minimal_provenance_stamp();
+            }
 
             if (is_open_)
                 return std::unexpected("Encoder is already open");
             if (const auto validation = validateVideoEncodingOptions(opts); !validation)
                 return std::unexpected(validation.error());
+
+            auto extension = core::path_to_utf8(path.extension());
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (!extension.empty() && extension != ".mp4")
+                return std::unexpected("Video export supports only MP4 (.mp4); unsupported filename extension");
 
             const size_t width = static_cast<size_t>(opts.width);
             const size_t height = static_cast<size_t>(opts.height);
@@ -161,6 +185,8 @@ namespace lfs::io::video {
             codec_ctx_->time_base = AVRational{1, framerate_};
             codec_ctx_->framerate = AVRational{framerate_, 1};
             codec_ctx_->pix_fmt = AV_PIX_FMT_CUDA;
+            codec_ctx_->colorspace = AVCOL_SPC_SMPTE170M;
+            codec_ctx_->color_range = AVCOL_RANGE_MPEG;
             codec_ctx_->gop_size = framerate_;
             codec_ctx_->max_b_frames = 0;
 
@@ -223,6 +249,8 @@ namespace lfs::io::video {
                 }
             }
 
+            applyProvenanceMetadata(fmt_ctx_, opts);
+
             ret = avformat_write_header(fmt_ctx_, nullptr);
             if (ret < 0) {
                 cleanupHwContexts();
@@ -279,6 +307,8 @@ namespace lfs::io::video {
             codec_ctx_->time_base = AVRational{1, framerate_};
             codec_ctx_->framerate = AVRational{framerate_, 1};
             codec_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
+            codec_ctx_->colorspace = AVCOL_SPC_SMPTE170M;
+            codec_ctx_->color_range = AVCOL_RANGE_MPEG;
             codec_ctx_->gop_size = framerate_;
             codec_ctx_->max_b_frames = 2;
             codec_ctx_->thread_count = 0;
@@ -311,6 +341,8 @@ namespace lfs::io::video {
                     return std::unexpected(std::string("File open failed: ") + err);
                 }
             }
+
+            applyProvenanceMetadata(fmt_ctx_, opts);
 
             ret = avformat_write_header(fmt_ctx_, nullptr);
             if (ret < 0) {
@@ -448,6 +480,11 @@ namespace lfs::io::video {
         }
 
         std::expected<void, std::string> encodeFrame(AVFrame* const frame) {
+            // Both RGB conversion paths produce BT.601 limited-range planes.
+            if (frame) {
+                frame->colorspace = AVCOL_SPC_SMPTE170M;
+                frame->color_range = AVCOL_RANGE_MPEG;
+            }
             int ret = avcodec_send_frame(codec_ctx_, frame);
             if (ret < 0) {
                 char err[AV_ERROR_MAX_STRING_SIZE];
@@ -465,6 +502,10 @@ namespace lfs::io::video {
                     return std::unexpected(std::string("Receive packet error: ") + err);
                 }
 
+                // Each submitted frame spans one tick of the fixed-rate codec time base.
+                // The muxer cannot infer this from timestamps for a single-frame video.
+                if (packet_->duration <= 0)
+                    packet_->duration = 1;
                 av_packet_rescale_ts(packet_, codec_ctx_->time_base, stream_->time_base);
                 packet_->stream_index = stream_->index;
 

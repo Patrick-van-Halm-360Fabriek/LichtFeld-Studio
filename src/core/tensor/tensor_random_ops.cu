@@ -3,8 +3,10 @@
 
 #include "core/assert.hpp"
 #include "core/cuda_error.hpp"
+#include "internal/cub_workspace.hpp"
 #include "internal/tensor_functors.hpp"
 #include "internal/tensor_ops.hpp"
+#include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
@@ -13,6 +15,7 @@
 #include <thrust/count.h>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
+#include <thrust/iterator/transform_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
@@ -107,9 +110,9 @@ namespace lfs::core::tensor_ops {
     }
 
     // Kernel for multinomial sampling with replacement
-    __global__ void multinomial_with_replacement_kernel(const float* weights, int64_t* samples,
+    __global__ void multinomial_with_replacement_kernel(const double* cumulative, int64_t* samples,
                                                         unsigned long n, unsigned long num_samples,
-                                                        double sum, unsigned long long seed) {
+                                                        unsigned long long seed) {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
         if (idx >= num_samples)
@@ -118,18 +121,16 @@ namespace lfs::core::tensor_ops {
         curandState state;
         curand_init(seed, idx, 0, &state);
 
-        const double u = static_cast<double>(uniform_unit_interval(&state)) * sum;
-
-        double cumsum = 0.0;
-        for (unsigned long i = 0; i < n; ++i) {
-            cumsum += static_cast<double>(weights[i]);
-            if (u < cumsum) {
-                samples[idx] = static_cast<int64_t>(i);
-                return;
-            }
+        const double u = static_cast<double>(uniform_unit_interval(&state)) * cumulative[n - 1];
+        unsigned long low = 0, high = n - 1;
+        while (low < high) {
+            const unsigned long middle = low + (high - low) / 2;
+            if (cumulative[middle] <= u)
+                low = middle + 1;
+            else
+                high = middle;
         }
-
-        samples[idx] = static_cast<int64_t>(n - 1);
+        samples[idx] = static_cast<int64_t>(low);
     }
 
     // Kernel to generate random keys for each index (Gumbel-max trick)
@@ -211,18 +212,19 @@ namespace lfs::core::tensor_ops {
 
         size_t invalid_count = 0;
         double sum = 0.0;
-        run_with_thrust_policy(stream, [&](auto policy) {
+        {
+            auto sync_policy = thrust::cuda::par.on(stream);
             invalid_count = thrust::count_if(
-                policy,
+                sync_policy,
                 weights_ptr, weights_ptr + n,
                 invalid_multinomial_weight{});
             sum = thrust::transform_reduce(
-                policy,
+                sync_policy,
                 weights_ptr, weights_ptr + n,
                 multinomial_weight_to_double{},
                 0.0,
                 thrust::plus<double>());
-        });
+        }
 
         LFS_ASSERT_MSG(invalid_count == 0,
                        "multinomial weights must be finite and non-negative");
@@ -230,10 +232,19 @@ namespace lfs::core::tensor_ops {
                        "multinomial weights must have a positive finite sum");
 
         if (replacement) {
+            // Accumulate once in double, including weights whose Float32 sum
+            // would overflow. Each draw then finds the first prefix above it.
+            ScopedDeviceBuffer cumulative(n * sizeof(double), stream, "tensor.multinomial.cumulative");
+            const auto converted = thrust::make_transform_iterator(weights, multinomial_weight_to_double{});
+            run_cub_operation("cub::DeviceScan::InclusiveSum", stream,
+                              [&](void* workspace, size_t& workspace_bytes) {
+                                  return cub::DeviceScan::InclusiveSum(workspace, workspace_bytes, converted,
+                                                                       cumulative.as<double>(), n, stream);
+                              });
             int block_size = 256;
             int grid_size = (num_samples + block_size - 1) / block_size;
             multinomial_with_replacement_kernel<<<grid_size, block_size, 0, stream>>>(
-                weights, samples, n, num_samples, sum, seed);
+                cumulative.as<double>(), samples, n, num_samples, seed);
             LFS_CUDA_LAUNCH_CHECK(stream, "tensor.random.multinomial_with_replacement");
         } else {
             thrust::device_vector<float> keys(n);
@@ -245,23 +256,24 @@ namespace lfs::core::tensor_ops {
                 weights, thrust::raw_pointer_cast(keys.data()), n, seed);
             LFS_CUDA_LAUNCH_CHECK(stream, "tensor.random.multinomial_gumbel_keys");
 
-            run_with_thrust_policy(stream, [&](auto policy) {
-                thrust::sequence(
-                    policy,
-                    indices.begin(), indices.end());
+            // keys/indices are destroyed when this scope ends. Keep a
+            // synchronous policy so the sort/copy finish before that free.
+            auto sync_policy = thrust::cuda::par.on(stream);
+            thrust::sequence(
+                sync_policy,
+                indices.begin(), indices.end());
 
-                thrust::sort_by_key(
-                    policy,
-                    keys.begin(), keys.end(),
-                    indices.begin(),
-                    thrust::greater<float>());
+            thrust::sort_by_key(
+                sync_policy,
+                keys.begin(), keys.end(),
+                indices.begin(),
+                thrust::greater<float>());
 
-                thrust::copy_n(
-                    policy,
-                    indices.begin(),
-                    num_samples,
-                    thrust::device_pointer_cast(samples));
-            });
+            thrust::copy_n(
+                sync_policy,
+                indices.begin(),
+                num_samples,
+                thrust::device_pointer_cast(samples));
         }
     }
 

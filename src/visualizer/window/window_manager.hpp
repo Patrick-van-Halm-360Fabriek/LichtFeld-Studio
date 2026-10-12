@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/export.hpp"
 #include "input/frame_input_buffer.hpp"
 #include "input/input_router.hpp"
 #include "visualizer/visualizer.hpp"
@@ -11,6 +12,7 @@
 #include <filesystem>
 #include <glm/glm.hpp>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,8 +24,16 @@ namespace lfs::vis {
     class InputController;
     class VulkanContext;
 
-    class WindowManager {
+    class LFS_VIS_API WindowManager {
     public:
+        struct PersistentWindowState {
+            int x = 0;
+            int y = 0;
+            int width = 1280;
+            int height = 720;
+            bool maximized = false;
+        };
+
         enum class ResizeIntent {
             Interactive,
             Exact,
@@ -47,12 +57,15 @@ namespace lfs::vis {
 
         bool init();
 
+        void setInitialWindowState(PersistentWindowState state);
+        [[nodiscard]] PersistentWindowState persistentWindowState() const;
+        [[nodiscard]] bool resetPersistentWindowState();
+
         void showWindow();
         void updateWindowSize(const char* reason = "manual",
                               ResizeIntent intent = ResizeIntent::Exact);
-        void swapBuffers();
         void pollEvents();
-        void waitEvents(double timeout_seconds);
+        void waitEvents(std::optional<double> timeout_seconds = std::nullopt);
         bool shouldClose() const;
         void requestClose() { should_close_ = true; }
         void cancelClose();
@@ -72,6 +85,7 @@ namespace lfs::vis {
         void setTitlebarDragRegion(int height_px, std::vector<HitTestRect> excluded_rects);
         void clearTitlebarDragRegion();
         [[nodiscard]] bool isTitlebarDragPoint(int x, int y) const;
+        [[nodiscard]] bool usesWayland() const { return is_wayland_; }
         [[nodiscard]] bool usesEventDrivenTitlebarDrag() const { return native_titlebar_move_available_; }
         void setFullscreen(bool fullscreen);
         GraphicsBackend graphicsBackend() const { return graphics_backend_; }
@@ -83,7 +97,15 @@ namespace lfs::vis {
         [[nodiscard]] const input::InputRouter& inputRouter() const { return input_router_; }
 
     private:
+        friend class WindowInputDispatchTest;
         void processEvent(const ::SDL_Event& event);
+        void dispatchQueuedEvent(const ::SDL_Event& event);
+        void dispatchPolledEvent(const ::SDL_Event& event);
+        bool drainQueuedEvents();
+        static bool watchEvent(void* userdata, ::SDL_Event* event);
+        bool pumping_events_ = false;
+        bool watching_event_ = false;
+        std::vector<std::pair<Uint32, Uint64>> dispatched_events_;
         [[nodiscard]] bool shouldSuppressGuiRoutingForResize(const ::SDL_Event& event,
                                                              unsigned int main_window_id) const;
 
@@ -112,6 +134,7 @@ namespace lfs::vis {
         int titlebar_drag_height_px_ = 0;
         std::vector<HitTestRect> titlebar_drag_excluded_rects_;
         bool native_titlebar_move_available_ = false;
+        bool is_wayland_ = false;
         bool pending_titlebar_double_click_ = false;
         bool titlebar_drag_active_ = false;
         bool titlebar_drag_started_maximized_ = false;
@@ -125,6 +148,7 @@ namespace lfs::vis {
         bool is_borderless_maximized_ = false;
         glm::ivec2 borderless_restore_pos_{0, 0};
         glm::ivec2 borderless_restore_size_{1280, 720};
+        std::optional<PersistentWindowState> initial_window_state_;
         bool should_close_ = false;
 
         static void* callback_handler_;
@@ -134,6 +158,7 @@ namespace lfs::vis {
         std::vector<std::string> pending_drop_files_;
 
         void beginTitlebarNativeMove();
+        void installX11ErrorHandlers();
         [[nodiscard]] ResizeEdge resizeEdgeAt(int x, int y) const;
         void setResizeCursorForEdge(ResizeEdge edge);
         void updateResizeCursor(int x, int y);

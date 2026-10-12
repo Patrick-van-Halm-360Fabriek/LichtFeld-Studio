@@ -7,6 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace lfs::training {
+    struct GumbelTopKScratch;
+} // namespace lfs::training
+
 namespace lfs::training::mrnf_strategy {
 
     struct MRNFBounds {
@@ -15,6 +19,16 @@ namespace lfs::training::mrnf_strategy {
         float median_size;
         float max_extent;
     };
+
+    void launch_replace_parent_weights(
+        const float* opacities,
+        const float* visibility,
+        const bool* active_mask,
+        const bool* trainable_mask,
+        const float* edge_guidance,
+        float* output,
+        size_t N,
+        void* stream = nullptr);
 
     /**
      * Per-iteration exploration noise for low-opacity splats.
@@ -72,7 +86,8 @@ namespace lfs::training::mrnf_strategy {
         float scale_decay,
         float train_t,
         size_t N,
-        void* stream = nullptr);
+        void* stream = nullptr,
+        const float* rendered_count = nullptr);
 
     /**
      * Compute percentile-based bounding box on GPU.
@@ -91,6 +106,14 @@ namespace lfs::training::mrnf_strategy {
         size_t N,
         float percentile,
         MRNFBounds* bounds,
+        void* stream = nullptr);
+
+    // Median of geomean(exp(scaling_raw)); out_valid is false when no usable extent remains.
+    void launch_median_geomean_extent(
+        const float* scaling_raw,
+        size_t N,
+        float* out_median,
+        bool* out_valid,
         void* stream = nullptr);
 
     /**
@@ -112,11 +135,27 @@ namespace lfs::training::mrnf_strategy {
         size_t K,
         uint64_t seed,
         int64_t* output_indices,
+        void* stream = nullptr,
+        bool compact_sparse = true,
+        lfs::training::GumbelTopKScratch* scratch = nullptr,
+        size_t known_nnz = 0);
+
+    // Row 0 is MRNF's persistent visibility count and must not be cleared.
+    // Fold row 1 into the persistent error maximum and clear only the row-1
+    // per-iteration scratch.
+    void launch_fold_densification_error_and_zero(
+        float* refine_weight_max,
+        float* densification_info,
+        size_t N,
         void* stream = nullptr);
 
-    void launch_elementwise_add_inplace(
-        float* a,
-        const float* b,
+    void launch_far_field_mask(
+        const float* means,
+        float centroid_x,
+        float centroid_y,
+        float centroid_z,
+        float far_radius,
+        bool* far_out,
         size_t N,
         void* stream = nullptr);
 

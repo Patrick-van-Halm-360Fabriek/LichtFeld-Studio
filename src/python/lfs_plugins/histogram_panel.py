@@ -4,7 +4,12 @@
 
 from __future__ import annotations
 
+import bisect
+import logging
 import math
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from collections import OrderedDict
 from typing import Iterable
 
 import lichtfeld as lf
@@ -13,6 +18,7 @@ from .histogram_support import METRICS, METRIC_BY_ID, histogram_mode_available, 
 from . import rml_widgets as w
 from .rml_keys import KI_A, KI_DELETE, KI_I
 from .types import Panel
+from .panels import panel_class
 from .ui import RuntimeState
 
 __lfs_panel_classes__ = ["HistogramPanel"]
@@ -22,6 +28,7 @@ __lfs_panel_ids__ = ["lfs.histogram"]
 DEFAULT_HISTOGRAM_BIN_COUNT = 56
 MIN_HISTOGRAM_BIN_COUNT = 16
 MAX_HISTOGRAM_BIN_COUNT = 128
+SORTED_SAMPLE_POINTS = 4096
 DEFAULT_COMPARE_X_BIN_COUNT = 20
 DEFAULT_COMPARE_Y_BIN_COUNT = 20
 MIN_COMPARE_BIN_COUNT = 8
@@ -34,6 +41,10 @@ RML_KM_CTRL = 1 << 0
 RML_KM_SHIFT = 1 << 1
 RML_KM_ALT = 1 << 2
 RML_KM_META = 1 << 3
+_HISTOGRAM_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lfs-histogram")
+_HISTOGRAM_DEBOUNCE_SECONDS = 0.025
+_HISTOGRAM_CACHE_LIMIT = 4
+_LOGGER = logging.getLogger(__name__)
 
 
 def _tr(key: str, fallback: str) -> str:
@@ -44,15 +55,8 @@ def _trf(key: str, fallback: str, **kwargs) -> str:
     return _tr(key, fallback).format(**kwargs)
 
 
+@panel_class("histogram")
 class HistogramPanel(Panel):
-    id = "lfs.histogram"
-    label = "Histogram"
-    space = lf.ui.PanelSpace.BOTTOM_DOCK
-    order = 97
-    template = "rmlui/histogram_panel.rml"
-    size = (860, 660)
-    height_mode = lf.ui.PanelHeightMode.FILL
-    update_policy = "dirty"
 
     def __init__(self):
         self._doc = None
@@ -69,6 +73,8 @@ class HistogramPanel(Panel):
         self._compare_x_bin_count = DEFAULT_COMPARE_X_BIN_COUNT
         self._compare_y_bin_count = DEFAULT_COMPARE_Y_BIN_COUNT
         self._scene_generation = -1
+        self._scene_data_generation = -1
+        self._selection_generation = self._selection_generation_value()
         self._history_generation = -1
         self._selected_nodes_signature: tuple[int, ...] = ()
         self._last_lang = ""
@@ -117,6 +123,9 @@ class HistogramPanel(Panel):
         self._custom_range_max_value: float | None = None
         self._custom_range_min_str = ""
         self._custom_range_max_str = ""
+        self._uncommitted_range_inputs: set[str] = set()
+        self._range_metric_id: str | None = None
+        self._compare_y_range_metric_id: str | None = None
         self._compare_values: lf.Tensor | None = None
         self._compare_finite_mask: lf.Tensor | None = None
         self._compare_valid_x_values: lf.Tensor | None = None
@@ -137,6 +146,82 @@ class HistogramPanel(Panel):
         self._compare_y_custom_range_max_str = ""
 
         self._selection_bin_indices: lf.Tensor | None = None
+        self._static_bin_records_key: tuple | None = None
+        self._primary_sorted_sample: tuple[int, list[float]] | None = None
+        self._compare_x_sorted_sample: tuple[int, list[float]] | None = None
+        self._compare_y_sorted_sample: tuple[int, list[float]] | None = None
+        self._static_bin_records_value: list[dict[str, object]] | None = None
+        self._finish_histogram_init()
+
+    def capture_chrome(self):
+        return {
+            "metric_id": self._metric_id,
+            "compare_metric_id": self._compare_metric_id,
+            "log_scale": bool(self._log_scale_enabled),
+            "bin_count": int(self._histogram_bin_count),
+            "compare_x_bin_count": int(self._compare_x_bin_count),
+            "compare_y_bin_count": int(self._compare_y_bin_count),
+            "custom_range_min": self._custom_range_min_value,
+            "custom_range_max": self._custom_range_max_value,
+            "compare_y_custom_range_min": self._compare_y_custom_range_min_value,
+            "compare_y_custom_range_max": self._compare_y_custom_range_max_value,
+        }
+
+    def apply_chrome(self, payload):
+        self._metric_id = METRICS[0].id
+        self._compare_metric_id = ""
+        self._log_scale_enabled = False
+        self._histogram_bin_count = DEFAULT_HISTOGRAM_BIN_COUNT
+        self._compare_x_bin_count = DEFAULT_COMPARE_X_BIN_COUNT
+        self._compare_y_bin_count = DEFAULT_COMPARE_Y_BIN_COUNT
+        self._reset_custom_range()
+        self._reset_compare_y_custom_range()
+        if isinstance(payload, dict):
+            metric = payload.get("metric_id")
+            if isinstance(metric, str) and metric in METRIC_BY_ID:
+                self._metric_id = metric
+            compare = payload.get("compare_metric_id")
+            if isinstance(compare, str) and compare in METRIC_BY_ID and compare != self._metric_id:
+                self._compare_metric_id = compare
+            if "log_scale" in payload:
+                self._log_scale_enabled = bool(payload.get("log_scale"))
+            bins = payload.get("bin_count")
+            if isinstance(bins, (int, float)):
+                self._histogram_bin_count = int(
+                    max(MIN_HISTOGRAM_BIN_COUNT, min(MAX_HISTOGRAM_BIN_COUNT, bins))
+                )
+            x_bins = payload.get("compare_x_bin_count")
+            if isinstance(x_bins, (int, float)):
+                self._compare_x_bin_count = int(
+                    max(MIN_COMPARE_BIN_COUNT, min(MAX_COMPARE_BIN_COUNT, x_bins))
+                )
+            y_bins = payload.get("compare_y_bin_count")
+            if isinstance(y_bins, (int, float)):
+                self._compare_y_bin_count = int(
+                    max(MIN_COMPARE_BIN_COUNT, min(MAX_COMPARE_BIN_COUNT, y_bins))
+                )
+
+            def _optional_float(key):
+                value = payload.get(key)
+                if value is None:
+                    return None
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return number if math.isfinite(number) else None
+
+            self._custom_range_min_value = _optional_float("custom_range_min")
+            self._custom_range_max_value = _optional_float("custom_range_max")
+            self._compare_y_custom_range_min_value = _optional_float("compare_y_custom_range_min")
+            self._compare_y_custom_range_max_value = _optional_float("compare_y_custom_range_max")
+        self._scene_generation = -1
+        if hasattr(self, "_refresh"):
+            self._refresh()
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _finish_histogram_init(self):
         self._hist_counts: list[int] | None = None
         self._hist_prefix_counts: list[int] | None = None
         self._hist_edges: list[float] | None = None
@@ -146,7 +231,6 @@ class HistogramPanel(Panel):
         self._compare_x_edges: list[float] | None = None
         self._compare_y_edges: list[float] | None = None
         self._selection_owned = False
-        self._pending_selection_commit = 0
         self._active_mark_source: str | None = None
         self._panel_selection_mask: lf.Tensor | None = None
         self._selected_histogram_bins: set[int] = set()
@@ -187,6 +271,14 @@ class HistogramPanel(Panel):
         self._compare_selection_width_style = "0%"
         self._compare_selection_height_style = "0%"
         self._reactive_unsubscribers = []
+        self._histogram_cache: OrderedDict[tuple, dict[str, object]] = OrderedDict()
+        self._histogram_compute_future: Future | None = None
+        self._histogram_compute_timer: threading.Timer | None = None
+        self._histogram_compute_token = 0
+        self._histogram_compute_cancel_event = threading.Event()
+        self._compute_executor = _HISTOGRAM_EXECUTOR
+        self._ui_scheduler = None
+        self._computing = False
 
     @classmethod
     def poll(cls, context):
@@ -277,13 +369,15 @@ class HistogramPanel(Panel):
         model.bind_func("undo_enabled", self._can_undo)
         model.bind_func("redo_enabled", self._can_redo)
         model.bind_func("clear_enabled", self._has_any_mark)
-        model.bind_func("delete_enabled", lambda: self._has_any_mark() and self._marked_count > 0)
+        model.bind_func("delete_enabled", lambda: not self._computing and self._has_any_mark() and self._marked_count > 0)
         model.bind("metric_id", lambda: self._metric_id, self._set_metric_id)
         model.bind("compare_metric_id", lambda: self._compare_metric_id, self._set_compare_metric_id)
         model.bind("log_scale_enabled", lambda: self._log_scale_enabled, self._set_log_scale_enabled)
         model.bind("histogram_bin_count", lambda: self._histogram_bin_count, self._set_histogram_bin_count)
         model.bind("compare_x_bin_count", lambda: self._compare_x_bin_count, self._set_compare_x_bin_count)
         model.bind("compare_y_bin_count", lambda: self._compare_y_bin_count, self._set_compare_y_bin_count)
+        model.bind_func("range_inputs_ready", self._range_inputs_ready)
+        model.bind_func("compare_y_range_inputs_ready", self._compare_y_range_inputs_ready)
         model.bind("range_min_str", lambda: self._custom_range_min_str, self._set_custom_range_min)
         model.bind("range_max_str", lambda: self._custom_range_max_str, self._set_custom_range_max)
         model.bind("compare_y_range_min_str",
@@ -343,6 +437,7 @@ class HistogramPanel(Panel):
         doc.add_event_listener("mouseup", self._on_document_mouseup)
 
         self._scene_generation = -1
+        self._selection_generation = self._selection_generation_value()
         self._history_generation = self._history_generation_value()
         self._last_lang = lf.ui.get_current_language()
         self._trainer_state = ""
@@ -355,59 +450,74 @@ class HistogramPanel(Panel):
 
         space_changed = self._sync_panel_space_state()
         scene_generation = lf.get_scene_generation()
+        data_generation = self._scene_data_generation_value()
         history_generation = self._history_generation_value()
         current_lang = lf.ui.get_current_language()
         trainer_state = RuntimeState.trainer_state.value
         selection_signature = self._scene_node_selection_signature()
+        selection_generation = self._selection_generation_value()
         scene_changed = scene_generation != self._scene_generation
+        data_changed = data_generation != self._scene_data_generation
         history_changed = history_generation != self._history_generation
-        selection_changed = selection_signature != self._selected_nodes_signature
+        nodes_changed = selection_signature != self._selected_nodes_signature
+        selection_changed = (
+            nodes_changed or
+            selection_generation != self._selection_generation
+        )
         sync_selection_from_scene = False
         if (scene_generation == self._scene_generation and
                 history_generation == self._history_generation and
                 trainer_state == self._trainer_state and
                 current_lang == self._last_lang and
+                not data_changed and
                 not selection_changed and
                 not space_changed):
             return False
 
-        if self._dragging_mark or self._dragging_compare_mark:
+        if (self._dragging_mark or self._dragging_compare_mark) and not (data_changed or nodes_changed):
             self._scene_generation = scene_generation
+            self._selection_generation = selection_generation
             self._history_generation = history_generation
             self._selected_nodes_signature = selection_signature
             self._last_lang = current_lang
             self._trainer_state = trainer_state
             if self._scene_selection_preview_active:
                 self._selection_owned = True
-                self._pending_selection_commit = max(self._pending_selection_commit, 2)
             return False
 
-        if scene_changed or history_changed:
-            if self._pending_selection_commit > 0:
-                self._pending_selection_commit -= 1
-            else:
-                self._selection_owned = False
-                sync_selection_from_scene = True
+        if scene_changed or history_changed or selection_changed:
+            # The panel's own commits leave the scene equal to its mask and are skipped
+            # there, so tool selections, clears and undo always reach the chart.
+            sync_selection_from_scene = True
 
-        if selection_changed:
+        if nodes_changed:
             self._clear_all_marks(clear_scene=False)
 
+        refresh_data = data_changed or nodes_changed or trainer_state != self._trainer_state or current_lang != self._last_lang
         self._scene_generation = scene_generation
+        self._scene_data_generation = data_generation
+        self._selection_generation = selection_generation
         self._history_generation = history_generation
         self._selected_nodes_signature = selection_signature
         self._last_lang = current_lang
         self._trainer_state = trainer_state
         self._rebuild_metric_options()
-        self._refresh()
-        if sync_selection_from_scene and not (self._dragging_mark or self._dragging_compare_mark):
+        if refresh_data:
+            self._refresh()
+        if sync_selection_from_scene and not (self._computing or self._dragging_mark or self._dragging_compare_mark):
             self._sync_panel_selection_from_scene()
+        if self._handle:
+            self._handle.dirty_all()
         return True
 
     def on_scene_changed(self, doc):
         del doc
-        self._scene_generation = -1
+        if self._scene_data_generation_value() != self._scene_data_generation:
+            self._scene_generation = -1
+            self._cancel_histogram_compute()
 
     def on_unmount(self, doc):
+        self._cancel_histogram_compute()
         self._unsubscribe_reactive_state()
         self._clear_owned_scene_selection()
         self._doc = None
@@ -494,16 +604,70 @@ class HistogramPanel(Panel):
         finite_values: lf.Tensor,
         range_min: float,
         range_max: float,
+        data_bounds: tuple[float, float] | None = None,
     ) -> tuple[float, float]:
         """Tighten [range_min, range_max] to the actual extent of values inside it."""
         if not math.isfinite(range_min) or not math.isfinite(range_max) or range_max <= range_min:
             return range_min, range_max
+        if data_bounds is not None and range_min <= data_bounds[0] and range_max >= data_bounds[1]:
+            return data_bounds if data_bounds[1] > data_bounds[0] else (range_min, range_max)
         in_range = (finite_values >= range_min) & (finite_values <= range_max)
         if not bool(in_range.any().item()):
             return range_min, range_max
         clipped = finite_values[in_range]
         data_min = float(clipped.min_scalar())
         data_max = float(clipped.max_scalar())
+        if not (math.isfinite(data_min) and math.isfinite(data_max)) or data_max <= data_min:
+            return range_min, range_max
+        return max(range_min, data_min), min(range_max, data_max)
+
+    @staticmethod
+    def _sorted_sample(sorted_values: lf.Tensor) -> tuple[int, list[float]]:
+        """Every stride-th sorted value as a plain list, to locate bounds without tensor churn."""
+        count = int(sorted_values.shape[0])
+        stride = max(1, -(-count // SORTED_SAMPLE_POINTS))
+        return stride, sorted_values[::stride].tolist()
+
+    @staticmethod
+    def _sorted_search(
+        sorted_values: lf.Tensor, sample: tuple[int, list[float]], bound: float, right: bool
+    ) -> int:
+        """bisect_left/right over the sorted tensor reading one small block."""
+        stride, points = sample
+        count = int(sorted_values.shape[0])
+        search = bisect.bisect_right if right else bisect.bisect_left
+        k = search(points, bound)
+        if k == 0:
+            return 0
+        start = (k - 1) * stride + 1
+        stop = min(count, k * stride + 1)
+        if start >= stop:
+            return start
+        return start + search(sorted_values[start:stop].tolist(), bound)
+
+    @staticmethod
+    def _snap_sorted_bounds_to_data(
+        sorted_values: lf.Tensor | None,
+        range_min: float,
+        range_max: float,
+        data_bounds: tuple[float, float] | None = None,
+        sample: tuple[int, list[float]] | None = None,
+    ) -> tuple[float, float]:
+        """_snap_bounds_to_data for ascending finite values: O(log n), no full scan."""
+        if not math.isfinite(range_min) or not math.isfinite(range_max) or range_max <= range_min:
+            return range_min, range_max
+        if data_bounds is not None and range_min <= data_bounds[0] and range_max >= data_bounds[1]:
+            return data_bounds if data_bounds[1] > data_bounds[0] else (range_min, range_max)
+        if sorted_values is None or int(sorted_values.shape[0]) == 0:
+            return range_min, range_max
+        if sample is None:
+            sample = HistogramPanel._sorted_sample(sorted_values)
+        first = HistogramPanel._sorted_search(sorted_values, sample, range_min, right=False)
+        last = HistogramPanel._sorted_search(sorted_values, sample, range_max, right=True) - 1
+        if first > last:
+            return range_min, range_max
+        data_min = float(sorted_values[first].item())
+        data_max = float(sorted_values[last].item())
         if not (math.isfinite(data_min) and math.isfinite(data_max)) or data_max <= data_min:
             return range_min, range_max
         return max(range_min, data_min), min(range_max, data_max)
@@ -518,10 +682,12 @@ class HistogramPanel(Panel):
         ]
 
     def _reset_custom_range(self):
+        # Keep the retained chart bounds until the reset result replaces them.
+        self._uncommitted_range_inputs.difference_update(("min", "max"))
         self._custom_range_min_value = None
         self._custom_range_max_value = None
-        self._custom_range_min_str = self._format_range_input(self._auto_histogram_min)
-        self._custom_range_max_str = self._format_range_input(self._auto_histogram_max)
+        self._custom_range_min_str = self._format_range_input(self._primary_histogram_min)
+        self._custom_range_max_str = self._format_range_input(self._primary_histogram_max)
 
     @staticmethod
     def _format_range_input(value: float) -> str:
@@ -560,6 +726,7 @@ class HistogramPanel(Panel):
         )
         self._custom_range_min_value = lo
         self._custom_range_max_value = hi
+        self._uncommitted_range_inputs.difference_update(("min", "max"))
         self._custom_range_min_str = self._format_range_input(lo)
         self._custom_range_max_str = self._format_range_input(hi)
         return changed
@@ -581,6 +748,7 @@ class HistogramPanel(Panel):
         )
         self._compare_y_custom_range_min_value = lo
         self._compare_y_custom_range_max_value = hi
+        self._uncommitted_range_inputs.difference_update(("y_min", "y_max"))
         self._compare_y_custom_range_min_str = self._format_range_input(lo)
         self._compare_y_custom_range_max_str = self._format_range_input(hi)
         return changed
@@ -668,17 +836,10 @@ class HistogramPanel(Panel):
         return float(view_min) <= domain_lo + tolerance and float(view_max) >= domain_hi - tolerance
 
     def _snap_histogram_zoom_bounds_to_data(self, range_min: float, range_max: float) -> tuple[float, float]:
-        if self._primary_valid_values is None:
-            return float(range_min), float(range_max)
-        try:
-            finite_values = self._primary_valid_values.contiguous().cpu().to("float32")
-            return self._snap_bounds_to_data(
-                finite_values,
-                float(range_min),
-                float(range_max),
-            )
-        except Exception:
-            return float(range_min), float(range_max)
+        return self._snap_sorted_bounds_to_data(
+            self._primary_sorted_values, float(range_min), float(range_max),
+            sample=self._primary_sorted_sample,
+        )
 
     def _histogram_value_for_mouse_x(self, mouse_x: float) -> float | None:
         if self._chart_el is None:
@@ -799,14 +960,28 @@ class HistogramPanel(Panel):
             return False
         return self._apply_compare_view_range(zoomed_x[0], zoomed_x[1], zoomed_y[0], zoomed_y[1])
 
+    def _range_inputs_ready(self):
+        return self._range_metric_id == self._metric_id
+
+    def _compare_y_range_inputs_ready(self):
+        return self._compare_y_range_metric_id == self._compare_metric_id
+
     def _set_custom_range_min(self, value):
         # Per-keystroke setter: just buffer the text. Commit happens on Enter or blur
         # via _commit_custom_range so the user can type freely without the input
         # snapping back mid-keystroke.
-        self._custom_range_min_str = str(value)
+        text = str(value)
+        if not self._range_inputs_ready() or text == self._custom_range_min_str:
+            return
+        self._custom_range_min_str = text
+        self._uncommitted_range_inputs.add("min")
 
     def _set_custom_range_max(self, value):
-        self._custom_range_max_str = str(value)
+        text = str(value)
+        if not self._range_inputs_ready() or text == self._custom_range_max_str:
+            return
+        self._custom_range_max_str = text
+        self._uncommitted_range_inputs.add("max")
 
     @staticmethod
     def _parse_range_input(value) -> float | None:
@@ -826,8 +1001,13 @@ class HistogramPanel(Panel):
         return abs(float(a) - float(b)) <= max(abs(float(b)) * 1e-6, 1e-9)
 
     def _commit_custom_range(self):
-        parsed_min = self._parse_range_input(self._custom_range_min_str)
-        parsed_max = self._parse_range_input(self._custom_range_max_str)
+        if not self._range_inputs_ready():
+            return
+        # Only typed text is a constraint; formatted bounds may be rounded or
+        # belong to the retained snapshot during an asynchronous metric change.
+        parsed_min = self._parse_range_input(self._custom_range_min_str) if "min" in self._uncommitted_range_inputs else None
+        parsed_max = self._parse_range_input(self._custom_range_max_str) if "max" in self._uncommitted_range_inputs else None
+        self._uncommitted_range_inputs.difference_update(("min", "max"))
 
         new_min = parsed_min if parsed_min is not None else self._custom_range_min_value
         new_max = parsed_max if parsed_max is not None else self._custom_range_max_value
@@ -860,6 +1040,7 @@ class HistogramPanel(Panel):
             self._refresh_range_input_strings()
 
     def _refresh_range_input_strings(self):
+        self._uncommitted_range_inputs.difference_update(("min", "max"))
         self._custom_range_min_str = self._format_range_input(self._primary_histogram_min)
         self._custom_range_max_str = self._format_range_input(self._primary_histogram_max)
         if self._handle:
@@ -898,20 +1079,34 @@ class HistogramPanel(Panel):
         return self._has_custom_range() or self._has_compare_y_custom_range()
 
     def _reset_compare_y_custom_range(self):
+        self._uncommitted_range_inputs.difference_update(("y_min", "y_max"))
         self._compare_y_custom_range_min_value = None
         self._compare_y_custom_range_max_value = None
-        self._compare_y_custom_range_min_str = self._format_range_input(self._compare_y_auto_min)
-        self._compare_y_custom_range_max_str = self._format_range_input(self._compare_y_auto_max)
+        self._compare_y_custom_range_min_str = self._format_range_input(self._compare_y_min)
+        self._compare_y_custom_range_max_str = self._format_range_input(self._compare_y_max)
 
     def _set_compare_y_range_min(self, value):
-        self._compare_y_custom_range_min_str = str(value)
+        text = str(value)
+        if not self._compare_y_range_inputs_ready() or text == self._compare_y_custom_range_min_str:
+            return
+        self._compare_y_custom_range_min_str = text
+        self._uncommitted_range_inputs.add("y_min")
 
     def _set_compare_y_range_max(self, value):
-        self._compare_y_custom_range_max_str = str(value)
+        text = str(value)
+        if not self._compare_y_range_inputs_ready() or text == self._compare_y_custom_range_max_str:
+            return
+        self._compare_y_custom_range_max_str = text
+        self._uncommitted_range_inputs.add("y_max")
 
     def _commit_compare_y_range(self):
-        parsed_min = self._parse_range_input(self._compare_y_custom_range_min_str)
-        parsed_max = self._parse_range_input(self._compare_y_custom_range_max_str)
+        if not self._compare_y_range_inputs_ready():
+            return
+        # Only typed text is a constraint; formatted bounds may be rounded or
+        # belong to the retained snapshot during an asynchronous metric change.
+        parsed_min = self._parse_range_input(self._compare_y_custom_range_min_str) if "y_min" in self._uncommitted_range_inputs else None
+        parsed_max = self._parse_range_input(self._compare_y_custom_range_max_str) if "y_max" in self._uncommitted_range_inputs else None
+        self._uncommitted_range_inputs.difference_update(("y_min", "y_max"))
 
         new_min = parsed_min if parsed_min is not None else self._compare_y_custom_range_min_value
         new_max = parsed_max if parsed_max is not None else self._compare_y_custom_range_max_value
@@ -940,6 +1135,7 @@ class HistogramPanel(Panel):
             self._refresh_compare_y_input_strings()
 
     def _refresh_compare_y_input_strings(self):
+        self._uncommitted_range_inputs.difference_update(("y_min", "y_max"))
         self._compare_y_custom_range_min_str = self._format_range_input(self._compare_y_min)
         self._compare_y_custom_range_max_str = self._format_range_input(self._compare_y_max)
         if self._handle:
@@ -964,42 +1160,47 @@ class HistogramPanel(Panel):
         bin_count = self._clamp_int(value, MIN_HISTOGRAM_BIN_COUNT, MAX_HISTOGRAM_BIN_COUNT)
         if bin_count == self._histogram_bin_count:
             return
-        mark_bounds = self._capture_histogram_mark_value_bounds() if self._active_mark_source == "histogram" else None
         self._histogram_bin_count = bin_count
-        if self._show_chart:
-            self._rebuild_histogram_from_cache()
-            if mark_bounds is not None and self._hist_edges is not None:
-                self._restore_histogram_mark_from_value_bounds(*mark_bounds)
-                self._sync_marked_range(apply_scene=False, preserve_value_bounds=True)
-        if self._handle:
+        if self._show_chart or self._computing:
+            # A loaded snapshot only needs re-binning; a pending worker result
+            # is recomputed with the new bin count instead.
+            if self._handle and (self._computing or self._primary_values is None):
+                self._refresh()
+            else:
+                self._rebuild_histogram_from_cache()
+                if self._handle:
+                    self._handle.dirty_all()
+        elif self._handle:
             self._handle.dirty_all()
 
     def _set_compare_x_bin_count(self, value):
         bin_count = self._clamp_int(value, MIN_COMPARE_BIN_COUNT, MAX_COMPARE_BIN_COUNT)
         if bin_count == self._compare_x_bin_count:
             return
-        mark_bounds = self._capture_compare_mark_value_bounds() if self._active_mark_source == "compare" else None
         self._compare_x_bin_count = bin_count
-        if self._show_compare_card:
-            self._rebuild_compare_from_cache()
-            if mark_bounds is not None and self._compare_x_edges is not None and self._compare_y_edges is not None:
-                self._restore_compare_mark_from_value_bounds(*mark_bounds)
-                self._sync_compare_mark(apply_scene=False, preserve_value_bounds=True)
-        if self._handle:
+        if self._show_compare_card or self._computing:
+            if self._handle and (self._computing or self._compare_values is None):
+                self._refresh()
+            else:
+                self._rebuild_compare_from_cache()
+                if self._handle:
+                    self._handle.dirty_all()
+        elif self._handle:
             self._handle.dirty_all()
 
     def _set_compare_y_bin_count(self, value):
         bin_count = self._clamp_int(value, MIN_COMPARE_BIN_COUNT, MAX_COMPARE_BIN_COUNT)
         if bin_count == self._compare_y_bin_count:
             return
-        mark_bounds = self._capture_compare_mark_value_bounds() if self._active_mark_source == "compare" else None
         self._compare_y_bin_count = bin_count
-        if self._show_compare_card:
-            self._rebuild_compare_from_cache()
-            if mark_bounds is not None and self._compare_x_edges is not None and self._compare_y_edges is not None:
-                self._restore_compare_mark_from_value_bounds(*mark_bounds)
-                self._sync_compare_mark(apply_scene=False, preserve_value_bounds=True)
-        if self._handle:
+        if self._show_compare_card or self._computing:
+            if self._handle and (self._computing or self._compare_values is None):
+                self._refresh()
+            else:
+                self._rebuild_compare_from_cache()
+                if self._handle:
+                    self._handle.dirty_all()
+        elif self._handle:
             self._handle.dirty_all()
 
     def _rebuild_metric_options(self):
@@ -1028,8 +1229,8 @@ class HistogramPanel(Panel):
         if not self._handle:
             return
 
-        # Zoom / range changes don't touch the data — re-bin the cached values
-        # instead of re-extracting, re-copying and re-sorting the whole scene.
+        # Zooming an already-loaded snapshot only changes the visible range. Keep
+        # this small path synchronous; scene/metric/bin changes use the worker below.
         if view_only and self._primary_finite_values_cpu is not None and self._primary_valid_values is not None:
             self._rebind_view_from_cache()
             if self._show_compare_card and self._compare_x_finite_cpu is not None:
@@ -1039,6 +1240,7 @@ class HistogramPanel(Panel):
 
         scene = lf.get_scene()
         if scene is None or not scene.is_valid():
+            self._cancel_histogram_compute()
             self._set_empty(
                 _tr("histogram.empty.no_scene.title", "No scene loaded"),
                 _tr("histogram.empty.no_scene.message", "Load a Gaussian scene, then reopen the histogram panel."),
@@ -1047,6 +1249,7 @@ class HistogramPanel(Panel):
 
         model = scene.combined_model()
         if model is None or int(getattr(model, "num_points", 0) or 0) <= 0:
+            self._cancel_histogram_compute()
             self._set_empty(
                 _tr("histogram.empty.no_visible_gaussians.title", "No visible Gaussians"),
                 _tr(
@@ -1056,77 +1259,516 @@ class HistogramPanel(Panel):
             )
             return
 
-        values = self._extract_metric_values(scene, model, self._metric_id)
-        if values is None:
-            self._set_empty(
-                _tr("histogram.empty.metric_unavailable.title", "Metric unavailable"),
-                _tr(
-                    "histogram.empty.metric_unavailable.message",
-                    "The selected metric could not be read from the combined Gaussian model.",
-                ),
-            )
+        cache_key = self._histogram_cache_key(
+            self._scene_data_generation_value(), self._scene_node_selection_signature()
+        )
+        cached = self._histogram_cache.get(cache_key)
+        if cached is not None:
+            self._cancel_histogram_compute()
+            self._histogram_cache.move_to_end(cache_key)
+            self._apply_histogram_result(cached)
+            self._handle.dirty_all()
             return
 
-        visible_mask = self._extract_visible_mask(model, values)
-        scope_mask = self._selection_scope_mask(scene, values)
-        scope_active = scope_mask is not None
-        if scope_mask is not None:
-            visible_mask = scope_mask if visible_mask is None else (visible_mask & scope_mask)
+        self._set_computing()
+        self._queue_histogram_compute(
+            scene,
+            model,
+            cache_key,
+            self._selection_scope_node_ids() or set(),
+            view_only=view_only,
+        )
 
-        finite_mask = values.isfinite()
-        if visible_mask is not None and visible_mask.shape == values.shape:
-            finite_mask = finite_mask & visible_mask
+    def _histogram_cache_key(self, scene_generation: int, node_selection: tuple[int, ...]) -> tuple:
+        """Identify a result by data identity and every histogram query parameter."""
+        return (
+            int(scene_generation),
+            self._metric_id,
+            int(self._histogram_bin_count),
+            tuple(node_selection),
+            self._compare_metric_id,
+            int(self._compare_x_bin_count),
+            int(self._compare_y_bin_count),
+            self._custom_range_min_value,
+            self._custom_range_max_value,
+            self._compare_y_custom_range_min_value,
+            self._compare_y_custom_range_max_value,
+        )
 
-        if not self._any_true(finite_mask):
-            if scope_active:
+    def _set_computing(self):
+        self._computing = True
+        if self._show_chart:
+            if self._handle:
+                self._handle.dirty_all()
+            return
+        self._show_chart = False
+        self._show_compare_card = False
+        self._show_compare_chart = False
+        self._empty_title = _tr("histogram.computing.title", "Computing histogram…")
+        self._empty_message = _tr(
+            "histogram.computing.message",
+            "The distribution will appear as soon as the data is ready.",
+        )
+        if self._handle:
+            self._handle.update_record_list("bins", [])
+            self._handle.update_record_list("compare_bins", [])
+            self._handle.dirty_all()
+
+    def _cancel_histogram_compute(self):
+        self._histogram_compute_cancel_event.set()
+        self._histogram_compute_token += 1
+        if self._histogram_compute_timer is not None:
+            self._histogram_compute_timer.cancel()
+            self._histogram_compute_timer = None
+        if self._histogram_compute_future is not None:
+            self._histogram_compute_future.cancel()
+            self._histogram_compute_future = None
+
+    def _queue_histogram_compute(self, scene, model, cache_key, scope_ids, *, view_only=False):
+        del view_only  # The worker always computes the requested view; this keeps UI work bounded.
+        self._cancel_histogram_compute()
+        token = self._histogram_compute_token
+        cancel_event = threading.Event()
+        self._histogram_compute_cancel_event = cancel_event
+        metric_id = self._metric_id
+        bin_count = self._histogram_bin_count
+        compare_metric_id = self._compare_metric_id
+        compare_x_bin_count = self._compare_x_bin_count
+        compare_y_bin_count = self._compare_y_bin_count
+        custom_range = (self._custom_range_min_value, self._custom_range_max_value)
+        compare_y_range = (
+            self._compare_y_custom_range_min_value,
+            self._compare_y_custom_range_max_value,
+        )
+
+        def submit():
+            if token != self._histogram_compute_token or cancel_event.is_set():
+                return
+            self._histogram_compute_timer = None
+            try:
+                future = self._compute_executor.submit(
+                    self._compute_histogram_result,
+                    scene,
+                    model,
+                    metric_id,
+                    bin_count,
+                    compare_metric_id,
+                    compare_x_bin_count,
+                    compare_y_bin_count,
+                    custom_range,
+                    compare_y_range,
+                    scope_ids,
+                    cancel_event,
+                )
+            except Exception as exc:
+                self._schedule_histogram_result(token, cache_key, {"kind": "error", "error": exc})
+                return
+            self._histogram_compute_future = future
+            future.add_done_callback(
+                lambda completed: self._on_histogram_future_done(token, cache_key, completed)
+            )
+
+        self._histogram_compute_timer = threading.Timer(_HISTOGRAM_DEBOUNCE_SECONDS, submit)
+        self._histogram_compute_timer.daemon = True
+        self._histogram_compute_timer.start()
+
+    def _on_histogram_future_done(self, token: int, cache_key: tuple, future: Future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = {"kind": "error", "error": exc}
+        self._schedule_histogram_result(token, cache_key, result)
+
+    def _schedule_histogram_result(self, token: int, cache_key: tuple, result: dict[str, object]):
+        if result.get("kind") == "error":
+            error = result.get("error")
+            error_text = str(error) if error is not None else "Unknown error"
+            if not error_text:
+                error_text = type(error).__name__ if error is not None else "Unknown error"
+            _LOGGER.warning("Histogram computation failed: %s", error_text)
+
+        def apply_result():
+            if token != self._histogram_compute_token or cache_key != self._histogram_cache_key(
+                self._scene_data_generation_value(), self._scene_node_selection_signature()
+            ):
+                return
+            kind = result.get("kind")
+            if kind == "cancelled":
+                return
+            self._histogram_compute_future = None
+            if kind == "ok":
+                self._histogram_cache[cache_key] = result
+                self._histogram_cache.move_to_end(cache_key)
+                while len(self._histogram_cache) > _HISTOGRAM_CACHE_LIMIT:
+                    self._histogram_cache.popitem(last=False)
+                self._apply_histogram_result(result)
+                self._sync_panel_selection_from_scene()
+            elif kind == "empty":
+                self._apply_empty_histogram_result(result)
+            elif kind == "error":
+                error = result.get("error")
+                error_text = str(error) if error is not None else "Unknown error"
+                if not error_text:
+                    error_text = type(error).__name__ if error is not None else "Unknown error"
                 self._set_empty(
-                    _tr("histogram.empty.no_selected_values.title", "No samples in selection"),
-                    _tr(
-                        "histogram.empty.no_selected_values.message",
-                        "The selected models contain no finite samples for this metric.",
+                    _tr("histogram.empty.compute_failed.title", "Histogram failed"),
+                    _trf(
+                        "histogram.empty.compute_failed.message",
+                        "Histogram computation failed: {error}",
+                        error=error_text,
                     ),
                 )
             else:
                 self._set_empty(
-                    _tr("histogram.empty.no_visible_values.title", "No visible values"),
+                    _tr("histogram.empty.metric_unavailable.title", "Metric unavailable"),
                     _tr(
-                        "histogram.empty.no_visible_values.message",
-                        "The selected metric does not contain any visible finite samples to visualize.",
+                        "histogram.empty.metric_unavailable.message",
+                        "The selected metric could not be read from the combined Gaussian model.",
                     ),
                 )
-            return
+            if self._handle:
+                self._handle.dirty_all()
 
-        valid_values = values[finite_mask]
-        finite_values = valid_values.contiguous().cpu().to("float32")
-        metric = METRIC_BY_ID[self._metric_id]
-        auto_min, auto_max = self._histogram_bounds(finite_values, self._metric_id)
-        sorted_values, _ = finite_values.sort(0, False)
-        self._primary_values = values
-        self._primary_finite_mask = finite_mask
-        self._primary_valid_values = valid_values
-        self._primary_finite_values_cpu = finite_values
-        self._primary_sorted_values = sorted_values
-        self._auto_histogram_min = auto_min
-        self._auto_histogram_max = auto_max
+        scheduler = self._ui_scheduler or getattr(lf.ui, "schedule_on_ui_thread", None)
+        if scheduler is None:
+            scheduler = getattr(lf.ui, "_run_on_ui_thread", None)
+        if callable(scheduler):
+            try:
+                scheduler(apply_result)
+                return
+            except Exception:
+                pass
+        # A worker must never mutate panel state directly. Runtime builds expose
+        # schedule_on_ui_thread; a missing scheduler is treated as a stale result.
 
-        # Whole-dataset stats — independent of the view range, so a later view-only
-        # re-bin reuses them instead of recomputing.
-        self._show_chart = True
-        self._sample_count = f"{int(finite_values.shape[0]):,}"
-        self._range_text = self._format_range_text(finite_values.min_scalar(), finite_values.max_scalar())
-        self._mean_text = self._format_value(finite_values.mean_scalar())
-        self._median_text = self._format_value(self._percentile_from_sorted(sorted_values, 50.0))
-        self._p95_text = self._format_value(self._percentile_from_sorted(sorted_values, 95.0))
-        self._summary_text = _trf(
-            "histogram.summary",
-            "{metric} distribution across {count} Gaussians",
-            metric=metric.label(),
-            count=f"{int(finite_values.shape[0]):,}",
+    @staticmethod
+    def _compute_histogram_result(
+        scene,
+        model,
+        metric_id: str,
+        bin_count: int,
+        compare_metric_id: str,
+        compare_x_bin_count: int,
+        compare_y_bin_count: int,
+        custom_range: tuple[float | None, float | None],
+        compare_y_range: tuple[float | None, float | None],
+        scope_ids,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        """Compute the complete snapshot away from the UI thread."""
+        if HistogramPanel._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        panel = HistogramPanel.__new__(HistogramPanel)
+        panel._metric_id = metric_id
+        values = panel._extract_metric_values(scene, model, metric_id, cancel_event)
+        if HistogramPanel._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        if values is None:
+            return {
+                "kind": "error",
+                "error": RuntimeError(f"Metric extraction returned no values for '{metric_id}'"),
+            }
+
+        visible_mask = panel._extract_visible_mask(model, values)
+        if HistogramPanel._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        scope_mask = panel._selection_scope_mask(scene, values, scope_ids, cancel_event)
+        if HistogramPanel._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        scope_active = scope_mask is not None
+        if scope_mask is not None:
+            visible_mask = scope_mask if visible_mask is None else visible_mask & scope_mask
+        finite_mask = values.isfinite()
+        if visible_mask is not None and visible_mask.shape == values.shape:
+            finite_mask = finite_mask & visible_mask
+        apply_crop_filter = getattr(scene, "apply_crop_filter", None)
+        if apply_crop_filter is not None:
+            apply_crop_filter(finite_mask)
+        primary = panel._build_series_result(
+            values, finite_mask, metric_id, bin_count, custom_range, cancel_event
         )
+        if HistogramPanel._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        if isinstance(primary, dict) and primary.get("kind") == "cancelled":
+            return primary
+        if primary is None:
+            return {"kind": "empty", "scope_active": scope_active}
 
-        self._rebind_view_from_cache()
-        self._refresh_compare(scene, model, values, visible_mask)
-        self._handle.dirty_all()
+        compare = None
+        if compare_metric_id:
+            compare_values = panel._extract_metric_values(
+                scene, model, compare_metric_id, cancel_event
+            )
+            if HistogramPanel._histogram_compute_cancelled(cancel_event):
+                return {"kind": "cancelled"}
+            if compare_values is None or compare_values.shape != values.shape:
+                compare = {"kind": "unavailable"}
+            else:
+                compare_mask = finite_mask & compare_values.isfinite()
+                compare = panel._build_compare_result(
+                    values,
+                    compare_values,
+                    compare_mask,
+                    metric_id,
+                    compare_metric_id,
+                    compare_x_bin_count,
+                    compare_y_bin_count,
+                    custom_range,
+                    compare_y_range,
+                    cancel_event,
+                )
+                if HistogramPanel._histogram_compute_cancelled(cancel_event):
+                    return {"kind": "cancelled"}
+                if isinstance(compare, dict) and compare.get("kind") == "cancelled":
+                    return compare
+        if HistogramPanel._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        return {"kind": "ok", "primary": primary, "compare": compare}
+
+    @staticmethod
+    def _histogram_compute_cancelled(cancel_event: threading.Event | None) -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    def _build_series_result(
+        self, values, finite_mask, metric_id, bin_count, custom_range, cancel_event=None
+    ):
+        # Keep the per-sample tensors on their device: binning, selection masks and the
+        # scene preview then never copy millions of samples between host and device.
+        values = values.contiguous().reshape([-1]).to("float32")
+        finite_mask = finite_mask.contiguous().reshape([-1]).to("bool")
+        if self._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        valid_values = values[finite_mask]
+        if int(valid_values.numel) == 0:
+            return None
+        if self._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        # The sorted host copy answers range snapping and percentiles in O(log n).
+        sorted_values, _ = valid_values.sort()
+        sorted_values = sorted_values.contiguous().cpu()
+        data_bounds = (float(sorted_values[0].item()), float(sorted_values[-1].item()))
+        bounded_extent = data_bounds if metric_id in ("opacity", "anisotropy", "erank") else None
+        auto_min, auto_max = self._histogram_bounds(sorted_values, metric_id, bounded_extent)
+        if self._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        histogram_min, histogram_max = HistogramPanel._resolve_and_snap_bounds(
+            sorted_values, auto_min, auto_max, custom_range, bounded_extent
+        )
+        bin_indices = self._bin_indices_for_values(
+            values, histogram_min, histogram_max, int(bin_count), finite_mask
+        )
+        counts, edges = self._build_histogram(
+            bin_indices, int(sorted_values.numel), histogram_min, histogram_max, int(bin_count)
+        )
+        if self._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        return {
+            "values": values,
+            "finite_mask": finite_mask,
+            "valid_values": sorted_values,
+            "finite_values_cpu": sorted_values,
+            "sorted_values": sorted_values,
+            "sorted_sample": self._sorted_sample(sorted_values),
+            "min_value": data_bounds[0],
+            "max_value": data_bounds[1],
+            "mean_value": float(valid_values.mean().item()),
+            "median_value": self._percentile_from_sorted(sorted_values, 50.0),
+            "p95_value": self._percentile_from_sorted(sorted_values, 95.0),
+            "auto_min": auto_min,
+            "auto_max": auto_max,
+            "histogram_min": histogram_min,
+            "histogram_max": histogram_max,
+            "counts": counts,
+            "edges": edges,
+            "bin_indices": bin_indices,
+        }
+
+    def _build_compare_result(
+        self,
+        x_values,
+        y_values,
+        finite_mask,
+        x_metric_id,
+        y_metric_id,
+        x_bin_count,
+        y_bin_count,
+        custom_range,
+        y_custom_range,
+        cancel_event=None,
+    ):
+        x_values = x_values.contiguous().reshape([-1]).to("float32")
+        y_values = y_values.contiguous().reshape([-1]).to("float32")
+        finite_mask = finite_mask.contiguous().reshape([-1]).to("bool")
+        if self._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        x_valid = x_values[finite_mask]
+        if int(x_valid.numel) == 0:
+            return {"kind": "empty"}
+        x_sorted, _ = x_valid.sort()
+        y_sorted, _ = y_values[finite_mask].sort()
+        x_sorted = x_sorted.contiguous().cpu()
+        y_sorted = y_sorted.contiguous().cpu()
+        if self._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        x_bounds = (
+            (float(x_sorted[0].item()), float(x_sorted[-1].item()))
+            if x_metric_id in ("opacity", "anisotropy", "erank") else None
+        )
+        y_bounds = (
+            (float(y_sorted[0].item()), float(y_sorted[-1].item()))
+            if y_metric_id in ("opacity", "anisotropy", "erank") else None
+        )
+        x_auto_min, x_auto_max = self._histogram_bounds(x_sorted, x_metric_id, x_bounds)
+        y_auto_min, y_auto_max = self._histogram_bounds(y_sorted, y_metric_id, y_bounds)
+        x_min, x_max = HistogramPanel._resolve_and_snap_bounds(x_sorted, x_auto_min, x_auto_max, custom_range, x_bounds)
+        y_min, y_max = HistogramPanel._resolve_and_snap_bounds(y_sorted, y_auto_min, y_auto_max, y_custom_range, y_bounds)
+        x_bin_indices = self._bin_indices_for_values(x_values, x_min, x_max, int(x_bin_count), finite_mask)
+        y_bin_indices = self._bin_indices_for_values(y_values, y_min, y_max, int(y_bin_count), finite_mask)
+        if self._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        heatmap, x_edges, y_edges = self._build_compare_heatmap(
+            x_bin_indices, y_bin_indices, int(x_sorted.numel),
+            x_min, x_max, y_min, y_max, int(x_bin_count), int(y_bin_count)
+        )
+        if self._histogram_compute_cancelled(cancel_event):
+            return {"kind": "cancelled"}
+        return {
+            "kind": "ok",
+            "x_values": x_values,
+            "y_values": y_values,
+            "finite_mask": finite_mask,
+            "valid_x_values": x_sorted,
+            "valid_y_values": y_sorted,
+            "x_finite_cpu": x_sorted,
+            "y_finite_cpu": y_sorted,
+            "x_sorted_sample": self._sorted_sample(x_sorted),
+            "y_sorted_sample": self._sorted_sample(y_sorted),
+            "x_auto_min": x_auto_min,
+            "x_auto_max": x_auto_max,
+            "y_auto_min": y_auto_min,
+            "y_auto_max": y_auto_max,
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": y_min,
+            "y_max": y_max,
+            "x_bin_indices": x_bin_indices,
+            "y_bin_indices": y_bin_indices,
+            "counts": heatmap,
+            "x_edges": x_edges,
+            "y_edges": y_edges,
+        }
+
+    def _apply_histogram_result(self, result):
+        self._computing = False
+        primary = result["primary"]
+        self._primary_values = primary["values"]
+        self._primary_finite_mask = primary["finite_mask"]
+        self._primary_valid_values = primary["valid_values"]
+        self._primary_finite_values_cpu = primary["finite_values_cpu"]
+        self._primary_sorted_values = primary["sorted_values"]
+        self._primary_sorted_sample = primary.get("sorted_sample")
+        self._auto_histogram_min = primary["auto_min"]
+        self._auto_histogram_max = primary["auto_max"]
+        self._primary_histogram_min = primary["histogram_min"]
+        self._primary_histogram_max = primary["histogram_max"]
+        self._range_metric_id = self._metric_id
+        # Enter may blur before this result arrives and restore the previous bounds.
+        # Publish the snapped bounds without replacing a newer, uncommitted edit.
+        if "min" not in self._uncommitted_range_inputs:
+            self._custom_range_min_str = self._format_range_input(self._primary_histogram_min)
+        if "max" not in self._uncommitted_range_inputs:
+            self._custom_range_max_str = self._format_range_input(self._primary_histogram_max)
+        self._show_chart = True
+        self._sample_count = f"{int(primary['valid_values'].shape[0]):,}"
+        self._range_text = self._format_range_text(primary["min_value"], primary["max_value"])
+        self._mean_text = self._format_value(primary["mean_value"])
+        self._median_text = self._format_value(primary["median_value"])
+        self._p95_text = self._format_value(primary["p95_value"])
+        self._summary_text = _trf(
+            "histogram.summary", "{metric} distribution across {count} Gaussians",
+            metric=METRIC_BY_ID[self._metric_id].label(), count=self._sample_count,
+        )
+        self._selection_bin_indices = primary["bin_indices"]
+        self._hist_counts = primary["counts"]
+        self._hist_prefix_counts = self._prefix_counts(self._hist_counts)
+        self._hist_edges = primary["edges"]
+        self._peak_text = f"{max(self._hist_counts, default=0):,}"
+        self._axis_min = self._format_value(self._hist_edges[0])
+        self._axis_max = self._format_value(self._hist_edges[-1])
+        self._update_bin_records()
+
+        compare = result.get("compare")
+        if not self._compare_metric_id:
+            self._hide_compare(clear_scene=self._active_mark_source == "compare")
+        elif compare is None or compare.get("kind") == "unavailable":
+            self._set_compare_empty(
+                _tr("histogram.compare.empty.metric_unavailable.title", "Compare metric unavailable"),
+                _tr("histogram.compare.empty.metric_unavailable.message", "The comparison metric could not be read from the combined Gaussian model."),
+                clear_scene=self._active_mark_source == "compare",
+            )
+        elif compare.get("kind") == "empty":
+            self._set_compare_empty(
+                _tr("histogram.compare.empty.no_visible_values.title", "No comparable values"),
+                _tr("histogram.compare.empty.no_visible_values.message", "The selected metric pair does not contain any visible finite samples to visualize."),
+                clear_scene=self._active_mark_source == "compare",
+            )
+        else:
+            self._apply_compare_result(compare)
+
+    def _apply_compare_result(self, compare):
+        self._show_compare_card = True
+        self._show_compare_chart = True
+        self._compare_values = compare["y_values"]
+        self._compare_finite_mask = compare["finite_mask"]
+        self._compare_valid_x_values = compare["valid_x_values"]
+        self._compare_valid_y_values = compare["valid_y_values"]
+        self._compare_x_finite_cpu = compare["x_finite_cpu"]
+        self._compare_y_finite_cpu = compare["y_finite_cpu"]
+        self._compare_x_sorted_sample = compare.get("x_sorted_sample")
+        self._compare_y_sorted_sample = compare.get("y_sorted_sample")
+        self._compare_x_auto_min = compare["x_auto_min"]
+        self._compare_x_auto_max = compare["x_auto_max"]
+        self._compare_y_auto_min = compare["y_auto_min"]
+        self._compare_y_auto_max = compare["y_auto_max"]
+        self._compare_x_min = compare["x_min"]
+        self._compare_x_max = compare["x_max"]
+        self._compare_y_min = compare["y_min"]
+        self._compare_y_max = compare["y_max"]
+        self._compare_y_range_metric_id = self._compare_metric_id
+        if "y_min" not in self._uncommitted_range_inputs:
+            self._compare_y_custom_range_min_str = self._format_range_input(self._compare_y_min)
+        if "y_max" not in self._uncommitted_range_inputs:
+            self._compare_y_custom_range_max_str = self._format_range_input(self._compare_y_max)
+        self._compare_x_bin_indices = compare["x_bin_indices"]
+        self._compare_y_bin_indices = compare["y_bin_indices"]
+        self._compare_counts = compare["counts"]
+        self._compare_x_edges = compare["x_edges"]
+        self._compare_y_edges = compare["y_edges"]
+        self._compare_x_metric_label = METRIC_BY_ID[self._metric_id].label()
+        self._compare_y_metric_label = METRIC_BY_ID[self._compare_metric_id].label()
+        self._compare_summary_text = _trf(
+            "histogram.compare.summary", "{x_metric} vs {y_metric} across {count} Gaussians",
+            x_metric=self._compare_x_metric_label,
+            y_metric=self._compare_y_metric_label,
+            count=f"{int(compare['valid_x_values'].shape[0]):,}",
+        )
+        self._compare_x_axis_min = self._format_value(self._compare_x_edges[0])
+        self._compare_x_axis_max = self._format_value(self._compare_x_edges[-1])
+        self._compare_y_axis_min = self._format_value(self._compare_y_edges[0])
+        self._compare_y_axis_max = self._format_value(self._compare_y_edges[-1])
+        self._update_compare_bin_records()
+
+    def _apply_empty_histogram_result(self, result):
+        if result.get("scope_active"):
+            self._set_empty(
+                _tr("histogram.empty.no_selected_values.title", "No samples in selection"),
+                _tr("histogram.empty.no_selected_values.message", "The selected models contain no finite samples for this metric."),
+            )
+        else:
+            self._set_empty(
+                _tr("histogram.empty.no_visible_values.title", "No visible values"),
+                _tr("histogram.empty.no_visible_values.message", "The selected metric does not contain any visible finite samples to visualize."),
+            )
 
     def _rebind_view_from_cache(self):
         """Re-resolve the view range and rebuild the bars from already-extracted data.
@@ -1137,11 +1779,12 @@ class HistogramPanel(Panel):
         range_min, range_max = self._resolve_active_bounds(self._auto_histogram_min, self._auto_histogram_max)
         # Snap to the actual extent of the values inside the resolved range so the bars
         # fill the chart instead of leaving leading/trailing empty bins.
-        histogram_min, histogram_max = self._snap_bounds_to_data(
-            finite_values, range_min, range_max
+        histogram_min, histogram_max = self._snap_sorted_bounds_to_data(
+            finite_values, range_min, range_max, sample=self._primary_sorted_sample
         )
         # Inputs reflect the current effective min/max; the typed constraint stays in
         # _custom_range_{min,max}_value.
+        self._uncommitted_range_inputs.difference_update(("min", "max"))
         self._custom_range_min_str = self._format_range_input(histogram_min)
         self._custom_range_max_str = self._format_range_input(histogram_max)
         self._primary_histogram_min = histogram_min
@@ -1149,6 +1792,7 @@ class HistogramPanel(Panel):
         self._rebuild_histogram_from_cache(reset_footer=self._active_mark_source != "compare")
 
     def _set_empty(self, title: str, message: str):
+        self._computing = False
         self._show_chart = False
         self._empty_title = title
         self._empty_message = message
@@ -1166,6 +1810,7 @@ class HistogramPanel(Panel):
         self._primary_valid_values = None
         self._primary_finite_values_cpu = None
         self._primary_sorted_values = None
+        self._primary_sorted_sample = None
         self._primary_histogram_min = 0.0
         self._primary_histogram_max = 1.0
         self._auto_histogram_min = 0.0
@@ -1202,14 +1847,8 @@ class HistogramPanel(Panel):
             self._primary_histogram_max,
             self._histogram_bin_count,
         )
-        valid_bin_indices = self._bin_indices_for_values(
-            self._primary_valid_values,
-            self._primary_histogram_min,
-            self._primary_histogram_max,
-            self._histogram_bin_count,
-        )
         counts, edges = self._build_histogram(
-            valid_bin_indices,
+            selection_bin_indices,
             int(self._primary_valid_values.shape[0]),
             self._primary_histogram_min,
             self._primary_histogram_max,
@@ -1270,21 +1909,9 @@ class HistogramPanel(Panel):
             self._compare_y_max,
             self._compare_y_bin_count,
         )
-        valid_x_bins = self._bin_indices_for_values(
-            self._compare_valid_x_values,
-            self._compare_x_min,
-            self._compare_x_max,
-            self._compare_x_bin_count,
-        )
-        valid_y_bins = self._bin_indices_for_values(
-            self._compare_valid_y_values,
-            self._compare_y_min,
-            self._compare_y_max,
-            self._compare_y_bin_count,
-        )
         compare_counts, x_edges, y_edges = self._build_compare_heatmap(
-            valid_x_bins,
-            valid_y_bins,
+            x_bin_indices,
+            y_bin_indices,
             int(self._compare_valid_x_values.shape[0]),
             self._compare_x_min,
             self._compare_x_max,
@@ -1314,37 +1941,43 @@ class HistogramPanel(Panel):
 
         self._update_compare_bin_records()
 
-    def _build_bin_records(self, counts: list[int], edges: list[float]) -> Iterable[dict[str, object]]:
+    def _static_bin_records(self, counts: list[int], edges: list[float]) -> list[dict[str, object]]:
+        key = (tuple(counts), tuple(edges), bool(self._log_scale_enabled), getattr(self, "_last_lang", None))
+        if self._static_bin_records_key == key and self._static_bin_records_value is not None:
+            return self._static_bin_records_value
         if self._log_scale_enabled:
             display_counts = [math.log1p(float(count)) for count in counts]
         else:
             display_counts = [float(count) for count in counts]
 
         peak = max(max(display_counts, default=0.0), 1.0)
-        selected_bins = self._selected_histogram_bins
-        marked_lo, marked_hi = self._marked_bounds()
+        records = []
         for index, count in enumerate(counts):
             ratio = display_counts[index] / peak
             height_pct = 0.0 if count <= 0 else max(3.0, ratio * 100.0)
             alpha = 0.16 if count <= 0 else (0.34 + ratio * 0.66)
-            left = self._format_value(edges[index])
-            right = self._format_value(edges[index + 1])
-            yield {
+            records.append({
                 "height_style": f"{height_pct:.2f}%",
                 "opacity_style": f"{alpha:.3f}",
                 "tooltip": _trf(
                     "histogram.bin_tooltip",
                     "Bin {index}: {left} to {right} | {count} Gaussians",
                     index=index + 1,
-                    left=left,
-                    right=right,
+                    left=self._format_value(edges[index]),
+                    right=self._format_value(edges[index + 1]),
                     count=f"{int(count):,}",
                 ),
-                "selected": (
-                    index in selected_bins or
-                    (marked_lo is not None and marked_lo <= index <= marked_hi)
-                ),
-            }
+            })
+        self._static_bin_records_key = key
+        self._static_bin_records_value = records
+        return records
+
+    def _build_bin_records(self, counts: list[int], edges: list[float]) -> Iterable[dict[str, object]]:
+        # The marked range is the last stroke, which a Ctrl stroke removes; only the
+        # selected bins are highlighted.
+        selected_bins = self._selected_histogram_bins
+        for index, record in enumerate(self._static_bin_records(counts, edges)):
+            yield {**record, "selected": index in selected_bins}
 
     def _update_bin_records(self):
         if self._handle is None or self._hist_counts is None or self._hist_edges is None:
@@ -1354,14 +1987,22 @@ class HistogramPanel(Panel):
             list(self._build_bin_records(self._hist_counts, self._hist_edges)),
         )
 
-    def _extract_metric_values(self, scene, model, metric_id: str | None = None) -> lf.Tensor | None:
+    def _extract_metric_values(
+        self,
+        scene,
+        model,
+        metric_id: str | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> lf.Tensor | None:
         metric_id = self._metric_id if metric_id is None else metric_id
         try:
+            if self._histogram_compute_cancelled(cancel_event):
+                return None
             if metric_id == "opacity":
                 return self._float_tensor(model.get_opacity()).reshape([-1])
 
             if metric_id in {"position_x", "position_y", "position_z", "world_distance", "distance"}:
-                world_means = self._extract_world_space_means(scene, model)
+                world_means = self._extract_world_space_means(scene, model, cancel_event)
                 if metric_id == "position_x":
                     return world_means[:, 0]
                 if metric_id == "position_y":
@@ -1393,15 +2034,19 @@ class HistogramPanel(Panel):
         except Exception:
             return None
 
-    def _extract_world_space_means(self, scene, model) -> lf.Tensor:
+    def _extract_world_space_means(
+        self, scene, model, cancel_event: threading.Event | None = None
+    ) -> lf.Tensor:
         means = self._float_tensor(model.get_means()).reshape([-1, 3])
         if means.numel == 0:
             return lf.Tensor.zeros([0, 3], dtype="float32", device=self._device_string(means))
 
-        world_means = self._world_space_means(scene, means)
+        world_means = self._world_space_means(scene, means, cancel_event)
         return means if world_means is None else world_means
 
-    def _world_space_means(self, scene, means: lf.Tensor) -> lf.Tensor | None:
+    def _world_space_means(
+        self, scene, means: lf.Tensor, cancel_event: threading.Event | None = None
+    ) -> lf.Tensor | None:
         nodes = self._visible_splat_nodes(scene)
         if not nodes:
             return None
@@ -1410,6 +2055,8 @@ class HistogramPanel(Panel):
         offset = 0
 
         for node in nodes:
+            if self._histogram_compute_cancelled(cancel_event):
+                return None
             count = int(getattr(node, "gaussian_count", 0) or 0)
             if count <= 0:
                 continue
@@ -1771,8 +2418,15 @@ class HistogramPanel(Panel):
             scope_ids.add(node_id)
         return scope_ids or None
 
-    def _selection_scope_mask(self, scene, reference: lf.Tensor) -> lf.Tensor | None:
-        scope_ids = self._selection_scope_node_ids()
+    def _selection_scope_mask(
+        self,
+        scene,
+        reference: lf.Tensor,
+        scope_ids=None,
+        cancel_event: threading.Event | None = None,
+    ) -> lf.Tensor | None:
+        if scope_ids is None:
+            scope_ids = self._selection_scope_node_ids()
         if not scope_ids:
             return None
 
@@ -1782,6 +2436,8 @@ class HistogramPanel(Panel):
             return None
         node_by_id: dict[int, object] = {}
         for node in nodes:
+            if self._histogram_compute_cancelled(cancel_event):
+                return None
             try:
                 node_by_id[int(node.id)] = node
             except Exception:
@@ -1791,6 +2447,8 @@ class HistogramPanel(Panel):
             visited: set[int] = set()
             current = node_id
             while current >= 0 and current not in visited:
+                if self._histogram_compute_cancelled(cancel_event):
+                    return False
                 if current in scope_ids:
                     return True
                 visited.add(current)
@@ -1813,6 +2471,8 @@ class HistogramPanel(Panel):
         counted = 0
         any_in_scope = False
         for node in visible_nodes:
+            if self._histogram_compute_cancelled(cancel_event):
+                return None
             count = int(getattr(node, "gaussian_count", 0) or 0)
             if count <= 0:
                 continue
@@ -1844,22 +2504,30 @@ class HistogramPanel(Panel):
         entropy = -(probabilities * (probabilities + 1e-12).log()).sum(1)
         return entropy.exp().reshape([-1])
 
-    def _histogram_bounds(self, values: lf.Tensor, metric_id: str | None = None) -> tuple[float, float]:
+    def _histogram_bounds(
+        self,
+        values: lf.Tensor,
+        metric_id: str | None = None,
+        data_bounds: tuple[float, float] | None = None,
+    ) -> tuple[float, float]:
         metric_id = self._metric_id if metric_id is None else metric_id
+        if metric_id in ("opacity", "anisotropy", "erank"):
+            # Automatic domains must include every finite sample, even outside the ideal bounds.
+            data_min, data_max = data_bounds if data_bounds is not None else (values.min_scalar(), values.max_scalar())
         if metric_id == "opacity":
-            return 0.0, 1.0
+            return min(0.0, data_min), max(1.0, data_max)
         if metric_id == "anisotropy":
-            lo = 1.0
-            hi = values.max_scalar()
+            lo = min(1.0, data_min)
+            hi = data_max
             if not math.isfinite(hi):
                 return lo, lo + 1.0
-            if hi < lo:
-                hi = lo
-            if math.isclose(hi, lo, rel_tol=1e-6, abs_tol=1e-9):
-                return lo, lo + 1e-3
+            if hi < 1.0:
+                hi = 1.0
+            if math.isclose(hi, 1.0, rel_tol=1e-6, abs_tol=1e-9):
+                return lo, 1.0 + 1e-3
             return lo, hi
         if metric_id == "erank":
-            return 1.0, 3.0
+            return min(1.0, data_min), max(3.0, data_max)
 
         lo = values.min_scalar()
         hi = values.max_scalar()
@@ -1872,6 +2540,20 @@ class HistogramPanel(Panel):
 
         return lo, hi
 
+    @staticmethod
+    def _resolve_and_snap_bounds(
+        values: lf.Tensor,
+        auto_min: float,
+        auto_max: float,
+        custom_range: tuple[float | None, float | None],
+        data_bounds: tuple[float, float] | None = None,
+    ) -> tuple[float, float]:
+        lo = custom_range[0] if custom_range[0] is not None else auto_min
+        hi = custom_range[1] if custom_range[1] is not None else auto_max
+        if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+            lo, hi = auto_min, auto_max
+        return HistogramPanel._snap_sorted_bounds_to_data(values, lo, hi, data_bounds)
+
     def _build_histogram(
         self,
         bin_indices: lf.Tensor,
@@ -1880,29 +2562,9 @@ class HistogramPanel(Panel):
         histogram_max: float,
         bin_count: int = DEFAULT_HISTOGRAM_BIN_COUNT,
     ) -> tuple[list[int], list[float]]:
+        del value_count
         edges = self._compute_bin_edges(histogram_min, histogram_max, bin_count)
-
-        span = histogram_max - histogram_min
-        if not math.isfinite(span) or span <= 0.0:
-            counts = [0] * bin_count
-            if value_count > 0:
-                counts[-1] = value_count
-            return counts, edges
-
-        device = self._device_string(bin_indices)
-        counts_tensor = lf.Tensor.zeros([bin_count], dtype="int32", device=device)
-        if value_count > 0:
-            # Drop the -1 sentinel that _bin_indices_for_values uses for samples
-            # outside [histogram_min, histogram_max).
-            in_range = bin_indices >= 0
-            in_range_indices = bin_indices[in_range]
-            in_range_count = int(in_range_indices.shape[0]) if in_range_indices.ndim > 0 else 0
-            if in_range_count > 0:
-                ones = lf.Tensor.ones([in_range_count], dtype="int32", device=device)
-                counts_tensor.index_add_(0, in_range_indices.contiguous().to("int32"), ones)
-        counts = counts_tensor.cpu().tolist() if counts_tensor.is_cuda else counts_tensor.tolist()
-        counts = [int(count) for count in counts]
-        return counts, edges
+        return self._bin_counts(bin_indices, bin_count), edges
 
     @staticmethod
     def _bin_indices_for_values(
@@ -1910,35 +2572,30 @@ class HistogramPanel(Panel):
         histogram_min: float,
         histogram_max: float,
         bin_count: int = DEFAULT_HISTOGRAM_BIN_COUNT,
+        valid_mask: lf.Tensor | None = None,
     ) -> lf.Tensor:
-        # Out-of-range values get a -1 sentinel so they're excluded from both
-        # the histogram counts and bin-based selection masks. Without this,
-        # clamping piles every out-of-range sample into the edge bins, which
-        # makes a custom range-of-interest meaningless.
+        """Per-sample bin index on the values' device, -1 outside the range or valid mask.
+
+        Purely elementwise: no mask compaction, no scatter and no host sync, so it stays
+        cheap on millions of samples. Values equal to histogram_max land in the last bin.
+        """
         value_count = int(values.shape[0]) if values.ndim > 0 else int(values.numel)
         device = HistogramPanel._device_string(values)
         if value_count <= 0:
             return lf.Tensor.zeros([0], dtype="int32", device=device)
 
+        flat = values.reshape([-1])
         span = histogram_max - histogram_min
         if not math.isfinite(span) or span <= 0.0:
-            return lf.Tensor.full([value_count], bin_count - 1, dtype="int32", device=device)
+            bins = lf.Tensor.full([value_count], bin_count - 1, dtype="int32", device=device)
+            return bins if valid_mask is None else bins.masked_fill(~valid_mask, -1)
 
-        flat = values.reshape([-1])
         in_range = (flat >= histogram_min) & (flat <= histogram_max)
-        raw = lf.Tensor.full([value_count], -1, dtype="int32", device=device)
-        if not bool(in_range.any().item()):
-            return raw
-
-        in_values = flat[in_range]
-        bin_idx = (
-            (((in_values - histogram_min) / span) * bin_count)
-            .floor()
-            .to("int32")
-        )
-        bin_idx = bin_idx.clamp(0.0, float(bin_count - 1)).to("int32")
-        raw[in_range] = bin_idx
-        return raw
+        if valid_mask is not None:
+            in_range = in_range & valid_mask
+        bins = (((flat - histogram_min) / span) * bin_count).floor()
+        bins = bins.clamp(0.0, float(bin_count - 1)).to("int32")
+        return bins.masked_fill(~in_range, -1)
 
     def _build_selection_bin_indices(
         self,
@@ -1948,19 +2605,26 @@ class HistogramPanel(Panel):
         histogram_max: float,
         bin_count: int = DEFAULT_HISTOGRAM_BIN_COUNT,
     ) -> lf.Tensor:
-        value_count = int(values.shape[0]) if values.ndim > 0 else int(values.numel)
-        device = self._device_string(values)
-        selection_bin_indices = lf.Tensor.full([value_count], -1, dtype="int32", device=device)
-        if value_count <= 0 or not self._any_true(finite_mask):
-            return selection_bin_indices
+        return self._bin_indices_for_values(values, histogram_min, histogram_max, bin_count, finite_mask)
 
-        selection_bin_indices[finite_mask] = self._bin_indices_for_values(
-            values[finite_mask],
-            histogram_min,
-            histogram_max,
-            bin_count,
-        )
-        return selection_bin_indices
+    @staticmethod
+    def _bin_counts(bin_indices: lf.Tensor, bin_count: int) -> list[int]:
+        """Histogram of per-sample bin indices; -1 entries go to a dropped overflow slot."""
+        value_count = int(bin_indices.shape[0]) if bin_indices.ndim > 0 else int(bin_indices.numel)
+        if value_count <= 0:
+            return [0] * bin_count
+        device = HistogramPanel._device_string(bin_indices)
+        slots = bin_indices.masked_fill(bin_indices < 0, bin_count).contiguous()
+        counts = lf.Tensor.zeros([bin_count + 1], dtype="int32", device=device)
+        counts.index_add_(0, slots, lf.Tensor.ones([value_count], dtype="int32", device=device))
+        values = counts.cpu().tolist() if counts.is_cuda else counts.tolist()
+        return [int(count) for count in values[:bin_count]]
+
+    @staticmethod
+    def _cell_indices(x_bins: lf.Tensor, y_bins: lf.Tensor, x_bin_count: int) -> lf.Tensor:
+        """Flattened heatmap cell per sample; -1 when either axis is out of range."""
+        cells = y_bins * x_bin_count + x_bins
+        return cells.masked_fill((x_bins < 0) | (y_bins < 0), -1).to("int32")
 
     @staticmethod
     def _prefix_counts(counts: list[int]) -> list[int]:
@@ -1997,14 +2661,34 @@ class HistogramPanel(Panel):
         scene_mask = getattr(scene, "selection_mask", None)
         if scene_mask is None:
             # Nothing selected (or selection cleared) -> clear panel highlight too.
+            self._selection_owned = False
             if self._has_any_mark():
                 self._reset_marked_state(clear_scene=False)
             return
 
-        if self._show_compare_chart and self._compare_finite_mask is not None and self._compare_values is not None:
+        source = (
+            "compare"
+            if self._show_compare_chart and self._compare_finite_mask is not None and self._compare_values is not None
+            else "histogram"
+        )
+        if self._scene_selection_matches_panel(scene_mask, source):
+            return
+        self._selection_owned = False
+        if source == "compare":
             self._commit_compare_mask_selection(scene_mask, apply_scene=False)
         elif self._primary_finite_mask is not None and self._primary_values is not None:
             self._commit_histogram_mask_selection(scene_mask, apply_scene=False)
+
+    def _scene_selection_matches_panel(self, scene_mask: lf.Tensor, source: str) -> bool:
+        """True when the scene holds the panel's own last selection within the panel's domain."""
+        panel_mask = self._panel_selection_mask
+        if panel_mask is None or self._active_mark_source != source:
+            return False
+        reference, domain_mask = self._selection_mode_state(source)
+        normalized = self._normalize_selection_mask(scene_mask, reference)
+        if normalized is None or domain_mask is None or normalized.numel != panel_mask.numel:
+            return False
+        return not self._any_true((normalized & domain_mask) != panel_mask)
 
     def _selection_mode_state(self, source: str) -> tuple[lf.Tensor | None, lf.Tensor | None]:
         if source == "compare":
@@ -2085,33 +2769,28 @@ class HistogramPanel(Panel):
 
     def _selected_histogram_bins_from_mask(self, mask: lf.Tensor | None) -> set[int]:
         normalized = self._normalize_selection_mask(mask, self._primary_values)
-        if normalized is None or self._selection_bin_indices is None or not self._any_true(normalized):
+        if normalized is None or self._selection_bin_indices is None:
             return set()
-        selected = self._selection_bin_indices[normalized]
-        if int(selected.numel) == 0:
-            return set()
-        values = selected.contiguous().cpu().tolist() if selected.is_cuda else selected.tolist()
-        return {int(value) for value in values if int(value) >= 0}
+        bin_count = len(self._hist_counts) if self._hist_counts is not None else self._histogram_bin_count
+        counts = self._bin_counts(self._selection_bin_indices.masked_fill(~normalized, -1), bin_count)
+        return {index for index, count in enumerate(counts) if count > 0}
 
     def _selected_compare_cells_from_mask(self, mask: lf.Tensor | None) -> set[tuple[int, int]]:
         normalized = self._normalize_selection_mask(mask, self._compare_values)
         if (
             normalized is None or
             self._compare_x_bin_indices is None or
-            self._compare_y_bin_indices is None or
-            not self._any_true(normalized)
+            self._compare_y_bin_indices is None
         ):
             return set()
-        x_selected = self._compare_x_bin_indices[normalized]
-        y_selected = self._compare_y_bin_indices[normalized]
-        if int(x_selected.numel) == 0:
-            return set()
-        x_values = x_selected.contiguous().cpu().tolist() if x_selected.is_cuda else x_selected.tolist()
-        y_values = y_selected.contiguous().cpu().tolist() if y_selected.is_cuda else y_selected.tolist()
+        x_bin_count = self._compare_x_bin_count
+        y_bin_count = self._compare_y_bin_count
+        cells = self._cell_indices(self._compare_x_bin_indices, self._compare_y_bin_indices, x_bin_count)
+        counts = self._bin_counts(cells.masked_fill(~normalized, -1), x_bin_count * y_bin_count)
         return {
-            (int(x_bin), int(y_bin))
-            for x_bin, y_bin in zip(x_values, y_values)
-            if int(x_bin) >= 0 and int(y_bin) >= 0
+            (index % x_bin_count, index // x_bin_count)
+            for index, count in enumerate(counts)
+            if count > 0
         }
 
     def _refresh_compare(self, scene, model, primary_values: lf.Tensor, visible_mask: lf.Tensor | None):
@@ -2134,6 +2813,9 @@ class HistogramPanel(Panel):
         finite_mask = primary_values.isfinite() & compare_values.isfinite()
         if visible_mask is not None and visible_mask.shape == primary_values.shape:
             finite_mask = finite_mask & visible_mask
+        apply_crop_filter = getattr(scene, "apply_crop_filter", None)
+        if apply_crop_filter is not None:
+            apply_crop_filter(finite_mask)
 
         if not self._any_true(finite_mask):
             self._set_compare_empty(
@@ -2161,8 +2843,10 @@ class HistogramPanel(Panel):
         self._compare_valid_y_values = y_valid
         self._compare_x_finite_cpu = x_finite
         self._compare_y_finite_cpu = y_finite
-        self._compare_x_auto_min, self._compare_x_auto_max = self._histogram_bounds(x_finite, self._metric_id)
-        self._compare_y_auto_min, self._compare_y_auto_max = self._histogram_bounds(y_finite, self._compare_metric_id)
+        x_bounds = (x_finite.min_scalar(), x_finite.max_scalar()) if self._metric_id in ("opacity", "anisotropy", "erank") else None
+        y_bounds = (y_finite.min_scalar(), y_finite.max_scalar()) if self._compare_metric_id in ("opacity", "anisotropy", "erank") else None
+        self._compare_x_auto_min, self._compare_x_auto_max = self._histogram_bounds(x_finite, self._metric_id, x_bounds)
+        self._compare_y_auto_min, self._compare_y_auto_max = self._histogram_bounds(y_finite, self._compare_metric_id, y_bounds)
         self._compare_summary_text = _trf(
             "histogram.compare.summary",
             "{x_metric} vs {y_metric} across {count} Gaussians",
@@ -2172,9 +2856,9 @@ class HistogramPanel(Panel):
         )
         self._compare_x_metric_label = METRIC_BY_ID[self._metric_id].label()
         self._compare_y_metric_label = METRIC_BY_ID[self._compare_metric_id].label()
-        self._rebind_compare_from_cache()
+        self._rebind_compare_from_cache(x_bounds, y_bounds)
 
-    def _rebind_compare_from_cache(self):
+    def _rebind_compare_from_cache(self, x_bounds=None, y_bounds=None):
         """Re-resolve compare X/Y ranges and rebuild the heatmap from cached values."""
         x_finite = self._compare_x_finite_cpu
         y_finite = self._compare_y_finite_cpu
@@ -2183,9 +2867,14 @@ class HistogramPanel(Panel):
         # Mirror the primary axis range-of-interest on the compare X axis so the 2D
         # heatmap stays consistent with the 1D histogram.
         x_range_min, x_range_max = self._resolve_active_bounds(self._compare_x_auto_min, self._compare_x_auto_max)
-        x_min, x_max = self._snap_bounds_to_data(x_finite, x_range_min, x_range_max)
+        x_min, x_max = self._snap_sorted_bounds_to_data(
+            x_finite, x_range_min, x_range_max, x_bounds, sample=self._compare_x_sorted_sample
+        )
         y_range_min, y_range_max = self._resolve_compare_y_bounds(self._compare_y_auto_min, self._compare_y_auto_max)
-        y_min, y_max = self._snap_bounds_to_data(y_finite, y_range_min, y_range_max)
+        y_min, y_max = self._snap_sorted_bounds_to_data(
+            y_finite, y_range_min, y_range_max, y_bounds, sample=self._compare_y_sorted_sample
+        )
+        self._uncommitted_range_inputs.difference_update(("y_min", "y_max"))
         self._compare_y_custom_range_min_str = self._format_range_input(y_min)
         self._compare_y_custom_range_max_str = self._format_range_input(y_max)
         self._compare_x_min = x_min
@@ -2206,23 +2895,11 @@ class HistogramPanel(Panel):
         x_bin_count: int,
         y_bin_count: int,
     ) -> tuple[list[int], list[float], list[float]]:
+        del value_count
         x_edges = self._compute_bin_edges(x_min, x_max, x_bin_count)
         y_edges = self._compute_bin_edges(y_min, y_max, y_bin_count)
-
-        device = self._device_string(x_bin_indices)
-        counts_tensor = lf.Tensor.zeros([x_bin_count * y_bin_count], dtype="int32", device=device)
-        if value_count > 0:
-            # Skip samples that fell out of either axis range (sentinel -1).
-            in_range = (x_bin_indices >= 0) & (y_bin_indices >= 0)
-            x_in = x_bin_indices[in_range]
-            y_in = y_bin_indices[in_range]
-            in_range_count = int(x_in.shape[0]) if x_in.ndim > 0 else 0
-            if in_range_count > 0:
-                flat_indices = (y_in * x_bin_count + x_in).reshape([-1]).to("int32")
-                ones = lf.Tensor.ones([in_range_count], dtype="int32", device=device)
-                counts_tensor.index_add_(0, flat_indices.contiguous(), ones)
-        counts = counts_tensor.cpu().tolist() if counts_tensor.is_cuda else counts_tensor.tolist()
-        return [int(count) for count in counts], x_edges, y_edges
+        cells = self._cell_indices(x_bin_indices, y_bin_indices, x_bin_count)
+        return self._bin_counts(cells, x_bin_count * y_bin_count), x_edges, y_edges
 
     def _set_compare_empty(self, title: str, message: str, clear_scene: bool):
         self._show_compare_card = bool(self._compare_metric_id)
@@ -2267,6 +2944,8 @@ class HistogramPanel(Panel):
         self._compare_valid_y_values = None
         self._compare_x_finite_cpu = None
         self._compare_y_finite_cpu = None
+        self._compare_x_sorted_sample = None
+        self._compare_y_sorted_sample = None
         self._compare_x_min = 0.0
         self._compare_x_max = 1.0
         self._compare_y_min = 0.0
@@ -2288,7 +2967,6 @@ class HistogramPanel(Panel):
 
         peak = max(max(display_counts, default=0.0), 1.0)
         selected_cells = self._selected_compare_cells
-        x_lo, x_hi, y_lo, y_hi = self._compare_marked_bounds()
         records = []
         cell_width = 100.0 / max(self._compare_x_bin_count, 1)
         cell_height = 100.0 / max(self._compare_y_bin_count, 1)
@@ -2309,14 +2987,7 @@ class HistogramPanel(Panel):
                             f"height: {cell_height:.4f}%;"
                         ),
                         "opacity_style": f"{opacity:.3f}",
-                        "selected": (
-                            (x_bin, y_bin) in selected_cells or
-                            (
-                                x_lo is not None and y_lo is not None and
-                                x_lo <= x_bin <= x_hi and
-                                y_lo <= y_bin <= y_hi
-                            )
-                        ),
+                        "selected": (x_bin, y_bin) in selected_cells,
                         "tooltip": _trf(
                             "histogram.compare.bin_tooltip",
                             "X {x_range} | Y {y_range} | {count} Gaussians",
@@ -2478,42 +3149,6 @@ class HistogramPanel(Panel):
             return set(base_bins) - drag_bins
         return None
 
-    def _toggle_histogram_bin_selection(self, bin_index: int, preview_scene: bool = False) -> bool:
-        base_mask = self._drag_selection_base_mask
-        if base_mask is None:
-            base_mask = self._current_selection_mask_for_source("histogram")
-        if base_mask is None:
-            return False
-
-        bin_mask = self._selection_mask_for_histogram_bin_bounds(bin_index, bin_index)
-        normalized_base = self._normalize_selection_mask(base_mask, self._primary_values)
-        if normalized_base is None or bin_mask is None:
-            return False
-
-        if not self._any_true(normalized_base & bin_mask):
-            return False
-
-        next_mask = normalized_base & ~bin_mask
-        self._commit_histogram_mask_selection(
-            next_mask,
-            apply_scene=not preview_scene,
-            preview_scene=preview_scene,
-        )
-        return True
-
-    def _maybe_promote_histogram_drag_selection_mode(self, event) -> bool:
-        if self._drag_selection_mode != "replace":
-            return False
-        mode = self._selection_mode_from_event(event)
-        if mode == "replace":
-            return False
-        self._drag_selection_mode = mode
-        if self._drag_selection_base_mask is None:
-            self._drag_selection_base_mask = self._current_selection_mask_for_source("histogram")
-        if self._drag_selection_base_bins is None:
-            self._drag_selection_base_bins = self._selected_histogram_bins_from_mask(self._drag_selection_base_mask)
-        return True
-
     def _commit_scene_selection_preview(self):
         if not self._scene_selection_preview_active:
             return
@@ -2529,7 +3164,6 @@ class HistogramPanel(Panel):
 
         self._scene_selection_preview_active = False
         self._selection_owned = True
-        self._pending_selection_commit = 2
 
     def _cancel_scene_selection_preview(self):
         if not self._scene_selection_preview_active:
@@ -2546,13 +3180,11 @@ class HistogramPanel(Panel):
 
         self._scene_selection_preview_active = False
         self._selection_owned = False
-        self._pending_selection_commit = 0
 
     def _apply_scene_selection_mask(self, mask: lf.Tensor | None, preview: bool = False):
         scene = lf.get_scene()
         if scene is None or not scene.is_valid():
             self._selection_owned = False
-            self._pending_selection_commit = 0
             return
 
         reference = self._primary_values if self._primary_values is not None else self._compare_values
@@ -2562,7 +3194,6 @@ class HistogramPanel(Panel):
         if normalized is None:
             scene.clear_selection()
             self._selection_owned = False
-            self._pending_selection_commit = 0
             return
 
         try:
@@ -2582,15 +3213,10 @@ class HistogramPanel(Panel):
             else:
                 scene.clear_selection()
                 self._selection_owned = False
-                self._pending_selection_commit = 0
                 return
             self._selection_owned = True
-            # A histogram commit can trigger separate scene and undo/history updates.
-            # Keep ownership across both so we do not immediately resync stale scene state.
-            self._pending_selection_commit = 2
         except Exception:
             self._selection_owned = False
-            self._pending_selection_commit = 0
 
     def _clear_histogram_overlay(self):
         self._histogram_overlay_bounds = None
@@ -2912,6 +3538,8 @@ class HistogramPanel(Panel):
             self._commit_histogram_mask_selection(inverted, apply_scene=True, force_full_domain=force_full_domain)
 
     def _on_keydown(self, event):
+        if self._computing:
+            return
         key = int(event.get_parameter("key_identifier", "0"))
         ctrl_pressed = self._event_primary_shortcut_pressed(event)
 
@@ -2949,7 +3577,7 @@ class HistogramPanel(Panel):
         return lower_value + (upper_value - lower_value) * weight
 
     def _on_chart_mousedown(self, event):
-        if not self._show_chart or self._chart_el is None or self._hist_edges is None:
+        if self._computing or not self._show_chart or self._chart_el is None or self._hist_edges is None:
             return
         if int(event.get_parameter("button", "0")) != 0:
             return
@@ -2959,16 +3587,21 @@ class HistogramPanel(Panel):
         except Exception:
             pass
 
+        # Like the viewport selection tools, the modifiers at press time decide the mode:
+        # none replaces, Shift adds, Ctrl removes.
         self._drag_selection_mode = self._selection_mode_from_event(event)
-        self._drag_selection_base_mask = self._current_selection_mask_for_source("histogram")
-        self._drag_selection_base_bins = self._selected_histogram_bins_from_mask(self._drag_selection_base_mask)
+        self._drag_selection_base_mask = None
+        self._drag_selection_base_bins = None
+        if self._drag_selection_mode != "replace":
+            self._drag_selection_base_mask = self._current_selection_mask_for_source("histogram")
+            self._drag_selection_base_bins = self._selected_histogram_bins_from_mask(self._drag_selection_base_mask)
         self._clear_compare_mark(clear_scene=False)
         bin_index = self._bin_index_for_mouse_x(self._event_mouse_x(event))
         self._dragging_mark = True
         self._marked_bin_start = bin_index
         self._marked_bin_end = bin_index
         self._sync_marked_range(apply_scene=False, preview_scene=True)
-        event.stop_propagation()
+        # RmlUi only detects double-clicks after a propagating mousedown.
 
     @staticmethod
     def _wheel_zoom_magnitude(delta: float) -> float:
@@ -2999,7 +3632,7 @@ class HistogramPanel(Panel):
         event.stop_propagation()
 
     def _on_compare_chart_mousedown(self, event):
-        if not self._show_compare_chart or self._compare_chart_el is None:
+        if self._computing or not self._show_compare_chart or self._compare_chart_el is None:
             return
         if int(event.get_parameter("button", "0")) != 0:
             return
@@ -3026,7 +3659,7 @@ class HistogramPanel(Panel):
         self._compare_mark_start = (x_bin, y_bin)
         self._compare_mark_end = (x_bin, y_bin)
         self._sync_compare_mark(apply_scene=False, preview_scene=True)
-        event.stop_propagation()
+        # RmlUi only detects double-clicks after a propagating mousedown.
 
     def _on_compare_chart_mousescroll(self, event):
         if not self._show_compare_chart or not self._event_matches_histogram_zoom_binding(event):
@@ -3062,9 +3695,8 @@ class HistogramPanel(Panel):
             return
 
         if self._dragging_mark and self._chart_el is not None:
-            mode_changed = self._maybe_promote_histogram_drag_selection_mode(event)
             bin_index = self._bin_index_for_mouse_x(self._event_mouse_x(event))
-            if bin_index == self._marked_bin_end and not mode_changed:
+            if bin_index == self._marked_bin_end:
                 return
             self._marked_bin_end = bin_index
             self._sync_marked_range(apply_scene=False, preview_scene=True)
@@ -3100,15 +3732,7 @@ class HistogramPanel(Panel):
             return
 
         if self._dragging_mark:
-            self._maybe_promote_histogram_drag_selection_mode(event)
-            toggled = (
-                self._drag_selection_mode == "replace" and
-                self._marked_bin_start is not None and
-                self._marked_bin_start == self._marked_bin_end and
-                self._toggle_histogram_bin_selection(self._marked_bin_start, preview_scene=True)
-            )
-            if not toggled:
-                self._sync_marked_range(apply_scene=False, preview_scene=True)
+            self._sync_marked_range(apply_scene=False, preview_scene=True)
             self._commit_scene_selection_preview()
             self._dragging_mark = False
             self._drag_selection_mode = "replace"
@@ -3386,7 +4010,6 @@ class HistogramPanel(Panel):
             self._clear_owned_scene_selection()
         else:
             self._selection_owned = False
-            self._pending_selection_commit = 0
 
     def _reset_marked_state(self, clear_scene: bool):
         self._reset_footer_mark_state(clear_scene=clear_scene)
@@ -3487,12 +4110,23 @@ class HistogramPanel(Panel):
         if scene is not None and scene.is_valid() and self._selection_owned:
             scene.clear_selection()
         self._selection_owned = False
-        self._pending_selection_commit = 0
 
     @staticmethod
     def _history_generation_value() -> int:
         try:
             return int(lf.undo.generation())
+        except Exception:
+            return -1
+
+    @staticmethod
+    def _scene_data_generation_value() -> int:
+        scene = lf.get_scene()
+        return int(getattr(scene, "render_generation", lf.get_scene_generation()))
+
+    @staticmethod
+    def _selection_generation_value() -> int:
+        try:
+            return int(RuntimeState.selection_generation.value)
         except Exception:
             return -1
 
@@ -3612,7 +4246,7 @@ class HistogramPanel(Panel):
         )
 
     def _on_delete_marked(self, _handle, _event, _args):
-        if not self._has_any_mark() or self._marked_count <= 0:
+        if self._computing or not self._has_any_mark() or self._marked_count <= 0:
             return
 
         if self._panel_selection_mask is None:

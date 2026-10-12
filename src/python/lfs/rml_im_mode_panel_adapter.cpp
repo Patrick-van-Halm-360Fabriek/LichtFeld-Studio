@@ -7,6 +7,7 @@
 #include "py_ui.hpp"
 #include "python/gil.hpp"
 #include "python/python_runtime.hpp"
+#include "python_panel_chrome.hpp"
 
 #include <RmlUi/Core/ElementDocument.h>
 #include <cassert>
@@ -57,12 +58,24 @@ namespace lfs::vis::gui {
     }
 
     RmlImModePanelAdapter::~RmlImModePanelAdapter() {
+        const bool has_gil = lfs::python::can_acquire_gil();
+        std::optional<lfs::python::GilAcquire> gil;
+        if (has_gil)
+            gil.emplace();
+
         layout_.release_elements();
         if (host_) {
             const auto& ops = lfs::python::get_rml_panel_host_ops();
             assert(ops.destroy);
             ops.destroy(host_);
+            host_ = nullptr;
         }
+
+        // Panel adapters are released by the graphics-thread cleanup queue.
+        // Drop the Python instance while that thread holds the GIL so its
+        // final decref cannot touch interpreter state without a thread state.
+        if (has_gil)
+            panel_instance_ = nb::object();
     }
 
     void RmlImModePanelAdapter::ensureHost() {
@@ -134,6 +147,48 @@ namespace lfs::vis::gui {
         drawLayout(&ctx);
 
         ops.draw(host_, &ctx);
+    }
+
+    PanelDirectRenderResult RmlImModePanelAdapter::renderDirect(
+        const PanelDirectRenderRequest& request,
+        const PanelDrawContext& ctx) {
+        setPanelSpace(request.space);
+        if (request.mode == PanelDirectRenderMode::Measure)
+            return {.handled = true, .height = getDirectDrawHeight()};
+
+        setInputClipY(request.clip_y_min, request.clip_y_max);
+        setInput(request.input);
+        setForcedHeight(request.forced_height);
+
+        bool handled = true;
+        try {
+            switch (request.mode) {
+            case PanelDirectRenderMode::Measure:
+                break;
+            case PanelDirectRenderMode::Draw:
+                drawDirect(request.x, request.y, request.width, request.height, ctx);
+                break;
+            case PanelDirectRenderMode::Cached:
+                handled = drawDirectCached(request.x, request.y, request.width,
+                                           request.height, ctx);
+                break;
+            case PanelDirectRenderMode::Preload:
+                preloadDirect(request.width, request.height, ctx,
+                              request.clip_y_min, request.clip_y_max, request.input);
+                break;
+            }
+        } catch (...) {
+            setForcedHeight(0.0f);
+            setInput(nullptr);
+            setInputClipY(-1.0f, -1.0f);
+            throw;
+        }
+
+        const float height = getDirectDrawHeight();
+        setForcedHeight(0.0f);
+        setInput(nullptr);
+        setInputClipY(-1.0f, -1.0f);
+        return {.handled = handled, .height = height};
     }
 
     void RmlImModePanelAdapter::preloadDirect(float w, float h, const PanelDrawContext& ctx,
@@ -245,6 +300,18 @@ namespace lfs::vis::gui {
         return ops.needs_animation ? ops.needs_animation(host_) : false;
     }
 
+    std::optional<double> RmlImModePanelAdapter::nextScheduledAnimationDelay() const {
+        if (!host_)
+            return std::nullopt;
+        const auto& ops = lfs::python::get_rml_panel_host_ops();
+        if (!ops.next_scheduled_update_delay)
+            return std::nullopt;
+        double host_delay = 0.0;
+        if (!ops.next_scheduled_update_delay(host_, &host_delay))
+            return std::nullopt;
+        return host_delay;
+    }
+
     void RmlImModePanelAdapter::reloadRmlResources() {
         if (!host_)
             return;
@@ -272,7 +339,20 @@ namespace lfs::vis::gui {
         if (lfs::python::bridge().prepare_ui)
             lfs::python::bridge().prepare_ui();
         const lfs::python::GilAcquire gil;
-        return nb::cast<bool>(panel_instance_.attr("poll")(lfs::python::get_app_context()));
+        try {
+            return nb::cast<bool>(panel_instance_.attr("poll")(lfs::python::get_app_context()));
+        } catch (const std::exception& e) {
+            LOG_ERROR("Panel poll error: {}", e.what());
+            return false;
+        }
+    }
+
+    std::string RmlImModePanelAdapter::captureChromeJson() const {
+        return capture_python_panel_chrome(panel_instance_);
+    }
+
+    void RmlImModePanelAdapter::applyChromeJson(const std::string_view json) {
+        apply_python_panel_chrome(panel_instance_, json);
     }
 
 } // namespace lfs::vis::gui

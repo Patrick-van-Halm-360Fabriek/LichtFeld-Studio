@@ -1,9 +1,12 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/crash_handler.hpp"
 #include "core/cuda_error.hpp"
+#include "core/cuda_safe_format.hpp"
 #include "core/logger.hpp"
 #include "internal/cub_workspace.hpp"
+#include "internal/gpu_config.hpp"
 #include "internal/memory_pool.hpp"
 #include "internal/tensor_dtype_dispatch.hpp"
 #include "internal/tensor_functors.hpp"
@@ -16,9 +19,11 @@
 #include <cmath>
 #include <cub/device/device_reduce.cuh>
 #include <cub/device/device_segmented_reduce.cuh>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <limits>
+#include <stdexcept>
 
 // Thrust headers
 #include <thrust/device_ptr.h>
@@ -40,6 +45,7 @@ namespace lfs::core::tensor_ops {
 
     namespace {
         std::atomic_bool force_cub_workspace_failure{false};
+        std::atomic_bool force_nan_check_host_allocation_failure{false};
 
         struct ieee_round_float_op {
             __host__ __device__ float operator()(const float value) const {
@@ -109,6 +115,10 @@ namespace lfs::core::tensor_ops {
         force_cub_workspace_failure.store(fail, std::memory_order_release);
     }
 
+    void set_nan_check_host_allocation_failure_for_testing(const bool fail) {
+        force_nan_check_host_allocation_failure.store(fail, std::memory_order_release);
+    }
+
     float direct_sum_scalar(const float* data, const size_t n, const cudaStream_t stream) {
         return direct_reduce_scalar(
             data, n, 0.0f, stream, "cub::DeviceReduce::Sum",
@@ -156,29 +166,24 @@ namespace lfs::core::tensor_ops {
         return isnan(value) ? value : fminf(fmaxf(value, min_val), max_val);
     }
 
-    // Vectorized clamp kernel with float4 loads (2-4x faster!)
+    // Vectorized clamp uses an SM-capped grid stride with multiple float4 values
+    // per thread.
     __global__ void clamp_kernel_vectorized(float* __restrict__ data, float min_val, float max_val, size_t n) {
-        const size_t vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
-        const size_t idx = vec_idx * 4;
+        const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+        const size_t n_vec = n / 4;
 
-        // Vectorized path: Load 4 floats in one transaction
-        if (idx + 3 < n) {
+        for (size_t vec_idx = tid; vec_idx < n_vec; vec_idx += stride) {
             float4 vals = reinterpret_cast<float4*>(data)[vec_idx];
-
-            // Clamp all 4 values
             vals.x = clamp_preserving_nan(vals.x, min_val, max_val);
             vals.y = clamp_preserving_nan(vals.y, min_val, max_val);
             vals.z = clamp_preserving_nan(vals.z, min_val, max_val);
             vals.w = clamp_preserving_nan(vals.w, min_val, max_val);
-
-            // Store 4 floats in one transaction
             reinterpret_cast<float4*>(data)[vec_idx] = vals;
         }
-        // Scalar fallback for remainder
-        else if (idx < n) {
-            for (size_t i = idx; i < n; ++i) {
+        if (tid == 0) {
+            for (size_t i = n_vec * 4; i < n; ++i)
                 data[i] = clamp_preserving_nan(data[i], min_val, max_val);
-            }
         }
     }
 
@@ -198,51 +203,50 @@ namespace lfs::core::tensor_ops {
         if (n == 0)
             return;
 
-        // Check alignment for float4 vectorization
-        bool is_aligned = (reinterpret_cast<uintptr_t>(data) % 16) == 0;
-
-        // Optimized launch configuration for maximum occupancy
+        const bool is_aligned = (reinterpret_cast<uintptr_t>(data) % 16) == 0;
         constexpr int BLOCK_SIZE = 256;
 
-        // Use vectorized kernel if aligned and large enough
-        if (is_aligned && n > 1024) {
-            // IMPORTANT: Each thread processes up to 4 elements, but we need enough threads
-            // to cover all elements. Grid size should ensure ALL elements are processed.
-            int num_threads_needed = (n + 3) / 4; // Round up
-            int grid_size = (num_threads_needed + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            // Don't cap grid_size - we need to process ALL elements!
-
+        if (is_aligned && n > kVectorizedMinElems) {
+            const size_t n_vec = n / 4;
+            const size_t work = n_vec > 0 ? n_vec : size_t{1};
+            int grid_size = static_cast<int>((work + BLOCK_SIZE - 1) / BLOCK_SIZE);
+            const int optimal = GPUConfig::get().optimal_grid_size(BLOCK_SIZE);
+            if (grid_size > optimal)
+                grid_size = optimal;
+            if (grid_size < 1)
+                grid_size = 1;
             clamp_kernel_vectorized<<<grid_size, BLOCK_SIZE, 0, stream>>>(data, min_val, max_val, n);
             LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.clamp_vectorized");
         } else {
-            // Fallback to scalar kernel for unaligned data
-            int grid_size = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            // No cap needed - grid-stride loop handles any size
-
+            int grid_size = static_cast<int>((n + BLOCK_SIZE - 1) / BLOCK_SIZE);
+            const int optimal = GPUConfig::get().optimal_grid_size(BLOCK_SIZE);
+            if (grid_size > optimal)
+                grid_size = optimal;
+            if (grid_size < 1)
+                grid_size = 1;
             clamp_kernel_optimized<<<grid_size, BLOCK_SIZE, 0, stream>>>(data, min_val, max_val, n);
             LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.clamp_optimized");
         }
     }
 
-    // Vectorized fused clamp kernel (2-4x faster!)
+    // Vectorized fused clamp: SM-capped grid-stride
     __global__ void clamp_kernel_fused_vectorized(const float* __restrict__ src, float* __restrict__ dst,
                                                   float min_val, float max_val, size_t n) {
-        const size_t vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
-        const size_t idx = vec_idx * 4;
+        const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+        const size_t n_vec = n / 4;
 
-        if (idx + 3 < n) {
+        for (size_t vec_idx = tid; vec_idx < n_vec; vec_idx += stride) {
             float4 vals = reinterpret_cast<const float4*>(src)[vec_idx];
-
             vals.x = clamp_preserving_nan(vals.x, min_val, max_val);
             vals.y = clamp_preserving_nan(vals.y, min_val, max_val);
             vals.z = clamp_preserving_nan(vals.z, min_val, max_val);
             vals.w = clamp_preserving_nan(vals.w, min_val, max_val);
-
             reinterpret_cast<float4*>(dst)[vec_idx] = vals;
-        } else if (idx < n) {
-            for (size_t i = idx; i < n; ++i) {
+        }
+        if (tid == 0) {
+            for (size_t i = n_vec * 4; i < n; ++i)
                 dst[i] = clamp_preserving_nan(src[i], min_val, max_val);
-            }
         }
     }
 
@@ -297,22 +301,28 @@ namespace lfs::core::tensor_ops {
         if (n == 0)
             return;
 
-        bool src_aligned = (reinterpret_cast<uintptr_t>(src) % 16) == 0;
-        bool dst_aligned = (reinterpret_cast<uintptr_t>(dst) % 16) == 0;
-
+        const bool src_aligned = (reinterpret_cast<uintptr_t>(src) % 16) == 0;
+        const bool dst_aligned = (reinterpret_cast<uintptr_t>(dst) % 16) == 0;
         constexpr int BLOCK_SIZE = 256;
 
-        if (src_aligned && dst_aligned && n > 1024) {
-            int num_threads_needed = (n + 3) / 4;
-            int grid_size = (num_threads_needed + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            // Don't cap grid_size!
-
+        if (src_aligned && dst_aligned && n > kVectorizedMinElems) {
+            const size_t n_vec = n / 4;
+            const size_t work = n_vec > 0 ? n_vec : size_t{1};
+            int grid_size = static_cast<int>((work + BLOCK_SIZE - 1) / BLOCK_SIZE);
+            const int optimal = GPUConfig::get().optimal_grid_size(BLOCK_SIZE);
+            if (grid_size > optimal)
+                grid_size = optimal;
+            if (grid_size < 1)
+                grid_size = 1;
             clamp_kernel_fused_vectorized<<<grid_size, BLOCK_SIZE, 0, stream>>>(src, dst, min_val, max_val, n);
             LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.clamp_fused_vectorized");
         } else {
-            int grid_size = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            // No cap needed - grid-stride loop handles any size
-
+            int grid_size = static_cast<int>((n + BLOCK_SIZE - 1) / BLOCK_SIZE);
+            const int optimal = GPUConfig::get().optimal_grid_size(BLOCK_SIZE);
+            if (grid_size > optimal)
+                grid_size = optimal;
+            if (grid_size < 1)
+                grid_size = 1;
             clamp_kernel_fused<<<grid_size, BLOCK_SIZE, 0, stream>>>(src, dst, min_val, max_val, n);
             LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.clamp_fused");
         }
@@ -329,12 +339,68 @@ namespace lfs::core::tensor_ops {
         });
     }
 
+    // Float16 clamp via promote-to-float (preserves NaN semantics of f32 path).
+    __global__ void clamp_half_kernel(const __half* __restrict__ src, __half* __restrict__ dst,
+                                      float min_val, float max_val, size_t n) {
+        const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+        for (size_t i = tid; i < n; i += stride) {
+            const float v = __half2float(src[i]);
+            dst[i] = __float2half(clamp_preserving_nan(v, min_val, max_val));
+        }
+    }
+
+    void launch_clamp_scalar_half(__half* data, float min_val, float max_val, size_t n,
+                                  cudaStream_t stream) {
+        if (n == 0)
+            return;
+        constexpr int BLOCK = 256;
+        int grid = static_cast<int>((n + BLOCK - 1) / BLOCK);
+        const int optimal = GPUConfig::get().optimal_grid_size(BLOCK);
+        if (grid > optimal)
+            grid = optimal;
+        if (grid < 1)
+            grid = 1;
+        clamp_half_kernel<<<grid, BLOCK, 0, stream>>>(data, data, min_val, max_val, n);
+        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.clamp_half");
+    }
+
+    void launch_clamp_fused_half(const __half* src, __half* dst, float min_val, float max_val,
+                                 size_t n, cudaStream_t stream) {
+        if (n == 0)
+            return;
+        constexpr int BLOCK = 256;
+        int grid = static_cast<int>((n + BLOCK - 1) / BLOCK);
+        const int optimal = GPUConfig::get().optimal_grid_size(BLOCK);
+        if (grid > optimal)
+            grid = optimal;
+        if (grid < 1)
+            grid = 1;
+        clamp_half_kernel<<<grid, BLOCK, 0, stream>>>(src, dst, min_val, max_val, n);
+        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.clamp_fused_half");
+    }
+
     // ============= TYPE CONVERSIONS (USING FUNCTORS) =============
 
     template <typename SrcT, typename DstT>
     struct ConvertFunctor {
         __device__ DstT operator()(SrcT x) const {
             return static_cast<DstT>(x);
+        }
+    };
+
+    // cvt.rzi maps NaN to INT64_MIN; tensor casts define NaN as zero.
+    template <>
+    struct ConvertFunctor<float, int64_t> {
+        __device__ int64_t operator()(float x) const {
+            return isnan(x) ? int64_t{0} : static_cast<int64_t>(x);
+        }
+    };
+
+    template <>
+    struct ConvertFunctor<__half, int64_t> {
+        __device__ int64_t operator()(__half x) const {
+            return __hisnan(x) ? int64_t{0} : static_cast<int64_t>(x);
         }
     };
 
@@ -606,11 +672,229 @@ namespace lfs::core::tensor_ops {
         }
     }
 
-    struct DivideByFunctor {
-        float divisor;
-        DivideByFunctor(float d) : divisor(d) {}
-        __device__ float operator()(float x) const { return x / divisor; }
+    // Device-side scale finalize (replaces 1-element / multi-element Thrust
+    // transforms for Mean, and keeps the pipeline fully on-device).
+    __global__ void scale_inplace_kernel(float* __restrict__ data, float scale, size_t n) {
+        const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+        const size_t n_vec = n / 4;
+        for (size_t vec = tid; vec < n_vec; vec += stride) {
+            float4 v = reinterpret_cast<float4*>(data)[vec];
+            v.x *= scale;
+            v.y *= scale;
+            v.z *= scale;
+            v.w *= scale;
+            reinterpret_cast<float4*>(data)[vec] = v;
+        }
+        if (tid == 0) {
+            for (size_t i = n_vec * 4; i < n; ++i)
+                data[i] *= scale;
+        }
+    }
+
+    __global__ void scale_scalar_kernel(float* __restrict__ p, float scale) {
+        if (threadIdx.x == 0 && blockIdx.x == 0)
+            *p *= scale;
+    }
+
+    inline void launch_scale_inplace(float* data, float scale, size_t n, cudaStream_t stream) {
+        if (n == 0)
+            return;
+        if (n == 1) {
+            scale_scalar_kernel<<<1, 1, 0, stream>>>(data, scale);
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.scale_scalar");
+            return;
+        }
+        constexpr int BLOCK = 256;
+        const size_t n_vec = n / 4;
+        const size_t work = n_vec > 0 ? n_vec : n;
+        int grid = static_cast<int>((work + BLOCK - 1) / BLOCK);
+        if (grid < 1)
+            grid = 1;
+        // Cap at SM-saturating size for large n.
+        const int optimal = GPUConfig::get().optimal_grid_size(BLOCK);
+        if (grid > optimal)
+            grid = optimal;
+        scale_inplace_kernel<<<grid, BLOCK, 0, stream>>>(data, scale, n);
+        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.scale_inplace");
+    }
+
+    // Permute a contiguous tensor so kept axes sit at the front and reduced
+    // axes become a contiguous trailing block. Metadata is passed by value
+    // (no per-call device allocations). Used to turn a general multi-axis
+    // reduction into the existing trailing-axis fast path.
+    struct PermuteGeom {
+        size_t in_strides[MAX_TENSOR_RANK];
+        size_t out_strides[MAX_TENSOR_RANK];
+        int perm[MAX_TENSOR_RANK];
+        size_t rank;
     };
+
+    __global__ void permute_copy_kernel(const float* __restrict__ in,
+                                        float* __restrict__ out,
+                                        PermuteGeom geom,
+                                        size_t n) {
+        const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+        for (size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             idx < n; idx += stride) {
+            size_t rem = idx;
+            size_t in_idx = 0;
+            for (size_t oa = 0; oa < geom.rank; ++oa) {
+                const size_t out_stride = geom.out_strides[oa];
+                const size_t coord = (out_stride == 0) ? 0 : rem / out_stride;
+                rem -= coord * out_stride;
+                in_idx += coord * geom.in_strides[geom.perm[oa]];
+            }
+            out[idx] = in[in_idx];
+        }
+    }
+
+    void launch_permute_copy(const float* in, float* out, const PermuteGeom& geom,
+                             size_t n, cudaStream_t stream) {
+        if (n == 0)
+            return;
+        constexpr int BLOCK = 256;
+        int grid = static_cast<int>((n + BLOCK - 1) / BLOCK);
+        const int optimal = GPUConfig::get().optimal_grid_size(BLOCK);
+        if (grid > optimal)
+            grid = optimal;
+        if (grid < 1)
+            grid = 1;
+        permute_copy_kernel<<<grid, BLOCK, 0, stream>>>(in, out, geom, n);
+        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.permute_copy");
+    }
+
+    // Rows of a few elements: one thread per row keeps whole warps busy, where a warp or a CUB block
+    // per row would leave almost all of its lanes idle.
+    constexpr size_t kSmallRowReduce = 16;
+
+    template <typename Op>
+    __global__ void small_row_reduce_kernel(const float* __restrict__ input, float* __restrict__ output,
+                                            const size_t rows, const int width, const float init,
+                                            const float divisor, Op op) {
+        for (size_t row = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; row < rows;
+             row += static_cast<size_t>(gridDim.x) * blockDim.x) {
+            const float* values = input + row * width;
+            float result = init;
+            for (int i = 0; i < width; ++i)
+                result = op(result, values[i]);
+            output[row] = divisor == 1.0f ? result : result / divisor;
+        }
+    }
+
+    bool launch_small_row_reduce(const float* input, float* output, const size_t rows, const size_t width,
+                                 const ReduceOp op, cudaStream_t stream) {
+        if (width == 0 || width > kSmallRowReduce || rows == 0)
+            return false;
+        constexpr int block_size = 256;
+        const auto grid = static_cast<unsigned>(std::min<size_t>((rows + block_size - 1) / block_size, size_t{1} << 20));
+        const int w = static_cast<int>(width);
+        switch (op) {
+        case ReduceOp::Sum:
+            small_row_reduce_kernel<<<grid, block_size, 0, stream>>>(input, output, rows, w, 0.0f, 1.0f, ops::add_op{});
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.small_row_reduce");
+            break;
+        case ReduceOp::Mean:
+            small_row_reduce_kernel<<<grid, block_size, 0, stream>>>(input, output, rows, w, 0.0f,
+                                                                     static_cast<float>(width), ops::add_op{});
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.small_row_reduce");
+            break;
+        case ReduceOp::Max:
+            small_row_reduce_kernel<<<grid, block_size, 0, stream>>>(
+                input, output, rows, w, -std::numeric_limits<float>::infinity(), 1.0f, ops::maximum_op{});
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.small_row_reduce");
+            break;
+        case ReduceOp::Min:
+            small_row_reduce_kernel<<<grid, block_size, 0, stream>>>(
+                input, output, rows, w, std::numeric_limits<float>::infinity(), 1.0f, ops::minimum_op{});
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.small_row_reduce");
+            break;
+        case ReduceOp::Prod:
+            small_row_reduce_kernel<<<grid, block_size, 0, stream>>>(input, output, rows, w, 1.0f, 1.0f, ops::mul_op{});
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.small_row_reduce");
+            break;
+        default:
+            return false;
+        }
+        return true;
+    }
+
+    // Trailing-axis (inner_size == 1) multi-axis reduce after the permute.
+    void launch_trailing_multi_axis_reduce(const float* input, float* output,
+                                           size_t outer_size, size_t reduce_count,
+                                           size_t n, ReduceOp op, cudaStream_t stream) {
+        if (outer_size > 1 && launch_small_row_reduce(input, output, outer_size, reduce_count, op, stream))
+            return;
+        if (outer_size == 1 && should_use_warp_reduce(n, 1)) {
+            float init_val = 0.0f;
+            switch (op) {
+            case ReduceOp::Sum:
+            case ReduceOp::Mean:
+                init_val = 0.0f;
+                break;
+            case ReduceOp::Max:
+                init_val = -std::numeric_limits<float>::infinity();
+                break;
+            case ReduceOp::Min:
+                init_val = std::numeric_limits<float>::infinity();
+                break;
+            case ReduceOp::Prod:
+                init_val = 1.0f;
+                break;
+            default:
+                LFS_ASSERT_MSG(false,
+                               "trailing multi-axis Float32 reduction encountered an unsupported operation");
+            }
+            init_scalar_gpu(output, init_val, stream);
+            launch_warp_reduce_full(input, output, n, op, stream);
+            if (op == ReduceOp::Mean) {
+                launch_scale_inplace(output, 1.0f / static_cast<float>(reduce_count), 1, stream);
+            }
+            return;
+        }
+        if (should_use_warp_reduce(n, outer_size)) {
+            launch_warp_segmented_reduce(input, output, outer_size, reduce_count, op, stream);
+            return;
+        }
+        const bool use_warp_multi_axis = outer_size < 100000 &&
+                                         reduce_count < 10000000 &&
+                                         n < 100000000;
+        if (use_warp_multi_axis) {
+            launch_warp_multi_axis_reduce(input, output, outer_size, reduce_count, 1, op, stream);
+            return;
+        }
+        float init_val = 0.0f;
+        switch (op) {
+        case ReduceOp::Sum:
+        case ReduceOp::Mean:
+            init_val = 0.0f;
+            launch_segmented_reduce(input, output, outer_size, reduce_count, 1,
+                                    init_val, ops::add_op{}, stream);
+            if (op == ReduceOp::Mean) {
+                launch_scale_inplace(output, 1.0f / static_cast<float>(reduce_count),
+                                     outer_size, stream);
+            }
+            break;
+        case ReduceOp::Max:
+            init_val = -std::numeric_limits<float>::infinity();
+            launch_segmented_reduce(input, output, outer_size, reduce_count, 1,
+                                    init_val, ops::maximum_op{}, stream);
+            break;
+        case ReduceOp::Min:
+            init_val = std::numeric_limits<float>::infinity();
+            launch_segmented_reduce(input, output, outer_size, reduce_count, 1,
+                                    init_val, ops::minimum_op{}, stream);
+            break;
+        case ReduceOp::Prod:
+            init_val = 1.0f;
+            launch_segmented_reduce(input, output, outer_size, reduce_count, 1,
+                                    init_val, ops::mul_op{}, stream);
+            break;
+        default:
+            LFS_ASSERT_MSG(false,
+                           "trailing multi-axis Float32 reduction encountered an unsupported operation");
+        }
+    }
 
     // ============= MAIN REDUCE OPERATION DISPATCH =============
 
@@ -660,13 +944,9 @@ namespace lfs::core::tensor_ops {
                 // Launch warp-level reduction (5-10x faster!)
                 launch_warp_reduce_full(d_in, d_out, n, op, stream);
 
-                // Handle mean: divide by count
+                // Handle mean: device-side scale (no 1-element Thrust launch)
                 if (op == ReduceOp::Mean) {
-                    auto out_ptr = thrust::device_pointer_cast(d_out);
-                    run_with_thrust_policy(stream, [&](auto policy) {
-                        thrust::transform(policy, out_ptr, out_ptr + 1, out_ptr,
-                                          DivideByFunctor(static_cast<float>(n)));
-                    });
+                    launch_scale_inplace(d_out, 1.0f / static_cast<float>(n), 1, stream);
                 }
                 return;
             }
@@ -687,12 +967,8 @@ namespace lfs::core::tensor_ops {
                         return cub::DeviceReduce::Sum(
                             workspace, workspace_bytes, d_in, d_out, n, stream);
                     });
-                // Divide by n using a simple kernel (faster than Thrust for single value)
-                auto out_ptr = thrust::device_pointer_cast(d_out);
-                run_with_thrust_policy(stream, [&](auto policy) {
-                    thrust::transform(policy, out_ptr, out_ptr + 1, out_ptr,
-                                      DivideByFunctor(static_cast<float>(n)));
-                });
+                // Device-side 1-element scale (no Thrust transform)
+                launch_scale_inplace(d_out, 1.0f / static_cast<float>(n), 1, stream);
                 break;
             }
             case ReduceOp::Max:
@@ -715,14 +991,16 @@ namespace lfs::core::tensor_ops {
                             std::numeric_limits<float>::infinity(), stream);
                     });
                 break;
-            case ReduceOp::Prod: {
-                float result = 0.0f;
-                run_with_thrust_policy(stream, [&](auto policy) {
-                    result = thrust::reduce(policy, input_ptr, input_ptr + n, 1.0f, ops::mul_op{});
-                });
-                init_scalar_gpu(static_cast<float*>(output), result, stream);
+            case ReduceOp::Prod:
+                // Fully device-side product via CUB (no host round-trip)
+                run_cub_operation(
+                    "cub::DeviceReduce::Reduce(prod)", stream,
+                    [&](void* workspace, size_t& workspace_bytes) {
+                        return cub::DeviceReduce::Reduce(
+                            workspace, workspace_bytes, d_in, d_out, n,
+                            ops::mul_op{}, 1.0f, stream);
+                    });
                 break;
-            }
             default:
                 LFS_ASSERT_MSG(false,
                                "full Float32 reduction encountered an unsupported operation");
@@ -748,6 +1026,8 @@ namespace lfs::core::tensor_ops {
             size_t output_size = outer_size * inner_size;
 
             if (inner_size == 1) {
+                if (outer_size > 1 && launch_small_row_reduce(input_f, output_f, outer_size, reduce_size, op, stream))
+                    return;
                 // Contiguous segments - use vectorized warp reduction
                 if (should_use_warp_reduce(n, outer_size)) {
                     LOG_DEBUG("[REDUCE] Using warp segmented reduce: outer={} reduce={} inner=1", outer_size, reduce_size);
@@ -793,14 +1073,8 @@ namespace lfs::core::tensor_ops {
                 init_val = 0.0f;
                 launch_segmented_reduce(input_f, output_f, outer_size, reduce_size, inner_size,
                                         init_val, ops::add_op{}, stream);
-                {
-                    auto out_ptr = thrust::device_pointer_cast(output_f);
-                    size_t output_size = outer_size * inner_size;
-                    run_with_thrust_policy(stream, [&](auto policy) {
-                        thrust::transform(policy, out_ptr, out_ptr + output_size, out_ptr,
-                                          DivideByFunctor(static_cast<float>(reduce_size)));
-                    });
-                }
+                launch_scale_inplace(output_f, 1.0f / static_cast<float>(reduce_size),
+                                     outer_size * inner_size, stream);
                 break;
             case ReduceOp::Max:
                 init_val = -std::numeric_limits<float>::infinity();
@@ -903,11 +1177,8 @@ namespace lfs::core::tensor_ops {
                         launch_warp_reduce_full(input_f, output_f, n, op, stream);
 
                         if (op == ReduceOp::Mean) {
-                            auto out_ptr = thrust::device_pointer_cast(output_f);
-                            run_with_thrust_policy(stream, [&](auto policy) {
-                                thrust::transform(policy, out_ptr, out_ptr + 1, out_ptr,
-                                                  DivideByFunctor(static_cast<float>(reduce_count)));
-                            });
+                            launch_scale_inplace(output_f, 1.0f / static_cast<float>(reduce_count),
+                                                 1, stream);
                         }
                         return;
                     }
@@ -944,20 +1215,92 @@ namespace lfs::core::tensor_ops {
             }
         }
 
-        // SLOW PATH: Generic multi-axis reduction
-        thrust::device_vector<bool> d_is_reduced(rank, false);
+        // General multi-axis case: permute kept axes to the front (a contiguous
+        // bandwidth-bound copy) then take the trailing-axis fast path above.
+        // Dense contiguous tensors of rank <= MAX_TENSOR_RANK can always be
+        // expressed this way. The generic one-thread-per-output kernel remains
+        // only as a fallback if rank exceeds MAX_TENSOR_RANK (Tensor forbids that)
+        // or the permute workspace cannot be allocated.
+        if (rank > 0 && rank <= MAX_TENSOR_RANK && num_axes > 0 && num_axes < rank) {
+            bool reduced[MAX_TENSOR_RANK] = {};
+            bool axes_valid = true;
+            for (size_t i = 0; i < num_axes; ++i) {
+                const int axis = axes[i];
+                if (axis < 0 || axis >= static_cast<int>(rank) || reduced[axis]) {
+                    axes_valid = false;
+                    break;
+                }
+                reduced[axis] = true;
+            }
+            if (axes_valid) {
+                PermuteGeom geom{};
+                geom.rank = rank;
+                size_t perm_shape[MAX_TENSOR_RANK];
+                size_t n_kept = 0;
+                for (size_t i = 0; i < rank; ++i) {
+                    if (!reduced[i]) {
+                        geom.perm[n_kept] = static_cast<int>(i);
+                        perm_shape[n_kept] = shape[i];
+                        ++n_kept;
+                    }
+                }
+                size_t n_red = 0;
+                size_t reduce_count = 1;
+                for (size_t i = 0; i < rank; ++i) {
+                    if (reduced[i]) {
+                        geom.perm[n_kept + n_red] = static_cast<int>(i);
+                        perm_shape[n_kept + n_red] = shape[i];
+                        reduce_count *= shape[i];
+                        ++n_red;
+                    }
+                }
+
+                geom.in_strides[rank - 1] = 1;
+                for (int i = static_cast<int>(rank) - 2; i >= 0; --i) {
+                    geom.in_strides[i] = geom.in_strides[i + 1] * shape[i + 1];
+                }
+                geom.out_strides[rank - 1] = 1;
+                for (int i = static_cast<int>(rank) - 2; i >= 0; --i) {
+                    geom.out_strides[i] = geom.out_strides[i + 1] * perm_shape[i + 1];
+                }
+
+                size_t outer_size = 1;
+                for (size_t i = 0; i < n_kept; ++i) {
+                    outer_size *= perm_shape[i];
+                }
+
+                ScopedDeviceBuffer permuted(n * sizeof(float), stream, "tensor.reduce.permute");
+                launch_permute_copy(input_f, permuted.as<float>(), geom, n, stream);
+                launch_trailing_multi_axis_reduce(
+                    permuted.as<float>(), output_f, outer_size, reduce_count, n, op, stream);
+                return;
+            }
+        }
+
+        // Fallback: generic multi-axis kernel. Unreachable for dense contiguous
+        // Float32 tensors (rank is capped at MAX_TENSOR_RANK). Kept so a future
+        // non-dense or out-of-rank path has a correct-if-slow implementation.
+        // Host metadata is copied by value into the kernel; no thrust allocations.
+        bool is_reduced_host[MAX_TENSOR_RANK] = {};
         for (size_t i = 0; i < num_axes; ++i) {
-            d_is_reduced[axes[i]] = true;
+            if (axes[i] >= 0 && axes[i] < static_cast<int>(rank)) {
+                is_reduced_host[axes[i]] = true;
+            }
         }
 
         size_t output_elements = 1;
         for (size_t i = 0; i < rank; ++i) {
-            if (!d_is_reduced[i] || keepdim) {
-                output_elements *= (d_is_reduced[i] ? 1 : shape[i]);
+            if (!is_reduced_host[i] || keepdim) {
+                output_elements *= (is_reduced_host[i] ? 1 : shape[i]);
             }
         }
 
-        thrust::device_vector<size_t> d_input_shape(shape, shape + rank);
+        ScopedDeviceBuffer d_is_reduced(rank * sizeof(bool), stream, "tensor.reduce.is_reduced");
+        ScopedDeviceBuffer d_input_shape(rank * sizeof(size_t), stream, "tensor.reduce.input_shape");
+        LFS_CUDA_CHECK(cudaMemcpyAsync(d_is_reduced.as<bool>(), is_reduced_host,
+                                       rank * sizeof(bool), cudaMemcpyHostToDevice, stream));
+        LFS_CUDA_CHECK(cudaMemcpyAsync(d_input_shape.as<size_t>(), shape,
+                                       rank * sizeof(size_t), cudaMemcpyHostToDevice, stream));
 
         float init_val = 0.0f;
         switch (op) {
@@ -982,8 +1325,8 @@ namespace lfs::core::tensor_ops {
         launch_multi_axis_reduce(
             input_f,
             output_f,
-            thrust::raw_pointer_cast(d_input_shape.data()),
-            thrust::raw_pointer_cast(d_is_reduced.data()),
+            d_input_shape.as<size_t>(),
+            d_is_reduced.as<bool>(),
             rank, output_elements, init_val, op, stream);
 
         if (op == ReduceOp::Mean) {
@@ -991,12 +1334,8 @@ namespace lfs::core::tensor_ops {
             for (size_t i = 0; i < num_axes; ++i) {
                 reduce_count *= shape[axes[i]];
             }
-            float scale = 1.0f / reduce_count;
-            run_with_thrust_policy(stream, [&](auto policy) {
-                thrust::transform(policy, output_ptr, output_ptr + output_elements,
-                                  thrust::make_constant_iterator(scale), output_ptr,
-                                  ops::mul_op{});
-            });
+            launch_scale_inplace(output_f, 1.0f / static_cast<float>(reduce_count),
+                                 output_elements, stream);
         }
     }
 
@@ -1074,12 +1413,9 @@ namespace lfs::core::tensor_ops {
                 LFS_ASSERT_MSG(output_dtype == DataType::Int64,
                                "Int32 product requires Int64 output");
                 auto in_ptr = thrust::device_pointer_cast(d_in);
-                int64_t result = 1;
-                run_with_thrust_policy(stream, [&](auto policy) {
-                    result = thrust::transform_reduce(
-                        policy, in_ptr, in_ptr + n, Int32ToInt64Op{}, int64_t{1},
-                        thrust::multiplies<int64_t>{});
-                });
+                int64_t result = thrust::transform_reduce(
+                    thrust::cuda::par.on(stream), in_ptr, in_ptr + n,
+                    Int32ToInt64Op{}, int64_t{1}, thrust::multiplies<int64_t>{});
                 init_scalar_gpu(static_cast<int64_t*>(output), result, stream);
             } break;
             default:
@@ -1362,6 +1698,86 @@ namespace lfs::core::tensor_ops {
         }
     }
 
+    // Float16 full reduction promotes to float through CUB. Partial-axis
+    // Float16 reductions remain rejected until host dispatch is wired.
+    __global__ void half_to_float_scalar_kernel(const float* __restrict__ src,
+                                                __half* __restrict__ dst) {
+        if (threadIdx.x == 0 && blockIdx.x == 0)
+            *dst = __float2half(*src);
+    }
+
+    // Named functor (nvcc rejects device lambdas nested inside generic lambdas).
+    struct half_to_float_op {
+        __device__ float operator()(const __half& h) const { return __half2float(h); }
+    };
+
+    __global__ void half_to_float_kernel(const __half* __restrict__ src,
+                                         float* __restrict__ dst, size_t n) {
+        const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+        for (size_t i = tid; i < n; i += stride)
+            dst[i] = __half2float(src[i]);
+    }
+
+    void launch_reduce_op_float16(const void* input, void* output, const size_t* shape,
+                                  size_t rank, const int* axes, size_t num_axes,
+                                  bool /*keepdim*/, ReduceOp op, DataType output_dtype,
+                                  cudaStream_t stream) {
+        size_t n = 1;
+        for (size_t i = 0; i < rank; ++i)
+            n *= shape[i];
+        if (n == 0)
+            return;
+
+        const bool full_reduce = (num_axes == 0 || num_axes == rank);
+        LFS_ASSERT_MSG(full_reduce,
+                       "Float16 partial-axis reductions are not yet implemented "
+                       "(only full reduce to scalar is supported; use .to(Float32) "
+                       "for segmented Float16 reduce)");
+        LFS_ASSERT_MSG(output_dtype == DataType::Float16 || output_dtype == DataType::Float32,
+                       "Float16 reduction requires Float16 or Float32 output");
+        LFS_ASSERT_MSG(op == ReduceOp::Sum || op == ReduceOp::Mean || op == ReduceOp::Max ||
+                           op == ReduceOp::Min || op == ReduceOp::Prod,
+                       "Float16 reduction supports only sum/mean/max/min/prod");
+
+        const __half* d_in = static_cast<const __half*>(input);
+
+        // Promote to float temp, reduce with existing float path, convert result.
+        float* d_f32 = nullptr;
+        LFS_CUDA_CHECK(cudaMallocAsync(&d_f32, n * sizeof(float), stream));
+        {
+            constexpr int BLOCK = 256;
+            int grid = static_cast<int>((n + BLOCK - 1) / BLOCK);
+            const int optimal = GPUConfig::get().optimal_grid_size(BLOCK);
+            if (grid > optimal)
+                grid = optimal;
+            if (grid < 1)
+                grid = 1;
+            half_to_float_kernel<<<grid, BLOCK, 0, stream>>>(d_in, d_f32, n);
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.half_to_float");
+        }
+
+        float* d_out_f32 = nullptr;
+        const bool need_tmp_out = (output_dtype == DataType::Float16);
+        if (need_tmp_out) {
+            LFS_CUDA_CHECK(cudaMallocAsync(&d_out_f32, sizeof(float), stream));
+        } else {
+            d_out_f32 = static_cast<float*>(output);
+        }
+
+        size_t full_shape[1] = {n};
+        // Empty axes → full reduce in float32 path
+        launch_reduce_op_float32(d_f32, d_out_f32, full_shape, 1, nullptr, 0, false, op, stream);
+
+        if (need_tmp_out) {
+            half_to_float_scalar_kernel<<<1, 1, 0, stream>>>(
+                d_out_f32, static_cast<__half*>(output));
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.half_reduce_store");
+            LFS_CUDA_CHECK(cudaFreeAsync(d_out_f32, stream));
+        }
+        LFS_CUDA_CHECK(cudaFreeAsync(d_f32, stream));
+    }
+
     // Public dispatcher function
     void launch_reduce_op(const void* input, void* output, const size_t* shape, size_t rank,
                           const int* axes, size_t num_axes, bool keepdim, ReduceOp op,
@@ -1372,6 +1788,10 @@ namespace lfs::core::tensor_ops {
                                "Float32 reduction requires Float32 output");
                 launch_reduce_op_float32(
                     input, output, shape, rank, axes, num_axes, keepdim, op, stream);
+            } else if constexpr (std::is_same_v<T, __half>) {
+                launch_reduce_op_float16(
+                    input, output, shape, rank, axes, num_axes, keepdim, op,
+                    output_dtype, stream);
             } else if constexpr (std::is_same_v<T, int32_t>) {
                 launch_reduce_op_int32(
                     input, output, shape, rank, axes, num_axes, keepdim, op,
@@ -1382,7 +1802,9 @@ namespace lfs::core::tensor_ops {
                     output_dtype, stream);
             } else {
                 LFS_ASSERT_MSG(false,
-                               "reduction encountered an unsupported input dtype");
+                               std::string("reduction unsupported for input dtype ") +
+                                   dtype_name(input_dtype) +
+                                   " (supported: Float32, Float16 full-reduce, Int32, Bool)");
             }
         });
     }
@@ -1933,32 +2355,72 @@ namespace lfs::core::tensor_ops {
         }
     }
 
-    // DEPRECATED: Old scalar kernel (kept for compatibility)
     template <typename T>
-    __global__ void cat_last_dim_kernel(
-        T* output,
-        const T** input_ptrs,
-        const size_t* input_sizes,
-        size_t num_tensors,
-        size_t num_rows,
-        size_t row_size) {
-        size_t row = blockIdx.x * blockDim.x + threadIdx.x;
-        if (row >= num_rows)
+    void launch_cat_last_dim_typed(void* output, const std::vector<Tensor>& tensors, size_t num_rows, size_t row_size,
+                                   cudaStream_t stream) {
+        const size_t num_tensors = tensors.size();
+        const T** d_input_ptrs = static_cast<const T**>(
+            CudaMemoryPool::instance().allocate(num_tensors * sizeof(T*), stream));
+        size_t* d_input_sizes = static_cast<size_t*>(
+            CudaMemoryPool::instance().allocate(num_tensors * sizeof(size_t), stream));
+
+        if (!d_input_ptrs || !d_input_sizes) {
+            LOG_ERROR("Failed to allocate cat metadata from memory pool");
+            if (d_input_ptrs)
+                CudaMemoryPool::instance().deallocate(const_cast<T**>(d_input_ptrs), stream);
+            if (d_input_sizes)
+                CudaMemoryPool::instance().deallocate(d_input_sizes, stream);
             return;
-
-        size_t result_offset = 0;
-        for (size_t t = 0; t < num_tensors; ++t) {
-            size_t tensor_dim_size = input_sizes[t];
-
-            const T* src = input_ptrs[t] + row * tensor_dim_size;
-            T* dst = output + row * row_size + result_offset;
-
-            for (size_t i = 0; i < tensor_dim_size; ++i) {
-                dst[i] = src[i];
-            }
-
-            result_offset += tensor_dim_size;
         }
+
+        // Copy metadata to device
+        std::vector<const T*> h_input_ptrs(num_tensors);
+        std::vector<size_t> h_input_sizes(num_tensors);
+
+        for (size_t i = 0; i < num_tensors; ++i) {
+            h_input_ptrs[i] = static_cast<const T*>(tensors[i].data_ptr());
+            h_input_sizes[i] = tensors[i].shape()[tensors[i].shape().rank() - 1];
+        }
+
+        LFS_CUDA_CHECK_MSG(
+            cudaMemcpyAsync(const_cast<T**>(d_input_ptrs), h_input_ptrs.data(),
+                            num_tensors * sizeof(T*), cudaMemcpyHostToDevice, stream),
+            "cat metadata pointer copy (tensor_count={})", num_tensors);
+        LFS_CUDA_CHECK_MSG(
+            cudaMemcpyAsync(d_input_sizes, h_input_sizes.data(),
+                            num_tensors * sizeof(size_t), cudaMemcpyHostToDevice, stream),
+            "cat metadata size copy (tensor_count={})", num_tensors);
+
+        int block_size = 256;
+        size_t num_blocks = (num_rows + block_size - 1) / block_size;
+        const size_t max_blocks_x = 65535; // Safe limit for all CUDA devices
+
+        // Use 2D grid for large arrays to avoid exceeding grid dimension limits
+        if (num_blocks <= max_blocks_x) {
+            cat_last_dim_kernel_vectorized<<<num_blocks, block_size, 0, stream>>>(
+                static_cast<T*>(output),
+                d_input_ptrs,
+                d_input_sizes,
+                num_tensors,
+                num_rows,
+                row_size);
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.cat_last_dim");
+        } else {
+            dim3 grid(std::min(num_blocks, max_blocks_x),
+                      (num_blocks + max_blocks_x - 1) / max_blocks_x);
+            cat_last_dim_kernel_vectorized<<<grid, block_size, 0, stream>>>(
+                static_cast<T*>(output),
+                d_input_ptrs,
+                d_input_sizes,
+                num_tensors,
+                num_rows,
+                row_size);
+            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.cat_last_dim");
+        }
+
+        // Return metadata arrays to memory pool (instant, cached for reuse)
+        CudaMemoryPool::instance().deallocate(const_cast<T**>(d_input_ptrs), stream);
+        CudaMemoryPool::instance().deallocate(d_input_sizes, stream);
     }
 
     void launch_cat_last_dim(
@@ -1994,70 +2456,15 @@ namespace lfs::core::tensor_ops {
             return;
         }
 
-        // GENERIC PATH: Use memory pool for metadata (NO thrust::device_vector!)
-        // Allocate from memory pool (fast, cached, no synchronization)
-        const float** d_input_ptrs = static_cast<const float**>(
-            CudaMemoryPool::instance().allocate(num_tensors * sizeof(float*), stream));
-        size_t* d_input_sizes = static_cast<size_t*>(
-            CudaMemoryPool::instance().allocate(num_tensors * sizeof(size_t), stream));
-
-        if (!d_input_ptrs || !d_input_sizes) {
-            LOG_ERROR("Failed to allocate cat metadata from memory pool");
-            if (d_input_ptrs)
-                CudaMemoryPool::instance().deallocate(const_cast<float**>(d_input_ptrs), stream);
-            if (d_input_sizes)
-                CudaMemoryPool::instance().deallocate(d_input_sizes, stream);
-            return;
+        switch (element_size) {
+        case 1: launch_cat_last_dim_typed<uint8_t>(output, tensors, num_rows, row_size, stream); break;
+        case 2: launch_cat_last_dim_typed<uint16_t>(output, tensors, num_rows, row_size, stream); break;
+        case 4: launch_cat_last_dim_typed<float>(output, tensors, num_rows, row_size, stream); break;
+        case 8: launch_cat_last_dim_typed<uint64_t>(output, tensors, num_rows, row_size, stream); break;
+        default:
+            throw std::invalid_argument(
+                detail::format_cuda_safe("cat: unsupported element size {}", element_size));
         }
-
-        // Copy metadata to device
-        std::vector<const float*> h_input_ptrs(num_tensors);
-        std::vector<size_t> h_input_sizes(num_tensors);
-
-        for (size_t i = 0; i < num_tensors; ++i) {
-            h_input_ptrs[i] = static_cast<const float*>(tensors[i].data_ptr());
-            h_input_sizes[i] = tensors[i].shape()[tensors[i].shape().rank() - 1];
-        }
-
-        LFS_CUDA_CHECK_MSG(
-            cudaMemcpyAsync(const_cast<float**>(d_input_ptrs), h_input_ptrs.data(),
-                            num_tensors * sizeof(float*), cudaMemcpyHostToDevice, stream),
-            "cat metadata pointer copy (tensor_count={})", num_tensors);
-        LFS_CUDA_CHECK_MSG(
-            cudaMemcpyAsync(d_input_sizes, h_input_sizes.data(),
-                            num_tensors * sizeof(size_t), cudaMemcpyHostToDevice, stream),
-            "cat metadata size copy (tensor_count={})", num_tensors);
-
-        int block_size = 256;
-        size_t num_blocks = (num_rows + block_size - 1) / block_size;
-        const size_t max_blocks_x = 65535; // Safe limit for all CUDA devices
-
-        // Use 2D grid for large arrays to avoid exceeding grid dimension limits
-        if (num_blocks <= max_blocks_x) {
-            cat_last_dim_kernel_vectorized<<<num_blocks, block_size, 0, stream>>>(
-                static_cast<float*>(output),
-                d_input_ptrs,
-                d_input_sizes,
-                num_tensors,
-                num_rows,
-                row_size);
-            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.cat_last_dim");
-        } else {
-            dim3 grid(std::min(num_blocks, max_blocks_x),
-                      (num_blocks + max_blocks_x - 1) / max_blocks_x);
-            cat_last_dim_kernel_vectorized<<<grid, block_size, 0, stream>>>(
-                static_cast<float*>(output),
-                d_input_ptrs,
-                d_input_sizes,
-                num_tensors,
-                num_rows,
-                row_size);
-            LFS_CUDA_LAUNCH_CHECK(stream, "tensor.ops.cat_last_dim");
-        }
-
-        // Return metadata arrays to memory pool (instant, cached for reuse)
-        CudaMemoryPool::instance().deallocate(const_cast<float**>(d_input_ptrs), stream);
-        CudaMemoryPool::instance().deallocate(d_input_sizes, stream);
     }
 
     template <typename T>
@@ -2095,16 +2502,9 @@ namespace lfs::core::tensor_ops {
         }
     }
 
-    void launch_cat_middle_dim(
-        void* output,
-        const std::vector<Tensor>& tensors,
-        size_t outer_size,
-        size_t inner_size,
-        int resolved_dim,
-        size_t element_size,
-        cudaStream_t stream) {
-        for (const auto& tensor : tensors)
-            pin_operands({&tensor});
+    template <typename T>
+    void launch_cat_middle_dim_typed(void* output, const std::vector<Tensor>& tensors, size_t outer_size,
+                                     size_t inner_size, int resolved_dim, cudaStream_t stream) {
         size_t num_tensors = tensors.size();
         size_t total_dim_size = 0;
         for (const auto& t : tensors) {
@@ -2113,33 +2513,32 @@ namespace lfs::core::tensor_ops {
 
         size_t total_elements = outer_size * total_dim_size * inner_size;
 
-        // OPTIMIZED: Use memory pool instead of thrust::device_vector
-        const float** d_input_ptrs = static_cast<const float**>(
-            CudaMemoryPool::instance().allocate(num_tensors * sizeof(float*), stream));
+        const T** d_input_ptrs = static_cast<const T**>(
+            CudaMemoryPool::instance().allocate(num_tensors * sizeof(T*), stream));
         size_t* d_input_sizes = static_cast<size_t*>(
             CudaMemoryPool::instance().allocate(num_tensors * sizeof(size_t), stream));
 
         if (!d_input_ptrs || !d_input_sizes) {
             LOG_ERROR("Failed to allocate cat_middle_dim metadata from memory pool");
             if (d_input_ptrs)
-                CudaMemoryPool::instance().deallocate(const_cast<float**>(d_input_ptrs), stream);
+                CudaMemoryPool::instance().deallocate(const_cast<T**>(d_input_ptrs), stream);
             if (d_input_sizes)
                 CudaMemoryPool::instance().deallocate(d_input_sizes, stream);
             return;
         }
 
         // Copy metadata to device
-        std::vector<const float*> h_input_ptrs(num_tensors);
+        std::vector<const T*> h_input_ptrs(num_tensors);
         std::vector<size_t> h_input_sizes(num_tensors);
 
         for (size_t i = 0; i < num_tensors; ++i) {
-            h_input_ptrs[i] = static_cast<const float*>(tensors[i].data_ptr());
+            h_input_ptrs[i] = static_cast<const T*>(tensors[i].data_ptr());
             h_input_sizes[i] = tensors[i].shape()[resolved_dim];
         }
 
         LFS_CUDA_CHECK_MSG(
-            cudaMemcpyAsync(const_cast<float**>(d_input_ptrs), h_input_ptrs.data(),
-                            num_tensors * sizeof(float*), cudaMemcpyHostToDevice, stream),
+            cudaMemcpyAsync(const_cast<T**>(d_input_ptrs), h_input_ptrs.data(),
+                            num_tensors * sizeof(T*), cudaMemcpyHostToDevice, stream),
             "cat-middle metadata pointer copy (tensor_count={})", num_tensors);
         LFS_CUDA_CHECK_MSG(
             cudaMemcpyAsync(d_input_sizes, h_input_sizes.data(),
@@ -2153,7 +2552,7 @@ namespace lfs::core::tensor_ops {
         // Use 2D grid for large arrays to avoid exceeding grid dimension limits
         if (num_blocks <= max_blocks_x) {
             cat_middle_dim_kernel<<<num_blocks, block_size, 0, stream>>>(
-                static_cast<float*>(output),
+                static_cast<T*>(output),
                 d_input_ptrs,
                 d_input_sizes,
                 num_tensors,
@@ -2165,7 +2564,7 @@ namespace lfs::core::tensor_ops {
             dim3 grid(std::min(num_blocks, max_blocks_x),
                       (num_blocks + max_blocks_x - 1) / max_blocks_x);
             cat_middle_dim_kernel<<<grid, block_size, 0, stream>>>(
-                static_cast<float*>(output),
+                static_cast<T*>(output),
                 d_input_ptrs,
                 d_input_sizes,
                 num_tensors,
@@ -2176,14 +2575,38 @@ namespace lfs::core::tensor_ops {
         }
 
         // Return metadata arrays to memory pool
-        CudaMemoryPool::instance().deallocate(const_cast<float**>(d_input_ptrs), stream);
+        CudaMemoryPool::instance().deallocate(const_cast<T**>(d_input_ptrs), stream);
         CudaMemoryPool::instance().deallocate(d_input_sizes, stream);
+    }
+
+    void launch_cat_middle_dim(
+        void* output,
+        const std::vector<Tensor>& tensors,
+        size_t outer_size,
+        size_t inner_size,
+        int resolved_dim,
+        size_t element_size,
+        cudaStream_t stream) {
+        for (const auto& tensor : tensors)
+            pin_operands({&tensor});
+        switch (element_size) {
+        case 1: launch_cat_middle_dim_typed<uint8_t>(output, tensors, outer_size, inner_size, resolved_dim, stream); break;
+        case 2: launch_cat_middle_dim_typed<uint16_t>(output, tensors, outer_size, inner_size, resolved_dim, stream); break;
+        case 4: launch_cat_middle_dim_typed<float>(output, tensors, outer_size, inner_size, resolved_dim, stream); break;
+        case 8: launch_cat_middle_dim_typed<uint64_t>(output, tensors, outer_size, inner_size, resolved_dim, stream); break;
+        default:
+            throw std::invalid_argument(
+                detail::format_cuda_safe("cat: unsupported element size {}", element_size));
+        }
     }
 
     // ============= EXPLICIT TEMPLATE INSTANTIATIONS =============
 
     // Type conversions
     template void launch_convert_type<float, uint8_t>(const float*, uint8_t*, size_t, cudaStream_t);
+    template void launch_convert_type<float, uint32_t>(const float*, uint32_t*, size_t, cudaStream_t);
+    template void launch_convert_type<uint32_t, float>(const uint32_t*, float*, size_t, cudaStream_t);
+    template void launch_convert_type<uint32_t, int64_t>(const uint32_t*, int64_t*, size_t, cudaStream_t);
     template void launch_convert_type<uint8_t, float>(const uint8_t*, float*, size_t, cudaStream_t);
     template void launch_convert_type<int, uint8_t>(const int*, uint8_t*, size_t, cudaStream_t);
     template void launch_convert_type<uint8_t, int>(const uint8_t*, int*, size_t, cudaStream_t);
@@ -2245,6 +2668,56 @@ namespace lfs::core::tensor_ops {
         const float*, float*, size_t, ops::neg_op, cudaStream_t);
     template LFS_CORE_API void launch_unary_op_generic<int, int, ops::neg_op>(
         const int*, int*, size_t, ops::neg_op, cudaStream_t);
+
+    // Float16 unary (Packed128 fast path + API hole fill).
+    // Generic functors are float-oriented and become ambiguous on __half
+    // (ternary / mixed float-half arithmetic). Wrap: promote → float op → half.
+    template <typename FloatOp>
+    struct half_unary_via_float {
+        FloatOp op;
+        __device__ __half operator()(const __half& h) const {
+            return __float2half(op(__half2float(h)));
+        }
+    };
+
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::log_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::log_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::exp_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::exp_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::abs_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::abs_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::sqrt_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::sqrt_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::square_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::square_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::relu_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::relu_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::sigmoid_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::sigmoid_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::neg_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::neg_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::floor_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::floor_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::ceil_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::ceil_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::sin_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::sin_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::cos_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::cos_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::tan_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::tan_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::tanh_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::tanh_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::sign_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::sign_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::reciprocal_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::reciprocal_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::rsqrt_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::rsqrt_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::gelu_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::gelu_op>, cudaStream_t);
+    template LFS_CORE_API void launch_unary_op_generic<__half, __half, half_unary_via_float<ops::swish_op>>(
+        const __half*, __half*, size_t, half_unary_via_float<ops::swish_op>, cudaStream_t);
     template LFS_CORE_API void launch_unary_op_generic<float, float, ops::floor_op>(
         const float*, float*, size_t, ops::floor_op, cudaStream_t);
     template LFS_CORE_API void launch_unary_op_generic<int, int, ops::floor_op>(
@@ -2638,6 +3111,21 @@ namespace lfs::core::tensor_ops {
     template LFS_CORE_API void launch_binary_op_generic<int64_t, unsigned char, ops::not_equal_op>(
         const int64_t*, const int64_t*, unsigned char*, size_t, ops::not_equal_op, cudaStream_t);
 
+#define LFS_INSTANTIATE_UINT32_COMPARISON(OP)                                    \
+    template LFS_CORE_API void launch_binary_op_generic<uint32_t, unsigned char, \
+                                                        ops::OP>(                \
+        const uint32_t*, const uint32_t*, unsigned char*, size_t, ops::OP, cudaStream_t);
+    LFS_INSTANTIATE_UINT32_COMPARISON(greater_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(greater_equal_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(less_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(less_equal_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(equal_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(not_equal_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(logical_and_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(logical_or_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(logical_xor_op)
+#undef LFS_INSTANTIATE_UINT32_COMPARISON
+
     template LFS_CORE_API void launch_binary_op_generic<__half, unsigned char, ops::greater_op>(
         const __half*, const __half*, unsigned char*, size_t, ops::greater_op, cudaStream_t);
     template LFS_CORE_API void launch_binary_op_generic<__half, unsigned char, ops::greater_equal_op>(
@@ -2967,15 +3455,16 @@ namespace lfs::core::tensor_ops {
         }
 
         // FALLBACK PATH: For ndim > 16 (extremely rare!)
-        // Use device memory allocation only when absolutely necessary
+        // Route shape/stride metadata through the pool (no bare cudaMalloc).
 
-        // Copy shape and strides to device
-        size_t* d_shape;
-        size_t* d_strides;
-        LFS_CUDA_CHECK(cudaMalloc(&d_shape, ndim * sizeof(size_t)));
-        LFS_CUDA_CHECK(cudaMalloc(&d_strides, ndim * sizeof(size_t)));
-        LFS_CUDA_CHECK(cudaMemcpy(d_shape, shape.data(), ndim * sizeof(size_t), cudaMemcpyHostToDevice));
-        LFS_CUDA_CHECK(cudaMemcpy(d_strides, strides.data(), ndim * sizeof(size_t), cudaMemcpyHostToDevice));
+        const size_t metadata_bytes = ndim * sizeof(size_t);
+        auto& pool = CudaMemoryPool::instance();
+        size_t* d_shape = static_cast<size_t*>(pool.allocate(metadata_bytes, stream));
+        size_t* d_strides = static_cast<size_t*>(pool.allocate(metadata_bytes, stream));
+        LFS_CUDA_CHECK(cudaMemcpyAsync(d_shape, shape.data(), metadata_bytes,
+                                       cudaMemcpyHostToDevice, stream));
+        LFS_CUDA_CHECK(cudaMemcpyAsync(d_strides, strides.data(), metadata_bytes,
+                                       cudaMemcpyHostToDevice, stream));
 
         // Use 2D grid for large arrays to avoid exceeding grid dimension limits
         if (num_blocks <= max_blocks_x) {
@@ -2994,9 +3483,8 @@ namespace lfs::core::tensor_ops {
             LFS_CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        // Clean up device memory
-        LFS_CUDA_CHECK(cudaFree(d_shape));
-        LFS_CUDA_CHECK(cudaFree(d_strides));
+        pool.deallocate(d_shape, stream);
+        pool.deallocate(d_strides, stream);
     }
 
     // Explicit instantiations
@@ -3076,7 +3564,8 @@ namespace lfs::core::tensor_ops {
         }
     }
 
-    // Persistent buffers to avoid malloc/free overhead (thread-safe via thread_local)
+    // Persistent buffers to avoid malloc/free overhead (thread-safe via thread_local).
+    // Device flag routes through CudaMemoryPool (slab); host stays pinned for D2H.
     namespace {
         struct NaNCheckBuffers {
             int* d_result = nullptr;
@@ -3085,8 +3574,35 @@ namespace lfs::core::tensor_ops {
 
             void init() {
                 if (!initialized) {
-                    LFS_CUDA_CHECK(cudaMalloc(&d_result, sizeof(int)));
-                    LFS_CUDA_CHECK(cudaMallocHost(&h_result_pinned, sizeof(int))); // Pinned memory
+                    int* next_device_result = static_cast<int*>(
+                        CudaMemoryPool::instance().allocate(sizeof(int), nullptr));
+                    if (!next_device_result) {
+                        LFS_CUDA_CHECK(cudaErrorMemoryAllocation);
+                        return;
+                    }
+
+                    int* next_host_result = nullptr;
+                    // Publish the TLS cache only after both allocations succeed.
+                    // A checked CUDA call can throw even after assigning its output.
+                    try {
+                        LFS_ASSERT_MSG(
+                            !force_nan_check_host_allocation_failure.load(
+                                std::memory_order_acquire),
+                            "NaN check pinned allocation failure injected");
+                        LFS_CUDA_CHECK(cudaMallocHost(&next_host_result, sizeof(int)));
+                    } catch (...) {
+                        if (next_host_result) {
+                            const cudaError_t cleanup_status = cudaFreeHost(next_host_result);
+                            if (cleanup_status != cudaSuccess) {
+                                (void)cudaGetLastError();
+                            }
+                        }
+                        safe_cuda_pool_deallocate(next_device_result, nullptr);
+                        throw;
+                    }
+
+                    d_result = next_device_result;
+                    h_result_pinned = next_host_result;
                     initialized = true;
                 }
             }
@@ -3099,19 +3615,17 @@ namespace lfs::core::tensor_ops {
                 initialized = false;
 
                 if (device_result) {
-                    const cudaError_t device_status = cudaFree(device_result);
-                    if (device_status != cudaSuccess) {
-                        ensure_cuda_success(
-                            device_status, "cudaFree(NaN-check device buffer)", {},
-                            LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnlyNoLatch);
-                    }
+                    // pool-liveness-aware free (TLS dtor after pool teardown).
+                    safe_cuda_pool_deallocate(device_result, nullptr);
                 }
                 if (host_result) {
-                    const cudaError_t host_status = cudaFreeHost(host_result);
-                    if (host_status != cudaSuccess) {
-                        ensure_cuda_success(
-                            host_status, "cudaFreeHost(NaN-check pinned buffer)", {},
-                            LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnlyNoLatch);
+                    // Skip host free after ordered process teardown — CUDA/pinned
+                    // may already be unusable and a second free is a double-free.
+                    if (!lfs::core::gpu_process_teardown_started()) {
+                        const cudaError_t host_status = cudaFreeHost(host_result);
+                        if (host_status != cudaSuccess) {
+                            (void)cudaGetLastError();
+                        }
                     }
                 }
                 return !initialized && d_result == nullptr && h_result_pinned == nullptr;
@@ -3130,6 +3644,14 @@ namespace lfs::core::tensor_ops {
     }
 
     namespace {
+        // main-thread nan-check TLS buffers freed before pool shutdown.
+        const bool g_nan_check_tls_release_hook_registered = [] {
+            register_gpu_pre_shutdown_hook([]() noexcept {
+                (void)release_nan_check_thread_buffers();
+            });
+            return true;
+        }();
+
         bool has_special_value_gpu(const float* data, size_t n, cudaStream_t stream, bool check_nan) {
             if (n == 0)
                 return false;

@@ -7,6 +7,8 @@
 #include "core/path_utils.hpp"
 #include "hdr_libplacebo.hpp"
 #include "hdr_tonemap.hpp"
+#include "video/frame_color_range.hpp"
+#include "video/sws_packed_rgb.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -220,8 +222,12 @@ namespace lfs::io {
 
             // Select the video stream before probing codec-level metadata.
             video_stream_idx_ = findUsableHeaderVideoStream(fmt_ctx_);
+            // avformat_find_stream_info frees its per-stream probe state; a second call on the
+            // same context dereferences it. Probe at most once.
+            bool stream_info_probed = false;
             if (video_stream_idx_ < 0) {
                 // Fallback for containers requiring packet probing.
+                stream_info_probed = true;
                 if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
                     close();
                     return false;
@@ -237,7 +243,7 @@ namespace lfs::io {
             discardNonVideoStreams(fmt_ctx_, video_stream_idx_);
 
             // Probe the selected stream for HDR metadata stored in the bitstream.
-            if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
+            if (!stream_info_probed && avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
                 LOG_WARN("VideoPlayer: could not complete video-only stream metadata probe");
             }
             av_seek_frame(fmt_ctx_, video_stream_idx_, 0, AVSEEK_FLAG_BACKWARD);
@@ -352,46 +358,59 @@ namespace lfs::io {
                                                         : "CPU");
             }
 
-            codec_ctx_ = avcodec_alloc_context3(codec);
-            if (!codec_ctx_) {
-                setError("Failed to allocate video decoder context");
-                close();
-                return false;
-            }
-            const int parameters_result =
-                avcodec_parameters_to_context(codec_ctx_, stream->codecpar);
-            if (parameters_result < 0) {
-                setError("Failed to configure video decoder: " +
-                         ffmpegError(parameters_result));
-                close();
-                return false;
-            }
-#ifdef AV_CODEC_EXPORT_DATA_DOVI_RPU
-            // Export Dolby Vision RPU side data for libplacebo.
-            codec_ctx_->export_side_data |= AV_CODEC_EXPORT_DATA_DOVI_RPU;
-#endif
-
-            if (using_hw_decode_) {
-                codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
-                if (!codec_ctx_->hw_device_ctx) {
-                    setError("Failed to retain CUDA video decoder context");
+            for (;;) {
+                codec_ctx_ = avcodec_alloc_context3(codec);
+                if (!codec_ctx_) {
+                    setError("Failed to allocate video decoder context");
                     close();
                     return false;
                 }
-                codec_ctx_->get_format = getHwFormat;
-            } else {
-                const unsigned int hardware_threads = std::max(1U, std::thread::hardware_concurrency());
-                codec_ctx_->thread_count = std::min(MAX_SW_DECODE_THREADS,
-                                                    static_cast<int>(hardware_threads));
-                codec_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-                LOG_INFO("VideoPlayer: FFmpeg software decoder threads: {}", codec_ctx_->thread_count);
-            }
+                const int parameters_result =
+                    avcodec_parameters_to_context(codec_ctx_, stream->codecpar);
+                if (parameters_result < 0) {
+                    setError("Failed to configure video decoder: " +
+                             ffmpegError(parameters_result));
+                    close();
+                    return false;
+                }
+#ifdef AV_CODEC_EXPORT_DATA_DOVI_RPU
+                // Export Dolby Vision RPU side data for libplacebo.
+                codec_ctx_->export_side_data |= AV_CODEC_EXPORT_DATA_DOVI_RPU;
+#endif
 
-            const int codec_open_result =
-                avcodec_open2(codec_ctx_, codec, nullptr);
-            if (codec_open_result < 0) {
-                setError("Failed to open video decoder: " +
-                         ffmpegError(codec_open_result));
+                if (using_hw_decode_) {
+                    codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
+                    if (!codec_ctx_->hw_device_ctx) {
+                        setError("Failed to retain CUDA video decoder context");
+                        close();
+                        return false;
+                    }
+                    codec_ctx_->get_format = getHwFormat;
+                } else {
+                    const unsigned int hardware_threads = std::max(1U, std::thread::hardware_concurrency());
+                    codec_ctx_->thread_count = std::min(MAX_SW_DECODE_THREADS,
+                                                        static_cast<int>(hardware_threads));
+                    codec_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+                    LOG_INFO("VideoPlayer: FFmpeg software decoder threads: {}", codec_ctx_->thread_count);
+                }
+
+                const int codec_open_result =
+                    avcodec_open2(codec_ctx_, codec, nullptr);
+                if (codec_open_result >= 0)
+                    break;
+
+                if (using_hw_decode_) {
+                    LOG_WARN("VideoPlayer: failed to open NVDEC decoder {}: {}; falling back to CPU",
+                             hw_decoder_name, ffmpegError(codec_open_result));
+                    avcodec_free_context(&codec_ctx_);
+                    av_buffer_unref(&hw_device_ctx_);
+                    using_hw_decode_ = false;
+                    codec = avcodec_find_decoder(codec_id);
+                    if (codec)
+                        continue;
+                }
+
+                setError("Failed to open video decoder: " + ffmpegError(codec_open_result));
                 close();
                 return false;
             }
@@ -779,42 +798,6 @@ namespace lfs::io {
         [[nodiscard]] int64_t totalFrames() const { return total_frames_; }
         [[nodiscard]] double fps() const { return fps_; }
 
-        std::vector<uint8_t> getThumbnail(const double time, const int max_width) {
-            if (!is_open_) {
-                return {};
-            }
-
-            seek(time);
-
-            if (display_buffer_.empty()) {
-                return {};
-            }
-
-            if (max_width > 0 && display_width_ > max_width) {
-                const int thumb_height = display_height_ * max_width / display_width_;
-                std::vector<uint8_t> thumb(static_cast<size_t>(max_width) * thumb_height * 3);
-
-                const AVPixelFormat preview_format =
-                    display_channels_ == 4 ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
-                SwsContext* const thumb_sws =
-                    sws_getContext(display_width_, display_height_, preview_format, max_width, thumb_height,
-                                   AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr);
-
-                if (thumb_sws) {
-                    uint8_t* src_data[1] = {display_buffer_.data()};
-                    int src_linesize[1] = {display_width_ * display_channels_};
-                    uint8_t* dst_data[1] = {thumb.data()};
-                    int dst_linesize[1] = {max_width * 3};
-
-                    sws_scale(thumb_sws, src_data, src_linesize, 0, display_height_, dst_data, dst_linesize);
-                    sws_freeContext(thumb_sws);
-                }
-                return thumb;
-            }
-
-            return display_buffer_;
-        }
-
     private:
         void displayFrame(DecodedFrame&& frame) {
             display_buffer_ = std::move(frame.data);
@@ -975,6 +958,8 @@ namespace lfs::io {
                 av_frame_unref(frame_);
                 const int receive_result = avcodec_receive_frame(codec_ctx_, frame_);
                 if (receive_result == 0) {
+                    video::restoreCuvidFullRange(frame_, codec_ctx_,
+                                                 fmt_ctx_->streams[video_stream_idx_]->codecpar);
                     return convertFrameToBuffer() ? DecodeResult::Frame : DecodeResult::Error;
                 }
                 if (receive_result == AVERROR_EOF)
@@ -1110,10 +1095,8 @@ namespace lfs::io {
                     return false;
                 }
                 decoded_frame_.data.resize(frame_size_);
-                uint8_t* dst_data[1] = {decoded_frame_.data.data()};
-                int dst_linesize[1] = {width_ * 3};
-                if (sws_scale(sws_ctx_, src_frame->data, src_frame->linesize, 0, src_height_,
-                              dst_data, dst_linesize) <= 0) {
+                if (scaleToPackedRgb24(sws_ctx_, src_frame->data, src_frame->linesize, src_height_,
+                                       decoded_frame_.data.data(), width_, height_, rgb_scratch_) <= 0) {
                     setError("Video color conversion failed");
                     decoded_frame_.data.clear();
                     return false;
@@ -1130,6 +1113,7 @@ namespace lfs::io {
         AVCodecContext* codec_ctx_ = nullptr;
         AVBufferRef* hw_device_ctx_ = nullptr;
         SwsContext* sws_ctx_ = nullptr;
+        std::vector<uint8_t> rgb_scratch_;
         AVFrame* frame_ = nullptr;
         AVFrame* sw_frame_ = nullptr;
         AVPacket* packet_ = nullptr;
@@ -1199,13 +1183,10 @@ namespace lfs::io {
     void VideoPlayer::close() { impl_->close(); }
     bool VideoPlayer::isOpen() const { return impl_->isOpen(); }
 
-    void VideoPlayer::play() { impl_->play(); }
-    void VideoPlayer::pause() { impl_->pause(); }
     void VideoPlayer::togglePlayPause() { impl_->togglePlayPause(); }
     bool VideoPlayer::isPlaying() const { return impl_->isPlaying(); }
 
     void VideoPlayer::seek(const double seconds) { impl_->seek(seconds); }
-    void VideoPlayer::seekFrame(const int64_t frame_number) { impl_->seekFrame(frame_number); }
     bool VideoPlayer::rerenderCurrentFrame() { return impl_->rerenderCurrentFrame(); }
     void VideoPlayer::stepForward() { impl_->stepForward(); }
     void VideoPlayer::stepBackward() { impl_->stepBackward(); }
@@ -1229,12 +1210,6 @@ namespace lfs::io {
 
     double VideoPlayer::currentTime() const { return impl_->currentTime(); }
     double VideoPlayer::duration() const { return impl_->duration(); }
-    int64_t VideoPlayer::currentFrameNumber() const { return impl_->currentFrameNumber(); }
-    int64_t VideoPlayer::totalFrames() const { return impl_->totalFrames(); }
     double VideoPlayer::fps() const { return impl_->fps(); }
-
-    std::vector<uint8_t> VideoPlayer::getThumbnail(const double time, const int max_width) {
-        return impl_->getThumbnail(time, max_width);
-    }
 
 } // namespace lfs::io

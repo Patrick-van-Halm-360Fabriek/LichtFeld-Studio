@@ -10,7 +10,6 @@
 #include "gui/panel_registry.hpp"
 #include "gui/rml_status_bar.hpp"
 #include "gui/sequencer_ui_manager.hpp"
-#include "gui/startup_overlay.hpp"
 #include "internal/viewport.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/coordinate_conventions.hpp"
@@ -35,6 +34,54 @@ namespace lfs::vis::gui::native_panels {
             PanelRegistry::instance().set_panel_enabled("native.video_extractor", false);
     }
 
+    PanelRenderCapabilities VideoExtractorPanel::renderCapabilities() const {
+        return {.direct = widget_ && widget_->supportsDirectDraw()};
+    }
+
+    PanelDirectRenderResult VideoExtractorPanel::renderDirect(
+        const PanelDirectRenderRequest& request,
+        const PanelDrawContext& ctx) {
+        if (!widget_)
+            return {};
+        setPanelSpace(request.space);
+        if (request.mode == PanelDirectRenderMode::Measure)
+            return {.handled = true, .height = getDirectDrawHeight()};
+
+        setInputClipY(request.clip_y_min, request.clip_y_max);
+        setInput(request.input);
+        setForcedHeight(request.forced_height);
+
+        bool handled = true;
+        try {
+            switch (request.mode) {
+            case PanelDirectRenderMode::Measure:
+                break;
+            case PanelDirectRenderMode::Draw:
+                drawDirect(request.x, request.y, request.width, request.height, ctx);
+                break;
+            case PanelDirectRenderMode::Cached:
+                handled = drawDirectCached(request.x, request.y, request.width,
+                                           request.height, ctx);
+                break;
+            case PanelDirectRenderMode::Preload:
+                preloadDirect(request.width, request.height, ctx,
+                              request.clip_y_min, request.clip_y_max, request.input);
+                break;
+            }
+        } catch (...) {
+            setForcedHeight(0.0f);
+            setInput(nullptr);
+            setInputClipY(-1.0f, -1.0f);
+            throw;
+        }
+
+        const float height = getDirectDrawHeight();
+        setForcedHeight(0.0f);
+        setInput(nullptr);
+        setInputClipY(-1.0f, -1.0f);
+        return {.handled = handled, .height = height};
+    }
+
     void VideoExtractorPanel::preloadDirect(const float w, const float h,
                                             const PanelDrawContext& ctx,
                                             const float clip_y_min,
@@ -42,10 +89,6 @@ namespace lfs::vis::gui::native_panels {
                                             const PanelInputState* input) {
         if (widget_)
             widget_->preloadDirect(w, h, ctx, clip_y_min, clip_y_max, input);
-    }
-
-    bool VideoExtractorPanel::supportsDirectDraw() const {
-        return widget_ && widget_->supportsDirectDraw();
     }
 
     void VideoExtractorPanel::drawDirect(const float x, const float y,
@@ -85,10 +128,6 @@ namespace lfs::vis::gui::native_panels {
             widget_->setFloating(space == PanelSpace::Floating);
     }
 
-    bool VideoExtractorPanel::wantsKeyboard() const {
-        return widget_ && widget_->wantsKeyboard();
-    }
-
     bool VideoExtractorPanel::needsAnimationFrame() const {
         return widget_ && widget_->needsAnimationFrame();
     }
@@ -96,20 +135,6 @@ namespace lfs::vis::gui::native_panels {
     void VideoExtractorPanel::reloadRmlResources() {
         if (widget_)
             widget_->reloadRmlResources();
-    }
-
-    StartupOverlayPanel::StartupOverlayPanel(StartupOverlay* overlay, const bool* drag_hovering)
-        : overlay_(overlay),
-          drag_hovering_(drag_hovering) {}
-
-    void StartupOverlayPanel::draw(const PanelDrawContext& ctx) {
-        if (ctx.viewport)
-            overlay_->render(*ctx.viewport, drag_hovering_ ? *drag_hovering_ : false);
-    }
-
-    bool StartupOverlayPanel::poll(const PanelDrawContext& ctx) {
-        (void)ctx;
-        return overlay_->isVisible();
     }
 
     SelectionOverlayPanel::SelectionOverlayPanel(GuiManager* gui)
@@ -134,6 +159,37 @@ namespace lfs::vis::gui::native_panels {
 
     void SequencerPanel::draw(const PanelDrawContext& ctx) {
         (void)ctx;
+    }
+
+    PanelDirectRenderResult SequencerPanel::renderDirect(
+        const PanelDirectRenderRequest& request,
+        const PanelDrawContext& ctx) {
+        is_floating_ = request.space == PanelSpace::Floating;
+        if (request.mode == PanelDirectRenderMode::Measure)
+            return {.handled = true, .height = direct_draw_height_};
+
+        input_ = request.input;
+        forced_height_ = request.forced_height;
+
+        bool handled = true;
+        switch (request.mode) {
+        case PanelDirectRenderMode::Measure:
+            break;
+        case PanelDirectRenderMode::Draw:
+            drawDirect(request.x, request.y, request.width, request.height, ctx);
+            break;
+        case PanelDirectRenderMode::Cached:
+            handled = false;
+            break;
+        case PanelDirectRenderMode::Preload:
+            preloadDirect(request.width, request.height, ctx,
+                          request.clip_y_min, request.clip_y_max, request.input);
+            break;
+        }
+
+        input_ = nullptr;
+        forced_height_ = 0.0f;
+        return {.handled = handled, .height = direct_draw_height_};
     }
 
     void SequencerPanel::preloadDirect(const float w, const float h,

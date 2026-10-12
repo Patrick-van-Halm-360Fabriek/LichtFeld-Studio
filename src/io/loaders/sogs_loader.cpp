@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "sogs_loader.hpp"
+#include "core/file_extensions.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/splat_data.hpp"
@@ -46,7 +47,7 @@ namespace lfs::io {
             bool valid = false;
 
             // Check if it's a .sog bundle
-            if (path.extension() == ".sog" && std::filesystem::is_regular_file(path)) {
+            if (core::has_extension(path, ".sog") && std::filesystem::is_regular_file(path)) {
                 // Basic validation - check if it's a valid archive
                 std::ifstream file;
                 if (lfs::core::open_file_for_read(path, std::ios::binary, file)) {
@@ -98,10 +99,10 @@ namespace lfs::io {
         }
 
         LOG_INFO("Loading SOG file: {}", lfs::core::path_to_utf8(path));
-        auto splat_result = load_sog(path);
+        std::optional<std::vector<uint8_t>> license_bytes;
+        auto splat_result = load_sog(path, &license_bytes);
         if (!splat_result) {
-            return make_error(ErrorCode::CORRUPTED_DATA,
-                              std::format("Failed to load SOG: {}", splat_result.error()), path);
+            return std::unexpected(splat_result.error());
         }
 
         if (options.progress) {
@@ -117,7 +118,9 @@ namespace lfs::io {
             .scene_center = Tensor::zeros({3}, Device::CPU),
             .loader_used = name(),
             .load_time = load_time,
-            .warnings = {}};
+            .warnings = {},
+            .georeference = std::nullopt,
+            .license_bytes = std::move(license_bytes)};
 
         LOG_INFO("SOG loaded successfully in {}ms", load_time.count());
 
@@ -130,7 +133,7 @@ namespace lfs::io {
         }
 
         // Check for .sog bundle file
-        if (path.extension() == ".sog" && std::filesystem::is_regular_file(path)) {
+        if (core::has_extension(path, ".sog") && std::filesystem::is_regular_file(path)) {
             return true;
         }
 

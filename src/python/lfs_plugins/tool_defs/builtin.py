@@ -117,20 +117,16 @@ def _poll_has_gaussians(context) -> bool:
     )
 
 
-def _poll_can_select(context) -> bool:
-    return _poll_has_gaussians(context) and not _selection_is_crop_volume()
-
-
 def _poll_can_transform(context) -> bool:
-    return bool(getattr(context, "can_transform", False)) and not _selection_is_crop_volume()
+    return bool(getattr(context, "can_transform", False))
 
 
 def _poll_can_mirror(_context) -> bool:
-    return _poll_builtin_tool_available("builtin.mirror") and not _selection_is_crop_volume()
+    return _poll_builtin_tool_available("builtin.mirror")
 
 
 def _poll_can_align(_context) -> bool:
-    return _poll_builtin_tool_available("builtin.align") and not _selection_is_crop_volume()
+    return _poll_builtin_tool_available("builtin.align")
 
 
 def _poll_can_cropbox(context) -> bool:
@@ -147,26 +143,28 @@ BUILTIN_TOOLS: tuple[ToolDef, ...] = (
     ToolDef(
         id="builtin.select",
         label="Select",
+        label_key="tool_defs.select",
         icon="selection",
         group="select",
         order=10,
         description="Select gaussians",
         shortcut="1",
         submodes=(
-            SubmodeDef("centers", "Centers", "circle-dot"),
+            SubmodeDef("centers", "Centers", "select-centers"),
             SubmodeDef("rectangle", "Rectangle", "rectangle"),
             SubmodeDef("polygon", "Polygon", "polygon"),
             SubmodeDef("lasso", "Lasso", "lasso"),
-            SubmodeDef("rings", "Rings", "ring"),
+            SubmodeDef("rings", "Rings", "select-rings"),
             SubmodeDef("color", "Color", "color-picker"),
             SubmodeDef("box", "Box", "box"),
             SubmodeDef("sphere", "Sphere", "sphere"),
         ),
-        poll=_poll_can_select,
+        poll=_poll_has_gaussians,
     ),
     ToolDef(
         id="builtin.translate",
         label="Move",
+        label_key="tool_defs.move",
         icon="translation",
         group="transform",
         order=20,
@@ -186,6 +184,7 @@ BUILTIN_TOOLS: tuple[ToolDef, ...] = (
     ToolDef(
         id="builtin.rotate",
         label="Rotate",
+        label_key="tool_defs.rotate",
         icon="rotation",
         group="transform",
         order=30,
@@ -205,6 +204,7 @@ BUILTIN_TOOLS: tuple[ToolDef, ...] = (
     ToolDef(
         id="builtin.scale",
         label="Scale",
+        label_key="tool_defs.scale",
         icon="scaling",
         group="transform",
         order=40,
@@ -224,6 +224,7 @@ BUILTIN_TOOLS: tuple[ToolDef, ...] = (
     ToolDef(
         id="builtin.mirror",
         label="Mirror",
+        label_key="tool_defs.mirror",
         icon="mirror",
         group="transform",
         order=50,
@@ -239,6 +240,7 @@ BUILTIN_TOOLS: tuple[ToolDef, ...] = (
     ToolDef(
         id="builtin.cropbox",
         label="Crop",
+        label_key="tool_defs.crop",
         icon="cropbox",
         group="utility",
         order=70,
@@ -249,6 +251,7 @@ BUILTIN_TOOLS: tuple[ToolDef, ...] = (
     ToolDef(
         id="builtin.align",
         label="Align",
+        label_key="tool_defs.align",
         icon="align",
         group="utility",
         order=80,

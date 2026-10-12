@@ -16,6 +16,9 @@ namespace lfs::io {
 
     // Supports %d, %0Nd zero-padding, %% escaping, and legacy %000 zero-padding.
     [[nodiscard]] std::string formatFrameFilenameStem(std::string_view pattern, int frame_number);
+    // True when the extractor writes `filename` (name only) for `pattern`: a frame stem with any
+    // positive frame number and padding width, followed by .png or .jpg.
+    [[nodiscard]] bool isGeneratedFrameFilename(std::string_view pattern, std::string_view filename);
     [[nodiscard]] std::size_t calculateFpsSampleCount(double start_time, double end_time,
                                                       double target_fps);
     [[nodiscard]] double fpsSampleTime(double start_time, double end_time,
@@ -23,6 +26,15 @@ namespace lfs::io {
     [[nodiscard]] bool frameCoversSampleTime(double frame_time, double frame_duration,
                                              double sample_time);
     [[nodiscard]] bool shouldFillRetainedFpsTail(bool reached_eof, bool reached_end);
+    // End time to request for a trim range edited against the preview player's duration. An end
+    // at the player's (float) duration can mean "to the end of the video" (-1) for an automatic
+    // interval range. Timed sampling and explicit user bounds retain their numeric endpoint.
+    [[nodiscard]] inline double extractionEndTime(const float trim_end, const double player_duration,
+                                                  const bool allow_stream_end = true) {
+        return trim_end < 0.0f || (allow_stream_end && trim_end >= static_cast<float>(player_duration))
+                   ? -1.0
+                   : static_cast<double>(trim_end);
+    }
 
     enum class ExtractionMode {
         FPS,     // Extract at specific FPS
@@ -38,6 +50,12 @@ namespace lfs::io {
         Original,
         Scale,
         Custom
+    };
+
+    enum class ExtractionOutcome {
+        Completed,
+        Cancelled,
+        Failed,
     };
 
     enum class SharpnessAlgorithm {
@@ -98,6 +116,7 @@ namespace lfs::io {
                                                  int source_height, double stream_time_base,
                                                  ValidatedLayout& layout, std::string& error);
         bool extract(const Params& params, std::string& error);
+        [[nodiscard]] ExtractionOutcome lastOutcome() const;
 
     private:
         class Impl;

@@ -5,6 +5,7 @@
 #include "core/cuda_error.hpp"
 #include "core/tensor/internal/tensor_generic_ops.cuh"
 #include "lfs/cuda_scratch.hpp"
+#include "lfs/training/refine_scratch.hpp"
 #include "mrnf_kernels.hpp"
 #include <algorithm>
 #include <cmath>
@@ -31,6 +32,10 @@ namespace lfs::training::mrnf_strategy {
         }
 
         __device__ __forceinline__ float d_logit(float p) {
+            if (isnan(p))
+                return p;
+            // The upper bound must be representable below 1 in float32.
+            p = fminf(fmaxf(p, 1e-12f), nextafterf(1.0f, 0.0f));
             return logf(p / (1.0f - p));
         }
 
@@ -41,6 +46,46 @@ namespace lfs::training::mrnf_strategy {
         };
 
     } // namespace
+
+    __global__ void replace_parent_weights_kernel(
+        const float* __restrict__ opacities,
+        const float* __restrict__ visibility,
+        const bool* __restrict__ active_mask,
+        const bool* __restrict__ trainable_mask,
+        const float* __restrict__ edge_guidance,
+        float* __restrict__ output,
+        size_t N) {
+        const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= N)
+            return;
+        float weight = opacities[i] * static_cast<float>(visibility[i] > 0.0f);
+        if (active_mask)
+            weight = weight * static_cast<float>(active_mask[i]);
+        if (trainable_mask)
+            weight = weight * static_cast<float>(trainable_mask[i]);
+        if (edge_guidance)
+            weight = weight * edge_guidance[i];
+        output[i] = weight;
+    }
+
+    void launch_replace_parent_weights(
+        const float* opacities,
+        const float* visibility,
+        const bool* active_mask,
+        const bool* trainable_mask,
+        const float* edge_guidance,
+        float* output,
+        size_t N,
+        void* stream) {
+        if (N == 0)
+            return;
+        constexpr int threads = 256;
+        const int blocks = static_cast<int>((N + threads - 1) / threads);
+        cudaStream_t s = resolve_stream(stream);
+        replace_parent_weights_kernel<<<blocks, threads, 0, s>>>(
+            opacities, visibility, active_mask, trainable_mask, edge_guidance, output, N);
+        LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.replace_parent_weights");
+    }
 
     __global__ void mrnf_noise_injection_kernel(
         float* __restrict__ means,
@@ -70,11 +115,13 @@ namespace lfs::training::mrnf_strategy {
         if (weight < 1e-12f)
             return;
 
-        curandState rng;
+        curandStatePhilox4_32_10_t rng;
         curand_init(seed, idx, 0, &rng);
+        const float4 n = curand_normal4(&rng);
+        const float noise_xyz[3] = {n.x, n.y, n.z};
 
         for (int d = 0; d < 3; ++d) {
-            const float noise = curand_normal(&rng) * weight;
+            const float noise = noise_xyz[d] * weight;
             const float clamped_noise = fminf(fmaxf(noise, -median_scale), median_scale);
             means[idx * 3 + d] += clamped_noise;
         }
@@ -107,6 +154,7 @@ namespace lfs::training::mrnf_strategy {
         LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.noise_injection");
     }
 
+    template <bool RenderedOnly>
     __global__ void mrnf_decay_kernel(
         float* __restrict__ raw_opacities,
         float* __restrict__ log_scales,
@@ -115,7 +163,8 @@ namespace lfs::training::mrnf_strategy {
         float opacity_decay,
         float scale_decay,
         float train_t,
-        size_t N) {
+        size_t N,
+        const float* __restrict__ rendered_count) {
 
         const size_t idx = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
         if (idx >= N)
@@ -125,9 +174,13 @@ namespace lfs::training::mrnf_strategy {
 
         const float t_shrink = 1.0f - train_t;
 
-        float opac = d_sigmoid(raw_opacities[idx]) - opacity_decay * t_shrink;
-        opac = fminf(fmaxf(opac, 1e-12f), 1.0f - 1e-12f);
-        raw_opacities[idx] = d_logit(opac);
+        const float opacity_delta = opacity_decay * t_shrink;
+        // A sigmoid/logit round trip loses finite saturated logits even when
+        // decay is disabled. Still repair infinities from older checkpoints.
+        if ((!RenderedOnly || rendered_count[idx] > 0.0f) &&
+            (opacity_delta != 0.0f || isinf(raw_opacities[idx]))) {
+            raw_opacities[idx] = d_logit(d_sigmoid(raw_opacities[idx]) - opacity_delta);
+        }
 
         const float decay_factor = 1.0f - scale_decay * t_shrink;
         for (int d = 0; d < 3; ++d) {
@@ -145,7 +198,8 @@ namespace lfs::training::mrnf_strategy {
         float scale_decay,
         float train_t,
         size_t N,
-        void* stream) {
+        void* stream,
+        const float* rendered_count) {
 
         if (N == 0)
             return;
@@ -154,24 +208,35 @@ namespace lfs::training::mrnf_strategy {
         const int blocks = static_cast<int>((N + threads - 1) / threads);
         cudaStream_t s = resolve_stream(stream);
 
-        mrnf_decay_kernel<<<blocks, threads, 0, s>>>(
-            raw_opacities, log_scales, frozen_mask, frozen_mask_size,
-            opacity_decay, scale_decay, train_t, N);
-        LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.decay");
+        if (rendered_count != nullptr) {
+            mrnf_decay_kernel<true><<<blocks, threads, 0, s>>>(
+                raw_opacities, log_scales, frozen_mask, frozen_mask_size,
+                opacity_decay, scale_decay, train_t, N, rendered_count);
+            LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.decay_with_rendered_count");
+        } else {
+            mrnf_decay_kernel<false><<<blocks, threads, 0, s>>>(
+                raw_opacities, log_scales, frozen_mask, frozen_mask_size,
+                opacity_decay, scale_decay, train_t, N, nullptr);
+            LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.decay_without_rendered_count");
+        }
     }
 
-    __global__ void elementwise_add_inplace_kernel(
-        float* __restrict__ a,
-        const float* __restrict__ b,
+    __global__ void fold_densification_error_and_zero_kernel(
+        float* __restrict__ refine_weight_max,
+        float* __restrict__ densification_info,
         size_t N) {
+
         const size_t idx = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
-        if (idx < N)
-            a[idx] += b[idx];
+        if (idx >= N)
+            return;
+
+        refine_weight_max[idx] = fmaxf(refine_weight_max[idx], densification_info[N + idx]);
+        densification_info[N + idx] = 0.0f;
     }
 
-    void launch_elementwise_add_inplace(
-        float* a,
-        const float* b,
+    void launch_fold_densification_error_and_zero(
+        float* refine_weight_max,
+        float* densification_info,
         size_t N,
         void* stream) {
         if (N == 0)
@@ -179,8 +244,9 @@ namespace lfs::training::mrnf_strategy {
         constexpr int threads = 256;
         const int blocks = static_cast<int>((N + threads - 1) / threads);
         cudaStream_t s = resolve_stream(stream);
-        elementwise_add_inplace_kernel<<<blocks, threads, 0, s>>>(a, b, N);
-        LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.elementwise_add");
+        fold_densification_error_and_zero_kernel<<<blocks, threads, 0, s>>>(
+            refine_weight_max, densification_info, N);
+        LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.fold_densification_error_and_zero");
     }
 
     __global__ void extract_axis_kernel(
@@ -266,6 +332,124 @@ namespace lfs::training::mrnf_strategy {
         bounds->max_extent = sorted_ext[2];
     }
 
+    __global__ void geomean_extent_kernel(
+        const float* __restrict__ scaling_raw,
+        float* __restrict__ extents,
+        size_t N) {
+        const size_t idx = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
+        if (idx >= N)
+            return;
+        const float s0 = scaling_raw[idx * 3 + 0];
+        const float s1 = scaling_raw[idx * 3 + 1];
+        const float s2 = scaling_raw[idx * 3 + 2];
+        const float g = expf((s0 + s1 + s2) * (1.0f / 3.0f));
+        extents[idx] = (isfinite(g) && g > 0.0f) ? g : 0.0f;
+    }
+
+    __global__ void fill_pos_inf_kernel(float* data, size_t n) {
+        const size_t i = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
+        if (i < n)
+            data[i] = INFINITY;
+    }
+
+    __global__ void store_positive_median_kernel(
+        const float* __restrict__ sorted,
+        const int* __restrict__ count,
+        float* __restrict__ out) {
+        const int c = *count;
+        if (c <= 0) {
+            *out = 0.0f;
+            return;
+        }
+        const float m = sorted[c / 2];
+        *out = (isfinite(m) && m > 0.0f) ? m : 0.0f;
+    }
+
+    void launch_median_geomean_extent(
+        const float* scaling_raw,
+        size_t N,
+        float* out_median,
+        bool* out_valid,
+        void* stream) {
+
+        LFS_ASSERT(out_median != nullptr);
+        LFS_ASSERT(out_valid != nullptr);
+        *out_median = 0.0f;
+        *out_valid = false;
+        if (N == 0 || scaling_raw == nullptr)
+            return;
+        LFS_ASSERT_MSG(N <= static_cast<size_t>(std::numeric_limits<int>::max()),
+                       "MRNF median-extent input exceeds CUB's int item-count limit");
+
+        cudaStream_t s = resolve_stream(stream);
+        const int n_int = static_cast<int>(N);
+        constexpr int threads = 256;
+        const int blocks = static_cast<int>((N + threads - 1) / threads);
+
+        const size_t values_bytes = cuda_scratch::checked_bytes(
+            N, sizeof(float), "MRNF median geomean extents");
+        cuda_scratch::DeviceBuffer extents_buf(values_bytes, s, "mrnf.median_extent.input");
+        cuda_scratch::DeviceBuffer selected_buf(values_bytes, s, "mrnf.median_extent.selected");
+        cuda_scratch::DeviceBuffer sorted_buf(values_bytes, s, "mrnf.median_extent.sorted");
+        cuda_scratch::DeviceBuffer count_buf(sizeof(int), s, "mrnf.median_extent.count");
+        cuda_scratch::DeviceBuffer median_buf(sizeof(float), s, "mrnf.median_extent.scalar");
+
+        auto* d_ext = extents_buf.as<float>();
+        auto* d_sel = selected_buf.as<float>();
+        auto* d_sorted = sorted_buf.as<float>();
+        auto* d_count = count_buf.as<int>();
+        auto* d_median = median_buf.as<float>();
+        LFS_CUDA_CHECK_MSG(cudaMemsetAsync(d_count, 0, sizeof(int), s),
+                           "MRNF median-extent count zero");
+        LFS_CUDA_CHECK_MSG(cudaMemsetAsync(d_median, 0, sizeof(float), s),
+                           "MRNF median-extent scalar zero");
+
+        geomean_extent_kernel<<<blocks, threads, 0, s>>>(scaling_raw, d_ext, N);
+        LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.geomean_extent");
+        fill_pos_inf_kernel<<<blocks, threads, 0, s>>>(d_sel, N);
+        LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.median_extent_fill_inf");
+
+        // Named predicate, kept from the PR #1840 Windows fix: this CUB call sits inside a
+        // host lambda, where nvcc+MSVC rejected a braced temporary. Do not inline it back.
+        const positive_weight positive_pred;
+        auto select_op = [&](void* workspace, size_t& workspace_bytes) {
+            return cub::DeviceSelect::If(
+                workspace, workspace_bytes, d_ext, d_sel, d_count,
+                n_int, positive_pred, s);
+        };
+        size_t select_bytes = 0;
+        LFS_CUDA_CHECK_MSG(select_op(nullptr, select_bytes), "MRNF median-extent select size");
+        if (select_bytes > 0) {
+            cuda_scratch::CubWorkspace select_ws(
+                "cub::DeviceSelect::If", s, select_op);
+            select_ws.run(select_op);
+        } else {
+            LFS_CUDA_CHECK_MSG(select_op(nullptr, select_bytes), "MRNF median-extent select");
+        }
+
+        auto sort_op = [&](void* workspace, size_t& workspace_bytes) {
+            return cub::DeviceRadixSort::SortKeys(
+                workspace, workspace_bytes, d_sel, d_sorted, n_int, 0, 32, s);
+        };
+        size_t sort_bytes = 0;
+        LFS_CUDA_CHECK_MSG(sort_op(nullptr, sort_bytes), "MRNF median-extent sort size");
+        if (sort_bytes > 0) {
+            cuda_scratch::CubWorkspace sort_ws(
+                "cub::DeviceRadixSort::SortKeys", s, sort_op);
+            sort_ws.run(sort_op);
+        } else {
+            LFS_CUDA_CHECK_MSG(sort_op(nullptr, sort_bytes), "MRNF median-extent sort");
+        }
+
+        store_positive_median_kernel<<<1, 1, 0, s>>>(d_sorted, d_count, d_median);
+        LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.store_positive_median");
+        LFS_CUDA_CHECK_MSG(
+            cudaMemcpyAsync(out_median, d_median, sizeof(float), cudaMemcpyDeviceToHost, s),
+            "MRNF median-extent readback");
+        LFS_CUDA_CHECK_MSG(cudaStreamSynchronize(s), "MRNF median-extent stream sync");
+        *out_valid = std::isfinite(*out_median) && *out_median > 0.0f;
+    }
+
     __global__ void gumbel_key_kernel(
         const float* __restrict__ weights,
         float* __restrict__ keys,
@@ -282,7 +466,7 @@ namespace lfs::training::mrnf_strategy {
             return;
         }
 
-        curandState rng;
+        curandStatePhilox4_32_10_t rng;
         curand_init(seed, idx, 0, &rng);
         float u = curand_uniform(&rng);
         u = fmaxf(u, 1e-10f);
@@ -293,7 +477,7 @@ namespace lfs::training::mrnf_strategy {
 
     __global__ void gumbel_key_for_indices_kernel(
         const float* __restrict__ weights,
-        const int64_t* __restrict__ indices,
+        const uint32_t* __restrict__ indices,
         float* __restrict__ keys,
         size_t N,
         uint64_t seed) {
@@ -302,10 +486,10 @@ namespace lfs::training::mrnf_strategy {
         if (idx >= N)
             return;
 
-        const int64_t src_idx = indices[idx];
+        const uint32_t src_idx = indices[idx];
         const float w = weights[src_idx];
 
-        curandState rng;
+        curandStatePhilox4_32_10_t rng;
         curand_init(seed, idx, 0, &rng);
         float u = curand_uniform(&rng);
         u = fmaxf(u, 1e-10f);
@@ -314,18 +498,33 @@ namespace lfs::training::mrnf_strategy {
         keys[idx] = -logf(-logf(u)) + logf(w);
     }
 
+    __global__ void widen_gumbel_indices_kernel(
+        const uint32_t* __restrict__ input,
+        int64_t* __restrict__ output,
+        size_t N) {
+        const size_t idx = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
+        if (idx < N) {
+            output[idx] = static_cast<int64_t>(input[idx]);
+        }
+    }
+
     void launch_gumbel_topk(
         const float* weights,
         size_t N,
         size_t K,
         uint64_t seed,
         int64_t* output_indices,
-        void* stream) {
+        void* stream,
+        bool compact_sparse,
+        GumbelTopKScratch* scratch,
+        size_t known_nnz) {
 
         LFS_ASSERT(K <= N);
         if (K == 0)
             return;
 
+        LFS_ASSERT_MSG(N <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()),
+                       "MRNF Gumbel input exceeds the uint32 payload contract");
         LFS_ASSERT_MSG(N <= static_cast<size_t>(std::numeric_limits<int>::max()),
                        "MRNF Gumbel input exceeds CUB's int item-count limit");
 
@@ -333,51 +532,91 @@ namespace lfs::training::mrnf_strategy {
 
         if (K == N) {
             auto out_ptr = thrust::device_pointer_cast(output_indices);
-            lfs::core::tensor_ops::run_with_thrust_policy(s, [&](auto policy) {
-                thrust::sequence(policy, out_ptr, out_ptr + N);
-            });
+            // Caller may consume output_indices via a Tensor whose home stream
+            // is not `s` (scratch allocated earlier). Keep the host wait.
+            thrust::sequence(thrust::cuda::par.on(s), out_ptr, out_ptr + N);
             return;
         }
 
         auto weights_ptr = thrust::device_pointer_cast(weights);
-        size_t active_count = 0;
-        lfs::core::tensor_ops::run_with_thrust_policy(s, [&](auto policy) {
-            active_count = static_cast<size_t>(
-                thrust::count_if(policy, weights_ptr, weights_ptr + N, positive_weight{}));
-        });
+        size_t active_count = N;
+        if (compact_sparse) {
+            if (known_nnz > 0) {
+                LFS_ASSERT_MSG(known_nnz <= N,
+                               lfs::core::detail::format_cuda_safe(
+                                   "Gumbel known_nnz must be <= N (known_nnz={}, N={})",
+                                   known_nnz, N));
+                active_count = known_nnz;
+            } else {
+                active_count = static_cast<size_t>(
+                    thrust::count_if(thrust::cuda::par.on(s), weights_ptr, weights_ptr + N,
+                                     positive_weight{}));
+            }
+        }
 
-        const bool compact_active = active_count >= K && active_count < N;
+        const bool compact_active = compact_sparse && active_count >= K && active_count < N;
         const size_t sort_count = compact_active ? active_count : N;
 
-        const size_t keys_bytes = cuda_scratch::checked_bytes(
-            sort_count, sizeof(float), "MRNF Gumbel keys");
-        const size_t indices_bytes = cuda_scratch::checked_bytes(
-            sort_count, sizeof(int64_t), "MRNF Gumbel indices");
-        cuda_scratch::DeviceBuffer keys_buffer(keys_bytes, s, "mrnf.gumbel.keys");
-        cuda_scratch::DeviceBuffer indices_buffer(indices_bytes, s, "mrnf.gumbel.indices");
-        cuda_scratch::DeviceBuffer sorted_keys_buffer(keys_bytes, s, "mrnf.gumbel.keys_sorted");
-        cuda_scratch::DeviceBuffer sorted_indices_buffer(
-            indices_bytes, s, "mrnf.gumbel.indices_sorted");
-        auto* d_keys = keys_buffer.as<float>();
-        auto* d_indices = indices_buffer.as<int64_t>();
-        auto* d_keys_sorted = sorted_keys_buffer.as<float>();
-        auto* d_indices_sorted = sorted_indices_buffer.as<int64_t>();
+        float* d_keys = nullptr;
+        uint32_t* d_indices = nullptr;
+        float* d_keys_sorted = nullptr;
+        uint32_t* d_indices_sorted = nullptr;
+
+        cuda_scratch::DeviceBuffer keys_buffer;
+        cuda_scratch::DeviceBuffer indices_buffer;
+        cuda_scratch::DeviceBuffer sorted_keys_buffer;
+        cuda_scratch::DeviceBuffer sorted_indices_buffer;
+
+        if (scratch) {
+            scratch->ensure_n(sort_count, lfs::core::Device::CUDA);
+            LFS_ASSERT_MSG(scratch->n_capacity >= sort_count,
+                           lfs::core::detail::format_cuda_safe(
+                               "Gumbel scratch n_capacity must be >= sort_count (cap={}, sort_count={})",
+                               scratch->n_capacity, sort_count));
+            LFS_ASSERT_MSG(scratch->keys.is_valid() && scratch->keys.ptr<float>() != nullptr,
+                           "Gumbel scratch keys buffer must be a non-null CUDA f32 tensor");
+            LFS_ASSERT_MSG(scratch->indices.is_valid() && scratch->indices.ptr<uint32_t>() != nullptr,
+                           "Gumbel scratch indices buffer must be a non-null CUDA uint32 tensor");
+            LFS_ASSERT_MSG(
+                scratch->keys_sorted.is_valid() && scratch->keys_sorted.ptr<float>() != nullptr,
+                "Gumbel scratch sorted-keys buffer must be a non-null CUDA f32 tensor");
+            LFS_ASSERT_MSG(
+                scratch->indices_sorted.is_valid() &&
+                    scratch->indices_sorted.ptr<uint32_t>() != nullptr,
+                "Gumbel scratch sorted-indices buffer must be a non-null CUDA uint32 tensor");
+            d_keys = scratch->keys.ptr<float>();
+            d_indices = scratch->indices.ptr<uint32_t>();
+            d_keys_sorted = scratch->keys_sorted.ptr<float>();
+            d_indices_sorted = scratch->indices_sorted.ptr<uint32_t>();
+        } else {
+            const size_t keys_bytes = cuda_scratch::checked_bytes(
+                sort_count, sizeof(float), "MRNF Gumbel keys");
+            const size_t indices_bytes = cuda_scratch::checked_bytes(
+                sort_count, sizeof(uint32_t), "MRNF Gumbel indices");
+            keys_buffer = cuda_scratch::DeviceBuffer(keys_bytes, s, "mrnf.gumbel.keys");
+            indices_buffer = cuda_scratch::DeviceBuffer(indices_bytes, s, "mrnf.gumbel.indices");
+            sorted_keys_buffer = cuda_scratch::DeviceBuffer(keys_bytes, s, "mrnf.gumbel.keys_sorted");
+            sorted_indices_buffer = cuda_scratch::DeviceBuffer(
+                indices_bytes, s, "mrnf.gumbel.indices_sorted");
+            d_keys = keys_buffer.as<float>();
+            d_indices = indices_buffer.as<uint32_t>();
+            d_keys_sorted = sorted_keys_buffer.as<float>();
+            d_indices_sorted = sorted_indices_buffer.as<uint32_t>();
+        }
 
         constexpr int threads = 256;
         const int blocks = static_cast<int>((sort_count + threads - 1) / threads);
 
         if (compact_active) {
             auto indices_ptr = thrust::device_pointer_cast(d_indices);
-            auto counting_begin = thrust::make_counting_iterator<int64_t>(0);
-            lfs::core::tensor_ops::run_with_thrust_policy(s, [&](auto policy) {
-                thrust::copy_if(
-                    policy,
-                    counting_begin,
-                    counting_begin + static_cast<std::ptrdiff_t>(N),
-                    weights_ptr,
-                    indices_ptr,
-                    positive_weight{});
-            });
+            auto counting_begin = thrust::make_counting_iterator<uint32_t>(0);
+            thrust::copy_if(
+                thrust::cuda::par.on(s),
+                counting_begin,
+                counting_begin + static_cast<std::ptrdiff_t>(N),
+                weights_ptr,
+                indices_ptr,
+                positive_weight{});
             gumbel_key_for_indices_kernel<<<blocks, threads, 0, s>>>(
                 weights, d_indices, d_keys, sort_count, seed);
             LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.gumbel_keys_indices");
@@ -392,29 +631,82 @@ namespace lfs::training::mrnf_strategy {
         LFS_CUDA_CHECK_MSG(cudaGetLastError(), "MRNF Gumbel key generation");
 
         const int sort_count_int = static_cast<int>(sort_count);
-        cuda_scratch::CubWorkspace cub_workspace(
-            "cub::DeviceRadixSort::SortPairsDescending", s,
-            [&](void* workspace, size_t& workspace_bytes) {
-                return cub::DeviceRadixSort::SortPairsDescending(
-                    workspace, workspace_bytes,
-                    d_keys, d_keys_sorted,
-                    d_indices, d_indices_sorted,
-                    sort_count_int, 0, 32, s);
-            });
-        cub_workspace.run([&](void* workspace, size_t& workspace_bytes) {
+        auto sort_pairs = [&](void* workspace, size_t& workspace_bytes) {
             return cub::DeviceRadixSort::SortPairsDescending(
                 workspace, workspace_bytes,
                 d_keys, d_keys_sorted,
                 d_indices, d_indices_sorted,
                 sort_count_int, 0, 32, s);
-        });
+        };
 
-        LFS_CUDA_CHECK_MSG(
-            cudaMemcpyAsync(
-                output_indices, d_indices_sorted,
-                cuda_scratch::checked_bytes(K, sizeof(int64_t), "MRNF Gumbel output"),
-                cudaMemcpyDeviceToDevice, s),
-            "MRNF Gumbel output copy");
+        if (scratch) {
+            size_t workspace_bytes = 0;
+            LFS_CUDA_CHECK_MSG(sort_pairs(nullptr, workspace_bytes),
+                               "MRNF Gumbel CUB workspace query");
+            scratch->ensure_cub(workspace_bytes, lfs::core::Device::CUDA);
+            LFS_ASSERT_MSG(workspace_bytes == 0 ||
+                               (scratch->cub.is_valid() && scratch->cub_bytes >= workspace_bytes &&
+                                scratch->cub.data_ptr() != nullptr),
+                           lfs::core::detail::format_cuda_safe(
+                               "Gumbel CUB workspace must cover queried bytes (have={}, need={})",
+                               scratch->cub_bytes, workspace_bytes));
+            LFS_CUDA_CHECK_MSG(
+                sort_pairs(workspace_bytes == 0 ? nullptr : scratch->cub.data_ptr(),
+                           workspace_bytes),
+                "MRNF Gumbel CUB sort");
+        } else {
+            cuda_scratch::CubWorkspace cub_workspace(
+                "cub::DeviceRadixSort::SortPairsDescending", s, sort_pairs);
+            cub_workspace.run(sort_pairs);
+        }
+
+        const int output_blocks = static_cast<int>((K + threads - 1) / threads);
+        widen_gumbel_indices_kernel<<<output_blocks, threads, 0, s>>>(
+            d_indices_sorted, output_indices, K);
+        LFS_CUDA_LAUNCH_CHECK(s, "MRNF Gumbel uint32 output widening");
+    }
+
+    __global__ void far_field_mask_kernel(
+        const float* __restrict__ means,
+        float centroid_x,
+        float centroid_y,
+        float centroid_z,
+        float far_radius_sq,
+        bool* __restrict__ far_out,
+        size_t N) {
+
+        const size_t idx = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
+        if (idx >= N)
+            return;
+
+        const float dx = means[idx * 3 + 0] - centroid_x;
+        const float dy = means[idx * 3 + 1] - centroid_y;
+        const float dz = means[idx * 3 + 2] - centroid_z;
+        far_out[idx] = (dx * dx + dy * dy + dz * dz) > far_radius_sq;
+    }
+
+    void launch_far_field_mask(
+        const float* means,
+        float centroid_x,
+        float centroid_y,
+        float centroid_z,
+        float far_radius,
+        bool* far_out,
+        size_t N,
+        void* stream) {
+
+        if (N == 0)
+            return;
+        LFS_ASSERT(means != nullptr);
+        LFS_ASSERT(far_out != nullptr);
+
+        constexpr int threads = 256;
+        const int blocks = static_cast<int>((N + threads - 1) / threads);
+        cudaStream_t s = resolve_stream(stream);
+        const float far_radius_sq = far_radius * far_radius;
+        far_field_mask_kernel<<<blocks, threads, 0, s>>>(
+            means, centroid_x, centroid_y, centroid_z, far_radius_sq, far_out, N);
+        LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.far_field_mask");
     }
 
 } // namespace lfs::training::mrnf_strategy

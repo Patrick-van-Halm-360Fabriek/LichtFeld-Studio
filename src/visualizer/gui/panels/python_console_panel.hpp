@@ -16,6 +16,10 @@
 #include <thread>
 #include <vector>
 
+namespace lfs::vis {
+    struct FrameInputEvent;
+}
+
 namespace lfs::vis::editor {
     class PythonEditor;
 } // namespace lfs::vis::editor
@@ -38,19 +42,22 @@ namespace lfs::vis::gui::panels {
         void addError(const std::string& text);
         void addInfo(const std::string& text);
         void clear();
+        bool handleShortcut(const FrameInputEvent& event);
 
         void addToHistory(const std::string& cmd);
-        void historyUp();
-        void historyDown();
 
         terminal::TerminalWidget* getTerminal();
         terminal::TerminalWidget* getOutputTerminal();
         editor::PythonEditor* getEditor();
+        const editor::PythonEditor* getEditor() const;
         void setEditorText(const std::string& text);
         void focusEditor();
         [[nodiscard]] std::string getEditorText() const;
         [[nodiscard]] std::string getEditorTextStripped() const;
         [[nodiscard]] std::string getOutputText() const;
+
+        void setVisible(bool visible) { visible_.store(visible); }
+        bool outputVisible() const { return visible_.load() && active_tab_.load() == 0; }
 
         // Tab selection (0 = Output, 1 = Terminal)
         int getActiveTab() const { return active_tab_; }
@@ -71,6 +78,10 @@ namespace lfs::vis::gui::panels {
         void increaseFontScale();
         void decreaseFontScale();
         void resetFontScale() { font_scale_ = 1.0f; }
+        void setFontScale(float scale);
+
+        [[nodiscard]] static float splitterRatio();
+        static void setSplitterRatio(float ratio);
 
         // Script execution
         bool isScriptRunning() const { return script_running_.load(); }
@@ -89,7 +100,8 @@ namespace lfs::vis::gui::panels {
         std::unique_ptr<terminal::TerminalWidget> terminal_;
         std::unique_ptr<terminal::TerminalWidget> output_terminal_;
         std::unique_ptr<editor::PythonEditor> editor_;
-        int active_tab_ = 0;
+        std::atomic<int> active_tab_{0};
+        std::atomic<bool> visible_{false};
         bool terminal_focused_ = false;
 
         // Script file tracking

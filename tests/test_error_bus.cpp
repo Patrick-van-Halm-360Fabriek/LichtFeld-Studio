@@ -5,6 +5,7 @@
 #include "core/error_bus.hpp"
 #include "core/error_codes.hpp"
 #include "core/error_reporter.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/frame_state_machine.hpp"
 #include "core/modal_request.hpp"
@@ -256,6 +257,45 @@ TEST(ErrorEventBridgeTest, TrainingOomMapsToResourceExhausted) {
     EXPECT_EQ(notification->error.code(), lfs::ErrorCode::ResourceExhausted);
 }
 
+// Fails if a training run whose project save ran out of disk space surfaces as GPU OOM instead of being
+// left to the disk-space dialog (also when only the error text survives), if another ResourceExhausted IO
+// error is mistaken for a full disk, or if a real GPU OOM stops reaching the error modal.
+TEST(ErrorEventBridgeTest, ProjectDiskSpaceFailureIsNotGpuOom) {
+    lfs::core::events::state::TrainingCompleted disk{};
+    disk.success = false;
+    disk.user_stopped = false;
+    disk.resource_exhausted = true;
+    disk.error = "There is not enough disk space to save the project.";
+    disk.error_info = lfs::core::WireError{.code = lfs::to_string(lfs::ErrorCode::ResourceExhausted),
+                                           .domain = lfs::to_string(lfs::ErrorDomain::IO),
+                                           .message = *disk.error};
+    const auto disk_space = lfs::vis::gui::projectDiskSpaceFailure(disk);
+    ASSERT_TRUE(disk_space.has_value());
+    EXPECT_TRUE(disk_space->is_project_save);
+    EXPECT_EQ(disk_space->error, *disk.error);
+    EXPECT_FALSE(lfs::vis::gui::translateTrainingCompleted(disk).has_value());
+
+    auto text_only = disk;
+    text_only.error_info.reset();
+    const auto text_only_disk_space = lfs::vis::gui::projectDiskSpaceFailure(text_only);
+    ASSERT_TRUE(text_only_disk_space.has_value());
+    EXPECT_EQ(text_only_disk_space->error, *disk.error);
+
+    auto host_memory = disk;
+    host_memory.error = "Not enough memory to load the geometry.";
+    host_memory.error_info->message = *host_memory.error;
+    EXPECT_FALSE(lfs::vis::gui::projectDiskSpaceFailure(host_memory).has_value());
+
+    auto gpu = disk;
+    gpu.error = "out of memory (12.0 GB)";
+    gpu.error_info->domain = lfs::to_string(lfs::ErrorDomain::Training);
+    gpu.error_info->message = *gpu.error;
+    EXPECT_FALSE(lfs::vis::gui::projectDiskSpaceFailure(gpu).has_value());
+    const auto notification = lfs::vis::gui::translateTrainingCompleted(gpu);
+    ASSERT_TRUE(notification.has_value());
+    EXPECT_EQ(notification->error.code(), lfs::ErrorCode::ResourceExhausted);
+}
+
 TEST(ErrorEventBridgeTest, TrainingSuccessDoesNotSurface) {
     lfs::core::events::state::TrainingCompleted success{};
     success.success = true;
@@ -271,7 +311,6 @@ TEST(ErrorEventBridgeTest, DiskSpaceCaseIsLeftToNativeHandler) {
 
     lfs::core::events::state::DiskSpaceSaveFailed other{};
     other.is_disk_space_error = false;
-    other.is_checkpoint = true;
     other.error = "write failed";
     const auto notification = lfs::vis::gui::translateDiskSpaceSaveFailed(other);
     ASSERT_TRUE(notification.has_value());
@@ -666,6 +705,83 @@ TEST(GuiErrorConsumerTest, RenderFrameOomMapsToGpuMemoryTitle) {
     EXPECT_EQ(modal->title, std::string(lichtfeld::Strings::ErrorModal::OUT_OF_GPU_MEMORY));
 }
 
+namespace {
+
+    std::string consumerTitle(const lfs::Error& error,
+                              const lfs::ErrorSurface surface = lfs::ErrorSurface::Modal) {
+        std::optional<lfs::core::ModalRequest> modal;
+        std::optional<lfs::vis::gui::ToastRequest> toast;
+        lfs::vis::gui::GuiErrorConsumer consumer(lfs::vis::gui::GuiErrorConsumer::Sinks{
+            .modal = [&](lfs::core::ModalRequest r) { modal = std::move(r); },
+            .toast = [&](lfs::vis::gui::ToastRequest r) { toast = std::move(r); },
+            .status = {}});
+        consumer.on_error(consumerNotification(error, surface), lfs::ErrorDeliveryInfo{});
+        if (surface == lfs::ErrorSurface::Toast) {
+            return toast ? toast->title : std::string{};
+        }
+        return modal ? modal->title : std::string{};
+    }
+
+} // namespace
+
+TEST(GuiErrorConsumerTest, AppSaveMapsToSaveFailedTitle) {
+    EXPECT_EQ(consumerTitle(makeError(lfs::ErrorCode::Unavailable, lfs::ErrorDomain::App, "save",
+                                      lfs::vis::gui::error_op::kSave)),
+              std::string(lichtfeld::Strings::ErrorModal::SAVE_FAILED));
+}
+
+TEST(GuiErrorConsumerTest, AppOpenProjectMapsToFileOpenFailedTitle) {
+    EXPECT_EQ(consumerTitle(makeError(lfs::ErrorCode::NotFound, lfs::ErrorDomain::App, "open",
+                                      lfs::vis::gui::error_op::kOpenProject)),
+              std::string(lichtfeld::Strings::ErrorModal::FILE_OPEN_FAILED));
+}
+
+TEST(GuiErrorConsumerTest, AppLoadConfigStillInvalidConfig) {
+    EXPECT_EQ(consumerTitle(makeError(lfs::ErrorCode::InvalidArgument, lfs::ErrorDomain::App,
+                                      "config", lfs::vis::gui::error_op::kLoadConfig)),
+              std::string(lichtfeld::Strings::ErrorModal::CONFIG_INVALID));
+}
+
+TEST(GuiErrorConsumerTest, IoSaveMapsToSaveFailedTitle) {
+    EXPECT_EQ(consumerTitle(makeError(lfs::ErrorCode::Unavailable, lfs::ErrorDomain::IO, "save",
+                                      lfs::vis::gui::error_op::kSave)),
+              std::string(lichtfeld::Strings::ErrorModal::SAVE_FAILED));
+}
+
+TEST(GuiErrorConsumerTest, IoOpenProjectMapsToFileOpenFailedTitle) {
+    EXPECT_EQ(consumerTitle(makeError(lfs::ErrorCode::NotFound, lfs::ErrorDomain::IO, "open",
+                                      lfs::vis::gui::error_op::kOpenProject)),
+              std::string(lichtfeld::Strings::ErrorModal::FILE_OPEN_FAILED));
+}
+
+TEST(GuiErrorConsumerTest, IoResourceExhaustedSaveIsNotGpuOom) {
+    EXPECT_EQ(consumerTitle(makeError(lfs::ErrorCode::ResourceExhausted, lfs::ErrorDomain::IO,
+                                      "disk full", lfs::vis::gui::error_op::kSave)),
+              std::string(lichtfeld::Strings::ErrorModal::SAVE_FAILED));
+    EXPECT_NE(consumerTitle(makeError(lfs::ErrorCode::ResourceExhausted, lfs::ErrorDomain::IO,
+                                      "disk full", lfs::vis::gui::error_op::kSave)),
+              std::string(lichtfeld::Strings::ErrorModal::OUT_OF_GPU_MEMORY));
+}
+
+TEST(GuiErrorConsumerTest, TrainingResourceExhaustedStillGpuOom) {
+    EXPECT_EQ(consumerTitle(makeError(lfs::ErrorCode::ResourceExhausted, lfs::ErrorDomain::Training,
+                                      "vram")),
+              std::string(lichtfeld::Strings::ErrorModal::OUT_OF_GPU_MEMORY));
+}
+
+TEST(GuiErrorConsumerTest, AsyncAndSyncSaveShareSaveFailedTitle) {
+    const auto sync_preflight =
+        makeError(lfs::ErrorCode::FailedPrecondition, lfs::ErrorDomain::App, "no path",
+                  lfs::vis::gui::error_op::kSave);
+    const auto async_worker =
+        makeError(lfs::ErrorCode::ResourceExhausted, lfs::ErrorDomain::IO, "ENOSPC",
+                  lfs::vis::gui::error_op::kSave);
+    const std::string sync_title = consumerTitle(sync_preflight, lfs::ErrorSurface::Toast);
+    const std::string async_title = consumerTitle(async_worker, lfs::ErrorSurface::Toast);
+    EXPECT_EQ(sync_title, async_title);
+    EXPECT_EQ(sync_title, std::string(lichtfeld::Strings::ErrorModal::SAVE_FAILED));
+}
+
 using lfs::vis::FrameFault;
 using lfs::vis::FrameStateMachine;
 using lfs::vis::RendererTerminalState;
@@ -857,4 +973,88 @@ TEST(FrameStateMachineTest, CustomLimits) {
     const auto first_internal = n.on_fault(FrameFault::RendererInternal);
     EXPECT_TRUE(first_internal.publish_internal_modal);
     EXPECT_TRUE(n.scene_render_suspended());
+}
+
+TEST(GuiErrorConsumerTest, CameraGuidanceResolvesAtPresentationTime) {
+    auto& locale = lfs::event::LocalizationManager::getInstance();
+    for (const auto* key : {"messages.err_distorted_images", "messages.err_non_pinhole"}) {
+        const auto error = lfs::make_error(lfs::ErrorInit{
+            .code = lfs::ErrorCode::InvalidArgument,
+            .domain = lfs::ErrorDomain::Training,
+            .user_message = "Readable English guidance",
+            .detection = LFS_SOURCE_SITE_CURRENT(),
+            .fields = lfs::SmallFields{}.add("message_key", std::string_view(key)),
+        });
+        std::optional<lfs::core::ModalRequest> modal;
+        std::optional<lfs::vis::gui::ToastRequest> toast;
+        std::string status;
+        lfs::vis::gui::GuiErrorConsumer consumer({
+            .modal = [&](lfs::core::ModalRequest request) { modal = std::move(request); },
+            .toast = [&](lfs::vis::gui::ToastRequest request) { toast = std::move(request); },
+            .status = [&](std::string text, lfs::vis::gui::ErrorNoticeLevel) { status = std::move(text); },
+        });
+        for (const auto* translated : {"Aktivieren Sie GUT im Trainingspanel.", "Activez GUT dans le panneau Entraînement."}) {
+            locale.setOverride(key, translated);
+            consumer.on_error(consumerNotification(error, lfs::ErrorSurface::Modal), {});
+            EXPECT_TRUE(modal.has_value());
+            if (modal) {
+                EXPECT_NE(modal->body_rml.find(translated), std::string::npos);
+                EXPECT_EQ(modal->body_rml.find(key), std::string::npos);
+            }
+            consumer.on_error(consumerNotification(error, lfs::ErrorSurface::Toast), {});
+            ASSERT_TRUE(toast.has_value());
+            EXPECT_EQ(toast->message, translated);
+            consumer.on_error(consumerNotification(error, lfs::ErrorSurface::StatusOnly), {});
+            EXPECT_EQ(status, translated);
+            EXPECT_EQ(error.user_message(), "Readable English guidance");
+        }
+        locale.clearOverride(key);
+    }
+}
+
+TEST(GuiErrorConsumerTest, MissingUnknownOrNonStringKeyKeepsEnglishMessage) {
+    for (const auto& fields : {lfs::SmallFields{},
+                               lfs::SmallFields{}.add("message_key", std::string_view("unknown.key")),
+                               lfs::SmallFields{}.add("message_key", true)}) {
+        const auto error = lfs::make_error(lfs::ErrorInit{
+            .code = lfs::ErrorCode::InvalidArgument,
+            .domain = lfs::ErrorDomain::Training,
+            .user_message = "Readable English guidance",
+            .detection = LFS_SOURCE_SITE_CURRENT(),
+            .fields = fields,
+        });
+        std::string status;
+        lfs::vis::gui::GuiErrorConsumer consumer({
+            .modal = {},
+            .toast = {},
+            .status = [&](std::string text, lfs::vis::gui::ErrorNoticeLevel) { status = std::move(text); },
+        });
+        consumer.on_error(consumerNotification(error, lfs::ErrorSurface::StatusOnly), {});
+        EXPECT_EQ(status, error.user_message());
+    }
+}
+
+TEST(ErrorEventBridgeTest, CameraGuidanceKeepsEnglishAndLocalizesAtPresentationTime) {
+    auto& locale = lfs::event::LocalizationManager::getInstance();
+    for (const auto* key : {"messages.err_distorted_images", "messages.err_non_pinhole"}) {
+        lfs::core::events::state::TrainingCompleted event{};
+        event.error = "Readable English guidance";
+        event.error_message_key = key;
+        const auto notification = lfs::vis::gui::translateTrainingCompleted(event);
+        ASSERT_TRUE(notification.has_value());
+        EXPECT_EQ(notification->error.user_message(), *event.error);
+        EXPECT_EQ(lfs::format_for_developer(notification->error).find(key), std::string::npos);
+        std::optional<lfs::core::ModalRequest> modal;
+        lfs::vis::gui::GuiErrorConsumer consumer({
+            .modal = [&](lfs::core::ModalRequest request) { modal = std::move(request); },
+            .toast = {},
+            .status = {},
+        });
+        locale.setOverride(key, "Aktivieren Sie GUT im Trainingspanel.");
+        consumer.on_error(*notification, {});
+        locale.clearOverride(key);
+        ASSERT_TRUE(modal.has_value());
+        EXPECT_NE(modal->body_rml.find("Aktivieren Sie GUT im Trainingspanel."), std::string::npos);
+        EXPECT_EQ(modal->body_rml.find(key), std::string::npos);
+    }
 }

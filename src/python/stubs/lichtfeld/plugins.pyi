@@ -8,7 +8,7 @@ API_VERSION: str = '1.0'
 FEATURES: list = ...
 
 def discover() -> object:
-    """Discover plugins in ~/.lichtfeld/plugins/"""
+    """Discover plugins in the resolved user plugin directory"""
 
 def load(name: str) -> bool:
     """Load plugin"""
@@ -80,6 +80,9 @@ def list_capabilities() -> list:
 
 def settings(plugin_name: str) -> object:
     """Get settings object for a plugin"""
+
+def data_dir(plugin_name: str) -> str:
+    """Return the plugin's durable data directory, creating it if missing"""
 
 def create(name: str) -> str:
     """Create a new plugin from template (returns path to created plugin)"""

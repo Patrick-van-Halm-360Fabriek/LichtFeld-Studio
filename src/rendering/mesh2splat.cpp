@@ -1100,7 +1100,7 @@ void main() {
                 VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
                 submit.commandBufferCount = 1;
                 submit.pCommandBuffers = &cmd;
-                result = vkQueueSubmit(queue_, 1, &submit, fence);
+                result = lfs::rendering::vk_queue_submit_synced(queue_, 1, &submit, fence);
                 if (result != VK_SUCCESS) {
                     // Submit never accepted — fence is not in flight; free OK.
                     vkDestroyFence(device_, fence, nullptr);
@@ -1277,7 +1277,7 @@ void main() {
                 // After DeviceWaitIdle, retained quarantine fences are safe to
                 // destroy (GPU has finished). CBs free with the command pool.
                 if (device_)
-                    vkDeviceWaitIdle(device_);
+                    lfs::rendering::vk_device_wait_idle_synced(device_);
                 for (VkFence fence : retained_fences_) {
                     if (fence != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
                         vkDestroyFence(device_, fence, nullptr);
@@ -1314,9 +1314,11 @@ void main() {
             mutable std::vector<VkCommandBuffer> retained_command_buffers_{};
         };
 
+        // Never destroyed: the Vulkan driver registers its own exit handlers after this context is first used, so
+        // they run first and a destructor at exit would call into a shut-down driver. The process releases the device.
         VulkanMesh2SplatContext& vulkan_context() {
-            static VulkanMesh2SplatContext context;
-            return context;
+            static auto* const context = new VulkanMesh2SplatContext;
+            return *context;
         }
 
         [[nodiscard]] std::optional<std::string> map_write(VkDevice device, Buffer& buffer, const void* data, VkDeviceSize size) {

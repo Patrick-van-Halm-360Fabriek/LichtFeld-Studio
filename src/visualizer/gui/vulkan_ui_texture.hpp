@@ -7,6 +7,7 @@
 #include "core/export.hpp"
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace lfs::core {
@@ -42,6 +43,17 @@ namespace lfs::vis::gui {
                                         int width,
                                         int height,
                                         int channels);
+        struct Region {
+            const std::uint8_t* pixels = nullptr;
+            int texture_width = 0;
+            int texture_height = 0;
+            int x = 0;
+            int y = 0;
+            int width = 0;
+            int height = 0;
+            int channels = 0;
+        };
+        [[nodiscard]] bool uploadRegions(std::span<const Region> regions);
         // flip_y: vertically mirror the image during upload. Set when the source tensor uses the
         // rasterizer's OpenGL (bottom-left origin) convention but the Vulkan view samples
         // top-left, e.g., the sequencer's RmlUi-bound preview textures.
@@ -51,10 +63,10 @@ namespace lfs::vis::gui {
                                   bool flip_y = false);
         [[nodiscard]] std::uintptr_t textureId() const;
         [[nodiscard]] bool valid() const;
-        // Build a Rml::Image src URL referencing this texture's image view and sampler.
-        // The returned URL is stable as long as the underlying VkImage is not torn down
-        // (a same-size re-upload preserves the view; a resize destroys and recreates it).
-        [[nodiscard]] std::string rmlSrcUrl(int width, int height) const;
+        // Cached Rml::Image source, unique to this image lifetime even if handles are recycled.
+        // Same-size uploads preserve it. The reference is borrowed until the image lifetime
+        // or requested display dimensions change; copy it if it must outlive those changes.
+        [[nodiscard]] const std::string& rmlSrcUrl(int width, int height) const;
         void reset();
 
     private:

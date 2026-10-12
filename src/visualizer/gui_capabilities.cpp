@@ -8,9 +8,12 @@
 
 #include "core/cuda/sh_layout.cuh"
 #include "core/events.hpp"
+#include "core/logger.hpp"
 #include "core/mesh_data.hpp"
 #include "core/point_cloud.hpp"
 #include "core/splat_data_transform.hpp"
+#include "lfs/training/live_model_mutation_guard.hpp"
+#include "lfs/training/sh_value_storage.hpp"
 #include "operation/undo_entry.hpp"
 #include "operation/undo_history.hpp"
 #include "rendering/rendering_manager.hpp"
@@ -18,6 +21,7 @@
 #include "visualizer/scene_coordinate_utils.hpp"
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/euler_angles.hpp>
@@ -35,6 +39,20 @@ namespace lfs::vis::cap {
                type == core::NodeType::CROPBOX ||
                type == core::NodeType::ELLIPSOID ||
                type == core::NodeType::MESH;
+    }
+
+    bool isAlignTransformTargetType(const core::NodeType type) {
+        switch (type) {
+        case core::NodeType::SPLAT:
+        case core::NodeType::POINTCLOUD:
+        case core::NodeType::GROUP:
+        case core::NodeType::PLY_SEQUENCE:
+        case core::NodeType::DATASET:
+        case core::NodeType::MESH:
+            return true;
+        default:
+            return false;
+        }
     }
 
     namespace {
@@ -72,15 +90,19 @@ namespace lfs::vis::cap {
 
         [[nodiscard]] bool has_significant_rotation(const glm::mat4& transform) {
             glm::mat3 rotation(transform);
-            glm::vec3 scale;
-            if (!normalize_rotation_basis(rotation[0], rotation[1], rotation[2], scale))
-                return true;
-
-            const glm::quat q = glm::quat_cast(rotation);
-            return std::abs(std::abs(q.w) - 1.0f) > kTransformEpsilon ||
-                   std::abs(q.x) > kTransformEpsilon ||
-                   std::abs(q.y) > kTransformEpsilon ||
-                   std::abs(q.z) > kTransformEpsilon;
+            for (int column = 0; column < 3; ++column) {
+                const float scale = glm::length(rotation[column]);
+                if (scale <= 1e-8f)
+                    return false; // Native SH skips a degenerate basis.
+                rotation[column] /= scale;
+            }
+            // SH directions retain shear and reflection. The decomposition
+            // helper removes reflection signs and cannot decide this branch.
+            for (int column = 0; column < 3; ++column)
+                for (int row = 0; row < 3; ++row)
+                    if (std::abs(rotation[column][row] - (column == row ? 1.0f : 0.0f)) > kTransformEpsilon)
+                        return true;
+            return false;
         }
 
         [[nodiscard]] std::string crop_volume_shape_label(const CropVolumeShape shape) {
@@ -186,7 +208,7 @@ namespace lfs::vis::cap {
 
             scene.notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
             if (rendering_manager)
-                rendering_manager->markDirty(DirtyFlag::SPLATS | DirtyFlag::OVERLAY);
+                rendering_manager->markDirty(DirtyFlag::SPLATS | DirtyFlag::OVERLAY, lfs::vis::FrameReason::SceneChange);
             sync_crop_volume_render_settings(rendering_manager, *node, target_shape);
 
             vis::op::undoHistory().push(std::make_unique<vis::op::SceneGraphPatchEntry>(
@@ -221,7 +243,7 @@ namespace lfs::vis::cap {
             scene.removeNode(remove_name, false);
             scene.notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
             if (rendering_manager)
-                rendering_manager->markDirty(DirtyFlag::SPLATS | DirtyFlag::OVERLAY);
+                rendering_manager->markDirty(DirtyFlag::SPLATS | DirtyFlag::OVERLAY, lfs::vis::FrameReason::SceneChange);
 
             if (const auto* const updated_keep = scene.getNodeById(keep_id))
                 sync_crop_volume_render_settings(rendering_manager, *updated_keep, keep_shape);
@@ -305,51 +327,29 @@ namespace lfs::vis::cap {
             mesh.mark_dirty();
         }
 
-        [[nodiscard]] std::expected<void, std::string> copy_tensor_preserving_storage(core::Tensor& dst,
-                                                                                      const core::Tensor& src,
-                                                                                      const std::string_view name) {
+        lfs::Error bake_error(const lfs::ErrorCode code, std::string message) {
+            return lfs::make_error(lfs::ErrorInit{
+                .code = code,
+                .domain = lfs::ErrorDomain::App,
+                .severity = lfs::Severity::Error,
+                .retryability = lfs::Retryability::NotRetryable,
+                .operation_id = {},
+                .user_message = message,
+                .detail = std::move(message),
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+                .fields = {},
+                .native = std::nullopt,
+            });
+        }
+
+        [[nodiscard]] lfs::Result<void> copy_tensor_preserving_storage(core::Tensor& dst,
+                                                                       const core::Tensor& src,
+                                                                       const std::string_view name) {
             if (dst.shape() != src.shape()) {
-                return std::unexpected("Bake produced incompatible " + std::string(name) + " tensor shape");
+                return lfs::Result<void>::failure(bake_error(lfs::ErrorCode::Internal, "Bake produced incompatible " + std::string(name) + " tensor shape"));
             }
 
             dst.copy_from(src);
-            return {};
-        }
-
-        [[nodiscard]] std::expected<void, std::string> bake_splat_transform_preserving_storage(
-            core::SplatData& model,
-            const glm::mat4& transform) {
-            try {
-                core::SplatData transformed(
-                    model.get_max_sh_degree(),
-                    model.means_raw().clone(),
-                    model.sh0_raw().clone(),
-                    model.shN_raw().is_valid() ? model.shN_raw().clone() : core::Tensor{},
-                    model.scaling_raw().clone(),
-                    model.rotation_raw().clone(),
-                    model.opacity_raw().clone(),
-                    model.get_scene_scale(),
-                    core::SplatData::ShNLayout::Swizzled);
-                transformed.set_active_sh_degree(model.get_active_sh_degree());
-
-                core::transform(transformed, transform);
-
-                if (auto result = copy_tensor_preserving_storage(model.means_raw(), transformed.means_raw(), "means"); !result)
-                    return result;
-                if (auto result = copy_tensor_preserving_storage(model.scaling_raw(), transformed.scaling_raw(), "scaling"); !result)
-                    return result;
-                if (auto result = copy_tensor_preserving_storage(model.rotation_raw(), transformed.rotation_raw(), "rotation"); !result)
-                    return result;
-                if (model.shN_raw().is_valid() && transformed.shN_raw().is_valid()) {
-                    if (auto result = copy_tensor_preserving_storage(model.shN_raw(), transformed.shN_raw(), "shN"); !result)
-                        return result;
-                }
-
-                model.set_scene_scale(transformed.get_scene_scale());
-            } catch (const std::exception& exc) {
-                return std::unexpected(std::string("Failed to bake splat transform: ") + exc.what());
-            }
-
             return {};
         }
 
@@ -515,7 +515,7 @@ namespace lfs::vis::cap {
                     continue;
                 }
 
-                if (static_cast<bool>(node->locked)) {
+                if (scene_manager.getScene().isNodeEffectivelyLocked(node->id)) {
                     selection.found_locked = true;
                     continue;
                 }
@@ -612,11 +612,54 @@ namespace lfs::vis::cap {
                                                                         const glm::mat4& visualizer_world_transform) {
             const auto local_transform =
                 scene_coords::nodeLocalTransformFromVisualizerWorld(scene_manager.getScene(), name, visualizer_world_transform);
-            if (!local_transform)
-                return std::unexpected("Node not found: " + name);
+            if (!local_transform) {
+                if (!scene_manager.getScene().getNode(name))
+                    return std::unexpected("Node not found: " + name);
+                return std::unexpected(
+                    "Cannot transform '" + name + "': parent transform cannot preserve a finite world transform");
+            }
 
-            scene_manager.setNodeTransform(name, *local_transform);
+            if (!scene_manager.setNodeTransform(name, *local_transform))
+                return std::unexpected("Cannot transform '" + name + "': node is locked");
             return {};
+        }
+
+        std::vector<std::string> top_level_transform_targets(
+            const core::Scene& scene,
+            const std::vector<std::string>& targets) {
+            std::unordered_set<core::NodeId> selected_ids;
+            selected_ids.reserve(targets.size());
+            for (const auto& name : targets) {
+                if (const auto* const node = scene.getNode(name))
+                    selected_ids.insert(node->id);
+            }
+
+            std::vector<std::string> top_level_names;
+            top_level_names.reserve(targets.size());
+            std::unordered_set<core::NodeId> emitted_ids;
+            emitted_ids.reserve(targets.size());
+            for (const auto& name : targets) {
+                const auto* const node = scene.getNode(name);
+                if (!node) {
+                    top_level_names.push_back(name);
+                    continue;
+                }
+                if (!emitted_ids.insert(node->id).second)
+                    continue;
+
+                bool ancestor_selected = false;
+                for (core::NodeId parent_id = node->parent_id; parent_id != core::NULL_NODE;) {
+                    if (selected_ids.contains(parent_id)) {
+                        ancestor_selected = true;
+                        break;
+                    }
+                    const auto* const parent = scene.getNodeById(parent_id);
+                    parent_id = parent ? parent->parent_id : core::NULL_NODE;
+                }
+                if (!ancestor_selected)
+                    top_level_names.push_back(name);
+            }
+            return top_level_names;
         }
 
         core::NodeId find_attached_child_node(const core::Scene& scene,
@@ -639,6 +682,69 @@ namespace lfs::vis::cap {
         }
 
     } // namespace
+
+    lfs::Result<void> bakeSplatTransformPreservingStorage(
+        core::SplatData& model,
+        const glm::mat4& transform) {
+        try {
+            const bool sh_f16_storage = model.shN_raw().is_valid() &&
+                                        model.shN_raw().dtype() == core::DataType::Float16; // q16 or IEEE-f16
+            const bool rotates_sh = has_significant_rotation(transform);
+
+            core::SplatData transformed(
+                model.get_max_sh_degree(),
+                model.means_raw().clone(),
+                model.sh0_raw().clone(),
+                sh_f16_storage
+                    ? (rotates_sh ? model.shN_canonical() : core::Tensor{})
+                    : (model.shN_raw().is_valid() ? model.shN_raw().clone() : core::Tensor{}),
+                model.scaling_raw().clone(),
+                model.rotation_raw().clone(),
+                model.opacity_raw().clone(),
+                model.get_scene_scale(),
+                (sh_f16_storage && rotates_sh)
+                    ? core::SplatData::ShNLayout::Canonical
+                    : core::SplatData::ShNLayout::Swizzled);
+            transformed.set_active_sh_degree(model.get_active_sh_degree());
+
+            core::transform(transformed, transform);
+
+            if (auto result = copy_tensor_preserving_storage(model.means_raw(), transformed.means_raw(), "means"); !result)
+                return result;
+            if (auto result = copy_tensor_preserving_storage(model.scaling_raw(), transformed.scaling_raw(), "scaling"); !result)
+                return result;
+            if (auto result = copy_tensor_preserving_storage(model.rotation_raw(), transformed.rotation_raw(), "rotation"); !result)
+                return result;
+            if (rotates_sh) {
+                if (auto result = copy_tensor_preserving_storage(model.sh0_raw(), transformed.sh0_raw(), "sh0"); !result)
+                    return result;
+            }
+            if (sh_f16_storage && rotates_sh) {
+                lfs::training::LiveModelMutationGuard mutation_scope("transform.bake");
+                const bool expanded = lfs::training::sh_value::ensure_shN_fp32_for_mutation(model);
+                lfs::training::sh_value::ShNCommitGuard commit_guard(model, expanded, "transform.bake");
+                if (!expanded)
+                    return lfs::Result<void>::failure(bake_error(lfs::ErrorCode::FailedPrecondition, "Bake could not expand quantized shN for mutation"));
+                if (auto result = copy_tensor_preserving_storage(model.shN_raw(), transformed.shN_raw(), "shN"); !result)
+                    return result;
+                lfs::training::sh_value::commit_shN_after_mutation(model);
+                if (model.has_tensor_allocator() && !lfs::io::splatTensorsRendererReady(model)) {
+                    LOG_WARN("transform.bake: shN storage left renderer-degraded after bake");
+                }
+            } else if (!sh_f16_storage && model.shN_raw().is_valid() &&
+                       transformed.shN_raw().is_valid()) {
+                if (auto result = copy_tensor_preserving_storage(model.shN_raw(), transformed.shN_raw(), "shN"); !result)
+                    return result;
+            }
+
+            model.set_scene_scale(transformed.get_scene_scale());
+        } catch (const std::exception& exc) {
+            // LFS-CENSUS-OK(empty-catch): bake exceptions are converted to a typed error.
+            return lfs::Result<void>::failure(bake_error(lfs::ErrorCode::Internal, std::string("Failed to bake splat transform: ") + exc.what()));
+        }
+
+        return {};
+    }
 
     TransformComponents decomposeTransform(const glm::mat4& matrix) {
         TransformComponents result;
@@ -789,23 +895,40 @@ namespace lfs::vis::cap {
         if (!translation && !rotation && !scale)
             return std::unexpected("At least one transform component must be provided");
 
+        const auto transform_targets = top_level_transform_targets(scene_manager.getScene(), targets);
         auto entry = std::make_unique<vis::op::SceneSnapshot>(scene_manager, std::string(undo_label));
-        entry->captureTransforms(targets);
+        entry->captureTransforms(transform_targets);
 
-        for (const auto& name : targets) {
+        for (const auto& name : transform_targets) {
             const auto world_transform = scene_coords::nodeVisualizerWorldTransform(scene_manager.getScene(), name);
             if (!world_transform)
                 return std::unexpected("Node not found: " + name);
 
             auto components = decomposeTransform(*world_transform);
+            glm::mat4 updated_transform = *world_transform;
+            if (rotation) {
+                const glm::mat3 current_rotation(glm::eulerAngleXYZ(
+                    components.rotation.x, components.rotation.y, components.rotation.z));
+                const glm::mat3 target_rotation(glm::eulerAngleXYZ(rotation->x, rotation->y, rotation->z));
+                const glm::mat3 rotation_delta = target_rotation * glm::transpose(current_rotation);
+                for (int column = 0; column < 3; ++column) {
+                    const glm::vec3 basis = rotation_delta * glm::vec3(updated_transform[column]);
+                    updated_transform[column] = glm::vec4(basis, 0.0f);
+                }
+            }
+            if (scale) {
+                const glm::vec3 factors(
+                    std::abs(components.scale.x) > 1e-12f ? scale->x / components.scale.x : 1.0f,
+                    std::abs(components.scale.y) > 1e-12f ? scale->y / components.scale.y : 1.0f,
+                    std::abs(components.scale.z) > 1e-12f ? scale->z / components.scale.z : 1.0f);
+                updated_transform[0] = glm::vec4(glm::vec3(updated_transform[0]) * factors.x, 0.0f);
+                updated_transform[1] = glm::vec4(glm::vec3(updated_transform[1]) * factors.y, 0.0f);
+                updated_transform[2] = glm::vec4(glm::vec3(updated_transform[2]) * factors.z, 0.0f);
+            }
             if (translation)
-                components.translation = *translation;
-            if (rotation)
-                components.rotation = *rotation;
-            if (scale)
-                components.scale = *scale;
+                updated_transform[3] = glm::vec4(*translation, 1.0f);
 
-            if (auto result = set_visualizer_world_transform(scene_manager, name, composeTransform(components)); !result)
+            if (auto result = set_visualizer_world_transform(scene_manager, name, updated_transform); !result)
                 return result;
         }
 
@@ -821,11 +944,22 @@ namespace lfs::vis::cap {
         if (targets.empty())
             return std::unexpected("No transform targets provided");
 
+        const auto transform_targets = top_level_transform_targets(scene_manager.getScene(), targets);
         auto entry = std::make_unique<vis::op::SceneSnapshot>(scene_manager, std::string(undo_label));
-        entry->captureTransforms(targets);
+        entry->captureTransforms(transform_targets);
 
-        for (const auto& name : targets)
-            scene_manager.setNodeTransform(name, transform);
+        for (const auto& name : transform_targets) {
+            const auto* node = scene_manager.getScene().getNode(name);
+            if (!node)
+                return std::unexpected(std::format("Cannot transform '{}': node not found", name));
+            if (scene_manager.getScene().isNodeEffectivelyLocked(node->id))
+                return std::unexpected(std::format("Cannot transform '{}': node is locked", name));
+        }
+
+        for (const auto& name : transform_targets) {
+            if (!scene_manager.setNodeTransform(name, transform))
+                return std::unexpected(std::format("Cannot transform '{}': node is locked", name));
+        }
 
         entry->captureAfter();
         vis::op::pushSceneSnapshotIfChanged(std::move(entry));
@@ -839,10 +973,11 @@ namespace lfs::vis::cap {
         if (targets.empty())
             return std::unexpected("No transform targets provided");
 
+        const auto transform_targets = top_level_transform_targets(scene_manager.getScene(), targets);
         auto entry = std::make_unique<vis::op::SceneSnapshot>(scene_manager, std::string(undo_label));
-        entry->captureTransforms(targets);
+        entry->captureTransforms(transform_targets);
 
-        for (const auto& name : targets) {
+        for (const auto& name : transform_targets) {
             const auto world_transform = scene_coords::nodeVisualizerWorldTransform(scene_manager.getScene(), name);
             if (!world_transform)
                 return std::unexpected("Node not found: " + name);
@@ -865,11 +1000,12 @@ namespace lfs::vis::cap {
         if (targets.empty())
             return std::unexpected("No transform targets provided");
 
+        const auto transform_targets = top_level_transform_targets(scene_manager.getScene(), targets);
         auto entry = std::make_unique<vis::op::SceneSnapshot>(scene_manager, std::string(undo_label));
-        entry->captureTransforms(targets);
+        entry->captureTransforms(transform_targets);
 
         const glm::mat4 rotation_delta = glm::eulerAngleXYZ(value.x, value.y, value.z);
-        for (const auto& name : targets) {
+        for (const auto& name : transform_targets) {
             const auto world_transform = scene_coords::nodeVisualizerWorldTransform(scene_manager.getScene(), name);
             if (!world_transform)
                 return std::unexpected("Node not found: " + name);
@@ -894,18 +1030,33 @@ namespace lfs::vis::cap {
                                                 const std::string_view undo_label) {
         if (targets.empty())
             return std::unexpected("No transform targets provided");
+        const bool identity_scale = value == glm::vec3(1.0f);
+        if (identity_scale) {
+            for (const auto& name : targets) {
+                const auto* const node = scene_manager.getScene().getNode(name);
+                if (!node)
+                    return std::unexpected("Node not found: " + name);
+                if (scene_manager.getScene().isNodeEffectivelyLocked(node->id))
+                    return std::unexpected("Cannot transform '" + name + "': node is locked");
+            }
+            return {};
+        }
 
+        const auto transform_targets = top_level_transform_targets(scene_manager.getScene(), targets);
         auto entry = std::make_unique<vis::op::SceneSnapshot>(scene_manager, std::string(undo_label));
-        entry->captureTransforms(targets);
+        entry->captureTransforms(transform_targets);
 
-        for (const auto& name : targets) {
+        for (const auto& name : transform_targets) {
             const auto world_transform = scene_coords::nodeVisualizerWorldTransform(scene_manager.getScene(), name);
             if (!world_transform)
                 return std::unexpected("Node not found: " + name);
 
-            auto components = decomposeTransform(*world_transform);
-            components.scale *= value;
-            if (auto result = set_visualizer_world_transform(scene_manager, name, composeTransform(components)); !result)
+            glm::mat4 scaled_world = *world_transform;
+            for (int column = 0; column < 3; ++column) {
+                glm::vec3 basis = glm::vec3(scaled_world[column]) * value;
+                scaled_world[column] = glm::vec4(basis, 0.0f);
+            }
+            if (auto result = set_visualizer_world_transform(scene_manager, name, scaled_world); !result)
                 return result;
         }
 
@@ -928,7 +1079,7 @@ namespace lfs::vis::cap {
             const auto* const node = scene.getNode(name);
             if (!node)
                 return std::unexpected("Node not found: " + name);
-            if (!isTransformableNodeType(node->type) || static_cast<bool>(node->locked) || !has_bakeable_payload(*node))
+            if (!isTransformableNodeType(node->type) || scene_manager.getScene().isNodeEffectivelyLocked(node->id) || !has_bakeable_payload(*node))
                 continue;
 
             const glm::mat4 local_transform = node->local_transform.get();
@@ -960,8 +1111,8 @@ namespace lfs::vis::cap {
 
             const glm::mat4 local_transform = node->local_transform.get();
             if (node->model) {
-                if (auto result = bake_splat_transform_preserving_storage(*node->model, local_transform); !result)
-                    return std::unexpected(result.error());
+                if (auto result = bakeSplatTransformPreservingStorage(*node->model, local_transform); !result)
+                    return std::unexpected(std::string(result.error().user_message()));
             } else if (node->point_cloud) {
                 bake_point_cloud_transform(*node->point_cloud, local_transform);
             } else if (node->mesh) {
@@ -969,6 +1120,7 @@ namespace lfs::vis::cap {
             } else {
                 continue;
             }
+            scene.markPayloadDiverged(node->id);
 
             preserve_child_world_transforms(scene_manager, *node, local_transform);
             scene_manager.setNodeTransform(name, glm::mat4(1.0f));
@@ -1052,6 +1204,38 @@ namespace lfs::vis::cap {
         } else {
             shape_dims[0] = indices.size();
         }
+
+        if (is_shN && field->dtype() != core::DataType::Float32) {
+            core::Tensor canon = node->model->shN_canonical();
+            const auto index_tensor = core::Tensor::from_vector(indices, {indices.size()}, canon.device());
+            const auto src_tensor = core::Tensor::from_vector(
+                values, core::TensorShape(shape_dims), canon.device());
+            core::Tensor before_rows = canon.index_select(0, index_tensor).contiguous();
+            canon.index_copy_(0, index_tensor, src_tensor);
+            node->model->shN_set_from_canonical(canon, node->model->means().capacity());
+            scene.markPayloadDiverged(node->id);
+
+            scene_manager.completePendingSelectionCounts();
+            vis::op::undoHistory().push(std::make_unique<vis::op::ShNCanonicalRowsUndoEntry>(
+                "gaussians.write",
+                vis::op::UndoMetadata{
+                    .id = "tensor.shN",
+                    .label = gaussian_field_label(canonical_field_name),
+                    .source = "mcp",
+                    .scope = "tensor",
+                },
+                node_name,
+                index_tensor.clone(),
+                std::move(before_rows),
+                src_tensor.clone(),
+                &scene_manager));
+
+            scene.notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
+            if (rendering_manager)
+                rendering_manager->markDirty(vis::DirtyFlag::SPLATS | vis::DirtyFlag::OVERLAY, lfs::vis::FrameReason::SceneChange);
+            return {};
+        }
+
         const auto before = field->clone();
 
         const auto index_tensor = core::Tensor::from_vector(indices, {indices.size()}, field->device());
@@ -1066,6 +1250,7 @@ namespace lfs::vis::cap {
         } else {
             field->index_copy_(0, index_tensor, src_tensor);
         }
+        scene.markPayloadDiverged(node->id);
 
         auto entry = std::make_unique<vis::op::TensorUndoEntry>(
             "gaussians.write",
@@ -1082,14 +1267,15 @@ namespace lfs::vis::cap {
                 if (!current_node || !current_node->model)
                     return nullptr;
                 return resolve_gaussian_field(*current_node->model, canonical_field_name);
-            });
+            },
+            &scene_manager);
         entry->captureAfter();
         if (entry->hasChanges())
             vis::op::undoHistory().push(std::move(entry));
 
         scene.notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
         if (rendering_manager)
-            rendering_manager->markDirty(vis::DirtyFlag::SPLATS | vis::DirtyFlag::OVERLAY);
+            rendering_manager->markDirty(vis::DirtyFlag::SPLATS | vis::DirtyFlag::OVERLAY, lfs::vis::FrameReason::SceneChange);
         return {};
     }
 
@@ -1224,6 +1410,7 @@ namespace lfs::vis::cap {
         if (cropbox_node) {
             core::events::state::PLYAdded{
                 .name = cropbox_node->name,
+                .uuid = cropbox_node->uuid,
                 .node_gaussians = 0,
                 .total_gaussians = scene.getTotalGaussianCount(),
                 .is_visible = cropbox_node->visible,
@@ -1310,7 +1497,7 @@ namespace lfs::vis::cap {
             scene_manager.setNodeTransform(cropbox_node->name, composeTransform(updated_components));
 
         if (rendering_manager && (cropbox_changed || transform_changed))
-            rendering_manager->markDirty(vis::DirtyFlag::SPLATS | vis::DirtyFlag::OVERLAY);
+            rendering_manager->markDirty(vis::DirtyFlag::SPLATS | vis::DirtyFlag::OVERLAY, lfs::vis::FrameReason::SceneChange);
 
         bool visibility_changed = false;
         if (update.has_show && cropbox_node->visible != update.show) {
@@ -1557,6 +1744,8 @@ namespace lfs::vis::cap {
             const glm::vec3 center = (min_bounds + max_bounds) * 0.5f;
             const glm::vec3 half_size = (max_bounds - min_bounds) * 0.5f;
             data.radii = half_size * CIRCUMSCRIBE_FACTOR;
+            data.radii = glm::mix(data.radii, glm::vec3(kCropVolumeMinExtent),
+                                  glm::lessThanEqual(data.radii, glm::vec3(0.0f)));
             scene.setNodeTransform(created_ellipsoid_name, glm::translate(glm::mat4(1.0f), center));
         }
         data.enabled = true;
@@ -1565,6 +1754,7 @@ namespace lfs::vis::cap {
         if (ellipsoid_node) {
             core::events::state::PLYAdded{
                 .name = ellipsoid_node->name,
+                .uuid = ellipsoid_node->uuid,
                 .node_gaussians = 0,
                 .total_gaussians = scene.getTotalGaussianCount(),
                 .is_visible = ellipsoid_node->visible,
@@ -1647,7 +1837,7 @@ namespace lfs::vis::cap {
             scene_manager.setNodeTransform(ellipsoid_node->name, composeTransform(updated_components));
 
         if (rendering_manager && (ellipsoid_changed || transform_changed))
-            rendering_manager->markDirty(vis::DirtyFlag::SPLATS | vis::DirtyFlag::OVERLAY);
+            rendering_manager->markDirty(vis::DirtyFlag::SPLATS | vis::DirtyFlag::OVERLAY, lfs::vis::FrameReason::SceneChange);
 
         bool visibility_changed = false;
         if (update.has_show && ellipsoid_node->visible != update.show) {

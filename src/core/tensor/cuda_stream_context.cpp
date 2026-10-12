@@ -4,6 +4,7 @@
 #include "internal/cuda_stream_context.hpp"
 #include "core/cuda_error.hpp"
 #include "internal/cuda_event_pool.hpp"
+#include "internal/stream_lifetime.hpp"
 #include "internal/tensor_impl.hpp"
 
 #include <format>
@@ -17,11 +18,16 @@ namespace lfs::core {
     }
 
     void setCurrentCUDAStream(cudaStream_t stream) {
+        if (stream) {
+            unretire_stream(stream);
+        }
         tl_current_stream = stream;
     }
 
     void waitForCUDAStream(cudaStream_t execution_stream, cudaStream_t dependency_stream) {
-        if (dependency_stream == nullptr || dependency_stream == execution_stream) {
+        unretire_stream(execution_stream);
+        unretire_stream(dependency_stream);
+        if (dependency_stream == execution_stream) {
             return;
         }
 
@@ -64,9 +70,27 @@ namespace lfs::core {
         }
     }
 
+    cudaError_t memcpy_ordered(void* const dst, const void* const src, const size_t bytes,
+                               const cudaMemcpyKind kind, const cudaStream_t stream) {
+        if (stream != nullptr && kind == cudaMemcpyDeviceToHost) {
+            bridgeStreams(stream, nullptr);
+        }
+        const cudaError_t status = cudaMemcpy(dst, src, bytes, kind);
+        if (status == cudaSuccess && stream != nullptr && kind == cudaMemcpyHostToDevice) {
+            bridgeStreams(nullptr, stream);
+        }
+        return status;
+    }
+
     cudaStream_t prepare_inputs_for_stream(
         const std::initializer_list<const Tensor*> inputs,
         const std::optional<cudaStream_t> requested_stream) {
+        // A deferred input enqueues its producer only when it materializes; do that
+        // first so the ordering below covers it.
+        for (const Tensor* input : inputs) {
+            if (input != nullptr && input->is_valid() && input->is_deferred())
+                (void)input->data_ptr();
+        }
         cudaStream_t execution_stream = requested_stream.has_value()
                                             ? *requested_stream
                                             : getCurrentCUDAStream();

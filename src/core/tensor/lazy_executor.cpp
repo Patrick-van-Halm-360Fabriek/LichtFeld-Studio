@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace lfs::core::internal {
 
@@ -147,15 +148,6 @@ namespace lfs::core::internal {
             }
 
             return false;
-        }
-
-        bool lazy_executor_pointwise_fusion_enabled() {
-            const int override_enabled = lazy_executor_pointwise_fusion_state()
-                                             .override_enabled.load(std::memory_order_acquire);
-            if (override_enabled == 0 || override_enabled == 1) {
-                return override_enabled == 1;
-            }
-            return true;
         }
 
         bool lazy_executor_memory_planner_enabled() {
@@ -375,12 +367,17 @@ namespace lfs::core::internal {
             return internal_nodes;
         }
 
-        float apply_pointwise_op_cpu(float x, LazyPointwiseOpKind kind, float scalar) {
+        float apply_pointwise_op_cpu(float x, LazyPointwiseOpKind kind, float scalar,
+                                     const float* rhs, size_t idx) {
             switch (kind) {
             case LazyPointwiseOpKind::AddScalar: return x + scalar;
             case LazyPointwiseOpKind::SubScalar: return x - scalar;
             case LazyPointwiseOpKind::MulScalar: return x * scalar;
             case LazyPointwiseOpKind::DivScalar: return x / scalar;
+            case LazyPointwiseOpKind::AddTensor: return x + rhs[idx];
+            case LazyPointwiseOpKind::SubTensor: return x - rhs[idx];
+            case LazyPointwiseOpKind::MulTensor: return x * rhs[idx];
+            case LazyPointwiseOpKind::DivTensor: return x / rhs[idx];
             case LazyPointwiseOpKind::Abs: return std::abs(x);
             case LazyPointwiseOpKind::Neg: return -x;
             case LazyPointwiseOpKind::Exp: return std::exp(x);
@@ -392,13 +389,20 @@ namespace lfs::core::internal {
             case LazyPointwiseOpKind::Square: return x * x;
             case LazyPointwiseOpKind::Tanh: return std::tanh(x);
             case LazyPointwiseOpKind::Rsqrt: return 1.0f / std::sqrt(x);
-            case LazyPointwiseOpKind::Sign: return float((x > 0) - (x < 0));
+            case LazyPointwiseOpKind::Sign: return ops::sign_op{}(x);
             case LazyPointwiseOpKind::Reciprocal: return 1.0f / x;
             case LazyPointwiseOpKind::Floor: return std::floor(x);
             case LazyPointwiseOpKind::Ceil: return std::ceil(x);
             case LazyPointwiseOpKind::Round: return ops::round_op{}(x);
             }
             return x;
+        }
+
+        bool is_tensor_binary_kind(LazyPointwiseOpKind kind) {
+            return kind == LazyPointwiseOpKind::AddTensor ||
+                   kind == LazyPointwiseOpKind::SubTensor ||
+                   kind == LazyPointwiseOpKind::MulTensor ||
+                   kind == LazyPointwiseOpKind::DivTensor;
         }
 
         bool execute_pointwise_fusion_recipe(const PointwiseFusionRecipe& recipe, Tensor& materialized) {
@@ -414,24 +418,59 @@ namespace lfs::core::internal {
                 return false;
             }
             Tensor source = *recipe.source;
-            if (!source.is_valid() ||
+            // ptr<> materializes deferred sources.
+            const float* in_probe = source.is_valid() ? std::as_const(source).ptr<float>() : nullptr;
+            if (!source.is_valid() || in_probe == nullptr ||
                 source.dtype() != DataType::Float32 ||
                 !source.is_contiguous()) {
                 return false;
             }
 
+            // Materialize any deferred rhs operands and validate same-shape float32 contig.
+            std::vector<Tensor> rhs_storage;
+            rhs_storage.reserve(recipe.ops.size());
+            for (const auto& op : recipe.ops) {
+                if (!is_tensor_binary_kind(op.kind)) {
+                    continue;
+                }
+                if (!op.rhs || !op.rhs->is_valid()) {
+                    return false;
+                }
+                Tensor rhs = *op.rhs;
+                const float* rhs_probe = std::as_const(rhs).ptr<float>();
+                if (rhs_probe == nullptr ||
+                    rhs.dtype() != DataType::Float32 ||
+                    !rhs.is_contiguous() ||
+                    rhs.shape() != source.shape() ||
+                    rhs.device() != source.device()) {
+                    return false;
+                }
+                rhs_storage.push_back(std::move(rhs));
+            }
+
             const size_t n = source.numel();
             tensor_ops::FusedPointwiseOpChain chain{};
             chain.num_ops = static_cast<int>(recipe.ops.size());
+            size_t rhs_i = 0;
             for (int i = 0; i < chain.num_ops; ++i) {
                 chain.ops[i].kind = static_cast<uint8_t>(recipe.ops[i].kind);
                 chain.ops[i].scalar = recipe.ops[i].scalar;
+                if (is_tensor_binary_kind(recipe.ops[i].kind)) {
+                    chain.ops[i].rhs = std::as_const(rhs_storage[rhs_i]).ptr<float>();
+                    ++rhs_i;
+                } else {
+                    chain.ops[i].rhs = nullptr;
+                }
             }
 
             if (source.device() == Device::CUDA) {
-                const float* in_ptr = source.ptr<float>();
+                const float* in_ptr = std::as_const(source).ptr<float>();
                 assert(in_ptr != nullptr);
-                const cudaStream_t execution_stream = prepare_inputs_for_stream({&source});
+                // prepare_inputs_for_stream only takes initializer_list; pin source then each rhs.
+                cudaStream_t execution_stream = prepare_inputs_for_stream({&source});
+                for (const auto& r : rhs_storage) {
+                    execution_stream = prepare_inputs_for_stream({&r}, execution_stream);
+                }
                 CUDAStreamGuard guard(execution_stream);
                 Tensor out = Tensor::empty(source.shape(), Device::CUDA, DataType::Float32);
                 float* out_ptr = out.ptr<float>();
@@ -441,7 +480,7 @@ namespace lfs::core::internal {
                 return true;
             }
 
-            const float* in_ptr = source.ptr<float>();
+            const float* in_ptr = std::as_const(source).ptr<float>();
             if (in_ptr == nullptr)
                 return false;
             Tensor out = Tensor::empty(source.shape(), Device::CPU, DataType::Float32);
@@ -450,8 +489,15 @@ namespace lfs::core::internal {
                 return false;
             for (size_t i = 0; i < n; ++i) {
                 float val = in_ptr[i];
+                rhs_i = 0;
                 for (int j = 0; j < chain.num_ops; ++j) {
-                    val = apply_pointwise_op_cpu(val, recipe.ops[j].kind, recipe.ops[j].scalar);
+                    const float* rhs_ptr = nullptr;
+                    if (is_tensor_binary_kind(recipe.ops[j].kind)) {
+                        rhs_ptr = std::as_const(rhs_storage[rhs_i]).ptr<float>();
+                        ++rhs_i;
+                    }
+                    val = apply_pointwise_op_cpu(val, recipe.ops[j].kind, recipe.ops[j].scalar,
+                                                 rhs_ptr, i);
                 }
                 out_ptr[i] = val;
             }
@@ -867,6 +913,15 @@ namespace lfs::core::internal {
             return;
         }
         state.override_enabled.store(-1, std::memory_order_release);
+    }
+
+    bool lazy_executor_pointwise_fusion_enabled() {
+        const int override_enabled = lazy_executor_pointwise_fusion_state()
+                                         .override_enabled.load(std::memory_order_acquire);
+        if (override_enabled == 0 || override_enabled == 1) {
+            return override_enabled == 1;
+        }
+        return true;
     }
 
     bool lazy_executor_pointwise_fusion_enabled_for_testing() {

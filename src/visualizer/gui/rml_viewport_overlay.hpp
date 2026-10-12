@@ -4,16 +4,20 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include "gui/rmlui/rml_tooltip.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/vram_hud_overlay.hpp"
 #include "visualizer/app_store.hpp"
 
 #include <RmlUi/Core/DataModelHandle.h>
+#include <RmlUi/Core/EventListener.h>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,13 +29,14 @@ namespace Rml {
 } // namespace Rml
 
 namespace lfs::vis {
+    class SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
     struct Theme;
-}
+} // namespace lfs::vis
 namespace lfs::vis::gui {
 
     struct PanelInputState;
 
-    class RmlViewportOverlay {
+    class LFS_VIS_API RmlViewportOverlay {
     public:
         struct GTMetricsOverlayState {
             bool visible = false;
@@ -70,6 +75,12 @@ namespace lfs::vis::gui {
             std::string hash_text;
         };
 
+        struct ProjectDragOverlayState {
+            bool visible = false;
+            bool gallery_scene = false;
+            std::string label;
+        };
+
         using VramHudOverlayState = VramHudOverlay::State;
 
         RmlViewportOverlay();
@@ -81,7 +92,7 @@ namespace lfs::vis::gui {
         void shutdown();
         void setViewportBounds(glm::vec2 pos, glm::vec2 size, glm::vec2 screen_origin);
         void setViewportContentOffset(float x);
-        void setToolbarPanels(float primary_x, float primary_width,
+        void setToolbarPanels(float primary_x, float primary_width, float inset,
                               bool show_secondary = false,
                               float secondary_x = 0.0f,
                               float secondary_width = 0.0f);
@@ -89,19 +100,32 @@ namespace lfs::vis::gui {
         void setSplitDividerOverlay(SplitDividerOverlayState state);
         void setGTMetricsOverlay(GTMetricsOverlayState state);
         void setLodStatsOverlay(LodStatsOverlayState state);
+        void setProjectDragOverlay(ProjectDragOverlayState state);
         void setVramHudOverlay(VramHudOverlayState state);
         void reloadResources();
         void render();
         void renderCached();
-        void processInput(const PanelInputState& input);
+        void renderFrostedGlass();
+        void processInput(const PanelInputState& input, std::function<bool(float, float)> pointer_blocker = {});
         bool wantsInput() const { return wants_input_; }
         [[nodiscard]] bool needsAnimationFrame() const {
             return render_needed_ || document_sync_dirty_ || animation_active_ || tooltip_.revealDue() ||
+                   toolbar_drag_active_ ||
                    (vram_hud_ && vram_hud_->needsAnimationFrame());
         }
+        // Next finite RmlUi or passive document-hook deadline in seconds.
+        // Continuous RmlUi demand is reported by needsAnimationFrame().
+        [[nodiscard]] std::optional<double> nextScheduledUpdateDelay() const;
         [[nodiscard]] bool blocksPointer(double screen_x, double screen_y) const;
 
     private:
+        friend class ViewportDepthLayoutTestAccess;
+        friend class lfs::vis::SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
+        struct ToolbarDragListener final : Rml::EventListener {
+            RmlViewportOverlay* owner = nullptr;
+            void ProcessEvent(Rml::Event& event) override;
+        };
+
         bool updateTheme();
         void cacheBodyTemplate();
         void ensureBodyDataModelBound(Rml::Element* body);
@@ -110,13 +134,23 @@ namespace lfs::vis::gui {
         void markDocumentSyncDirty();
         bool syncBuiltinDocument(bool force);
         bool updateToolbarRoots();
+        bool updateToolbarRailLayout();
+        bool applyToolbarPosition();
+        void attachToolbarDragListeners();
+        void resetToolbarDragListeners();
+        void onToolbarDrag(Rml::Event& event);
+        [[nodiscard]] float toolbarFreeGap(float toolbar_height) const;
+        [[nodiscard]] float toolbarFreeTop(float toolbar_height) const;
+        [[nodiscard]] float toolbarFreeTravel(float toolbar_height) const;
         void updateViewportContentOffset();
+        void updateViewportContentClasses(float dp_ratio);
         void bindReactiveStore();
         void refreshGTMetricsOverlayFromStore();
         void applySplitDividerOverlay();
         void applyLeftDockResizeIndicator();
         void applyGTMetricsOverlay();
         void applyLodStatsOverlay();
+        void applyProjectDragOverlay();
         bool applyFrameTooltip();
         void queueCachedVulkanContext(bool refresh_cache);
         enum class RenderReason : std::uint32_t {
@@ -137,6 +171,9 @@ namespace lfs::vis::gui {
             Keyboard = 1u << 14,
             LodStats = 1u << 15,
             LeftDockResize = 1u << 16,
+            PerfHud = 1u << 17,
+            ProjectDrag = 1u << 18,
+            ThemePresentation = 1u << 19,
         };
         void markRenderNeeded(RenderReason reason);
         [[nodiscard]] std::string renderReasonSources() const;
@@ -150,6 +187,7 @@ namespace lfs::vis::gui {
         glm::vec2 vp_size_{0, 0};
         glm::vec2 screen_origin_{0, 0};
         float primary_toolbar_x_ = 0.0f;
+        float toolbar_inset_ = 0.0f;
         float primary_toolbar_width_ = 0.0f;
         bool show_secondary_toolbar_ = false;
         float secondary_toolbar_x_ = 0.0f;
@@ -160,10 +198,27 @@ namespace lfs::vis::gui {
         float applied_secondary_toolbar_x_ = 0.0f;
         float applied_secondary_toolbar_width_ = -1.0f;
         bool toolbar_roots_dirty_ = true;
+        bool toolbar_rail_layout_dirty_ = true;
+        float last_toolbar_dpi_ = 0.0f;
+        bool toolbar_position_preference_dirty_ = true;
+        std::string viewport_toolbar_position_ = "centered";
+        std::string applied_viewport_toolbar_position_;
+        float viewport_toolbar_free_y_ = 0.5f;
+        float applied_primary_toolbar_top_ = std::numeric_limits<float>::quiet_NaN();
+        float applied_secondary_toolbar_top_ = std::numeric_limits<float>::quiet_NaN();
+        Rml::Element* primary_toolbar_drag_handle_ = nullptr;
+        Rml::Element* secondary_toolbar_drag_handle_ = nullptr;
+        ToolbarDragListener toolbar_drag_listener_;
+        bool toolbar_drag_active_ = false;
+        bool applied_toolbar_drag_active_ = false;
+        bool toolbar_drag_moved_ = false;
+        float toolbar_drag_start_top_ = 0.0f;
+        float toolbar_drag_start_mouse_y_ = 0.0f;
         float viewport_content_offset_ = 0.0f;
         bool viewport_content_offset_dirty_ = true;
         std::size_t last_theme_signature_ = 0;
         bool has_theme_signature_ = false;
+        std::string viewport_chrome_style_ = "translucent";
         std::string base_rcss_;
         std::string body_template_rml_;
         bool wants_input_ = false;
@@ -173,6 +228,7 @@ namespace lfs::vis::gui {
         bool document_sync_dirty_ = true;
         bool data_model_binding_dirty_ = true;
         bool animation_active_ = false;
+        double next_update_delay_ = std::numeric_limits<double>::infinity();
         bool hovered_interactive_ = false;
         Rml::Element* last_hover_element_ = nullptr;
         bool mouse_pos_valid_ = false;
@@ -187,11 +243,11 @@ namespace lfs::vis::gui {
         SplitDividerOverlayState split_divider_overlay_;
         GTMetricsOverlayState gt_metrics_overlay_;
         LodStatsOverlayState lod_stats_overlay_;
+        ProjectDragOverlayState project_drag_overlay_;
         lfs::vis::AppStore::GTMetricsOverlayConfig gt_metrics_config_;
         std::optional<lfs::vis::AppStore::CameraMetrics> camera_metrics_;
         lfs::core::reactive::SubscriptionToken gt_metrics_config_subscription_;
         lfs::core::reactive::SubscriptionToken camera_metrics_subscription_;
-        lfs::core::reactive::SubscriptionToken vram_hud_subscription_;
         std::vector<lfs::core::reactive::SubscriptionToken> document_sync_subscriptions_;
         std::unique_ptr<VramHudOverlay> vram_hud_;
         RmlTooltipController tooltip_;

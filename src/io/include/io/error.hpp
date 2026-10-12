@@ -130,26 +130,6 @@ namespace lfs::io {
         }
 
         [[nodiscard]] bool is(ErrorCode c) const { return code == c; }
-
-        [[nodiscard]] bool is_filesystem_error() const {
-            const int c = static_cast<int>(code);
-            return c >= 100 && c < 200;
-        }
-
-        [[nodiscard]] bool is_validation_error() const {
-            const int c = static_cast<int>(code);
-            return c >= 200 && c < 300;
-        }
-
-        [[nodiscard]] bool is_save_error() const {
-            const int c = static_cast<int>(code);
-            return c >= 300 && c < 400;
-        }
-
-        [[nodiscard]] bool is_load_error() const {
-            const int c = static_cast<int>(code);
-            return c >= 400 && c < 500;
-        }
     };
 
     template <typename T>
@@ -181,7 +161,7 @@ namespace lfs::io {
         }
 
         if (!std::filesystem::exists(check_path, ec)) {
-            auto parent = check_path;
+            auto parent = std::filesystem::absolute(check_path, ec);
             while (!parent.empty() && !std::filesystem::exists(parent, ec)) {
                 parent = parent.parent_path();
             }

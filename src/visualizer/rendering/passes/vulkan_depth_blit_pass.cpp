@@ -32,8 +32,10 @@ namespace lfs::vis {
 
         struct DepthBlitPush {
             float params[4]; // near, far, is_view_depth, flip_y
+            float uv_scale[2];
+            float uv_clamp_max[2];
         };
-        static_assert(sizeof(DepthBlitPush) == 16);
+        static_assert(sizeof(DepthBlitPush) == 32);
 
         [[nodiscard]] const char* waitOutcomeLabel(const lfs::rendering::WaitOutcome outcome) noexcept {
             using lfs::rendering::WaitOutcome;
@@ -70,6 +72,7 @@ namespace lfs::vis {
             VkDescriptorSet set = VK_NULL_HANDLE;
             VkImageView bound_view = VK_NULL_HANDLE;
             std::uint64_t bound_generation = 0;
+            std::uint64_t binding_revision = 0;
         };
         std::vector<FrameDescriptor> frame_descriptors;
         VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
@@ -715,6 +718,7 @@ namespace lfs::vis {
                                          "depth_blit.image[{}x{}]",
                                          w,
                                          h);
+            vmaSetAllocationName(allocator, image_alloc, "Depth-blit image");
             image_vram_label = std::format("r32_float:{}x{}", w, h);
             lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
                 "vulkan.depth_blit.image",
@@ -882,15 +886,15 @@ namespace lfs::vis {
             si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             si.commandBufferCount = 1;
             si.pCommandBuffers = &transfer_cmd;
-            if (si.commandBufferCount != 1 || si.pCommandBuffers == nullptr ||
-                si.pCommandBuffers[0] == VK_NULL_HANDLE || transfer_fence == VK_NULL_HANDLE ||
+            // transfer_cmd address is never null; validate the handles themselves.
+            if (transfer_cmd == VK_NULL_HANDLE || transfer_fence == VK_NULL_HANDLE ||
                 graphics_queue == VK_NULL_HANDLE) {
                 return replaceTransferFenceSignaled("Depth-blit submit integrity check",
                                                     VK_ERROR_INITIALIZATION_FAILED);
             }
             // Async submit: in-order queue execution makes the upload visible to the
             // viewport pass that samples this image right after on the same queue.
-            result = vkQueueSubmit(graphics_queue, 1, &si, transfer_fence);
+            result = lfs::rendering::vk_queue_submit_synced(graphics_queue, 1, &si, transfer_fence);
             if (result != VK_SUCCESS) {
                 return replaceTransferFenceSignaled("vkQueueSubmit", result);
             }
@@ -919,6 +923,7 @@ namespace lfs::vis {
             vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
             descriptor.bound_view = view;
             descriptor.bound_generation = generation;
+            ++descriptor.binding_revision;
         }
 
         void prepare(const VulkanDepthBlitParams& params, const std::size_t frame_slot) {
@@ -988,6 +993,10 @@ namespace lfs::vis {
             push.params[1] = params.far_plane;
             push.params[2] = params.depth_is_ndc ? 0.0f : 1.0f;
             push.params[3] = params.flip_y ? 1.0f : 0.0f;
+            push.uv_scale[0] = params.uv_scale.x;
+            push.uv_scale[1] = params.uv_scale.y;
+            push.uv_clamp_max[0] = params.uv_clamp_max.x;
+            push.uv_clamp_max[1] = params.uv_clamp_max.y;
             vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(push), &push);
             vkCmdDraw(cb, 6, 1, 0, 0);
@@ -1032,6 +1041,10 @@ namespace lfs::vis {
 
     VkImageView VulkanDepthBlitPass::depthView(const std::size_t frame_slot) const {
         return impl_ ? impl_->descriptorForFrame(frame_slot).bound_view : VK_NULL_HANDLE;
+    }
+
+    std::uint64_t VulkanDepthBlitPass::depthBindingRevision(const std::size_t frame_slot) const {
+        return impl_ ? impl_->descriptorForFrame(frame_slot).binding_revision : 0;
     }
 
 } // namespace lfs::vis
